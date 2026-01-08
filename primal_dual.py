@@ -143,8 +143,8 @@ class PrimalDualTrainer():
         elif self.problem_type == "ED":
             self.primal_loss_fn = self.primal_loss
             #! PrimalNetEndToEnd takes into account whether repairs are used or not.
-            print(f"Data xdim: {data.xdim}, layer: {args['n_layers']} hidden size factro : {args['hidden_size_factor']} hid size: {[int(args['hidden_size_factor']*data.xdim)] * args['n_layers']}")
-            print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            # print(f"Data xdim: {data.xdim}, layer: {args['n_layers']} hidden size factro : {args['hidden_size_factor']} hid size: {[int(args['hidden_size_factor']*data.xdim)] * args['n_layers']}")
+            # print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
             self.primal_net = PrimalNetEndToEnd(self.args, self.data).to(dtype=self.DTYPE, device=self.DEVICE)
             
             if self.args["dual_alternate_loss"]:
@@ -302,7 +302,7 @@ class PrimalDualTrainer():
                     avg_lagrange_eq = total_lagrange_eq / num_batches
                     avg_lagrange_ineq = total_lagrange_ineq / num_batches
                     avg_penalty = total_penalty / num_batches
-                    print(f"Outer iter {k}, inner iter {l1}: Train Loss {avg_train_loss}. Eq {avg_lagrange_eq} Ineq {avg_lagrange_ineq} Penalty {avg_penalty}")
+                    # print(f"Outer iter {k}, inner iter {l1}: Train Loss {avg_train_loss}. Eq {avg_lagrange_eq} Ineq {avg_lagrange_ineq} Penalty {avg_penalty}")
                     # Log training loss:
                     if self.logger and self.log_frequency > 0 and self.step % self.log_frequency == 0:
                         with torch.no_grad():
@@ -470,13 +470,13 @@ class PrimalDualTrainer():
                 print(f" --- Primal opt gap: {primal_opt_gap:.4f}, Dual opt gap: {dual_opt_gap:.4f}, Duality gap: {duality_gap:.4f} --- ")
 
             end_time = time.time()
-            print(f"Epoch {k} done. Time taken: {end_time - begin_time}. Rho: {self.rho}. Primal LR: {self.primal_optim.param_groups[0]['lr']}, Dual LR: {self.dual_optim.param_groups[0]['lr']}")
+            print(f"Epoch {k} done. Time taken: {end_time - begin_time}. Rho: {self.rho}. Violation: {v_k}. Primal LR: {self.primal_optim.param_groups[0]['lr']}, Dual LR: {self.dual_optim.param_groups[0]['lr']}")
             print("-----------------------------------------")
             if self.args["learn_primal"]:
                 # Update rho from the second iteration onward.
                 if k > 0 and v_k > self.tau * prev_v_k:
+                    print(f"Updating rho. v_k: {v_k}, prev_v_k: {prev_v_k}, tau: {self.tau}")
                     self.rho = np.min([self.alpha * self.rho, self.rho_max])
-
                 prev_v_k = v_k
         
         self.save(self.save_dir)
@@ -579,9 +579,8 @@ class PrimalDualTrainer():
     
     def primal_loss(self, X, Y, mu, lamb, X_opt):
         # if self.args["penalize_md_obj"]:
-        print("Using primal loss with obj penalty.")
-        print(f"X dtype {X.shape} Y dtype {Y.shape}")
-        print("-------------------------------------")
+
+
         obj = self.data.obj_fn(X, Y)
         if self.rho > 0:
             ineq = self.data.ineq_resid(X, Y)

@@ -171,10 +171,14 @@ class FeedForwardNet(nn.Module):
 
 
 class BoundRepairLayer(nn.Module):
-    def __init__(self):
+    def __init__(self, scale_sigmoid = False, shifted_sigmoid_scale = False, k = 1.0):
         super().__init__()
+        self.scale_sigmoid = scale_sigmoid
+        self.shifted_sigmoid_scale = shifted_sigmoid_scale
+        self.k = k
+        self.s = 100
     
-    def forward(self, x, lb, ub, k=1.0):
+    def forward(self, x, lb, ub):
         """_summary_
 
         Args:
@@ -185,24 +189,44 @@ class BoundRepairLayer(nn.Module):
         Returns:
             _type_: _description_
         """
-        scaled = torch.sigmoid(k * x)
+        if self.scale_sigmoid:
+            
+            # # sig_input = k*(x/(ub+lb)+1e-6)
+            # m = (ub+lb) / 2.0
+            # r = (ub - lb) / 2.0
 
-        repaired = lb + (ub - lb) * scaled
-
+            # scaled = r*torch.tanh((x-m)/self.s) + m
+            # # scaled = torch.sigmoid(sig_input)
+            # repaired = scaled
+            
+            if self.shifted_sigmoid_scale:
+                
+                sig_input = (x - (lb + ub)/2)*1/self.k
+            else:
+                sig_input = x*1/self.k
+            scaled = torch.sigmoid(sig_input)
+            
+            repaired = lb + (ub - lb) * scaled
+        else:
+            sig_input = x
+            scaled = torch.sigmoid(sig_input)
+            
+            repaired = lb + (ub - lb) * scaled
         if False: #! Set to True to attach hooks to inspect gradients
             def print_grad(name):
                 return lambda grad: print(f"Gradient for {name}: {grad.norm():.4e}")
             x.register_hook(print_grad("x"))
             scaled.register_hook(print_grad("sigmoid(kx)"))
             repaired.register_hook(print_grad("repaired output"))
-
         return repaired
+    
 class EstimateSlackLayer(nn.Module):
     def __init__(self, node_to_gen_mask, lineflow_mask):
         super().__init__()
 
         self.node_to_gen_mask = node_to_gen_mask    # [N, G]
         self.lineflow_mask = lineflow_mask          # [N, L]
+
 
     def forward(self, p_gt, f_lt, D_nt):
         """Compute md_n,t
@@ -211,11 +235,27 @@ class EstimateSlackLayer(nn.Module):
             p_gt (_type_): Generator production, shape [B, G]
             f_lt (_type_): Line flow, shape [B, L]
             D_nt (_type_): Demand, shape [B, N]
+
+            Line Flow Mask.T: like this
+                    Node 0  Node 1  Node 2
+            Line 0    -1     1        0      Line 0 connects Node 0 to Node 1
+            Line 1    -1     0        1      Line 1 connects Node 0 to Node 2
+            Line 2     0     -1       1      Line 2 connects Node 1 to Node 2
         """
+
+
         combined_flow = torch.matmul(p_gt, self.node_to_gen_mask.T) + \
                         torch.matmul(f_lt, self.lineflow_mask.T)
-    
+        # print(f"Production Location: {torch.matmul(p_gt, self.node_to_gen_mask.T)}")
+        #print("########")
+        net_prod = torch.matmul(p_gt, self.node_to_gen_mask.T)
+        net_flow = torch.matmul(f_lt, self.lineflow_mask.T)
+
+        
+        # print("########")
         md_nt = D_nt - combined_flow
+        
+        net_flow_demand_mask = md_nt > D_nt
 
         return md_nt
 
@@ -260,10 +300,19 @@ class PrimalNetEndToEnd(nn.Module):
 
         self.feed_forward = FeedForwardNet(args, data.xdim, self.hidden_sizes, output_dim=self.out_dim).to(self.DTYPE).to(self.DEVICE)
         
+        if "scale_sigmoid" not in self.args:
+            self.args["scale_sigmoid"] = False
+        if "shifted_sigmoid_scale" not in self.args:
+            self.args["shifted_sigmoid_scale"] = False
+        if "k" not in self.args:
+            self.args["k"] = 1.0
         if self.args["repair_bounds"]:
-            self.bound_repair_layer = BoundRepairLayer()
-            # self.ramping_repair_layer = RampingRepairLayer()
-
+            # if "scale_sigmoid" in self.args and self.args["scale_sigmoid"]:
+            #     self.bound_repair_layer = BoundRepairLayer(scale_sigmoid = True)
+            # else:
+            #     self.bound_repair_layer = BoundRepairLayer()
+            # # self.ramping_repair_layer = RampingRepairLayer()
+            self.bound_repair_layer = BoundRepairLayer(scale_sigmoid= self.args["scale_sigmoid"], shifted_sigmoid_scale=self.args["shifted_sigmoid_scale"], k = self.args["k"])
         if self.args["repair_completion"]:
             self.estimate_slack_layer = EstimateSlackLayer(data.node_to_gen_mask.to(self.DTYPE).to(self.DEVICE), data.lineflow_mask.to(self.DTYPE).to(self.DEVICE))
     
@@ -280,6 +329,15 @@ class PrimalNetEndToEnd(nn.Module):
 
         # [B, bounds, T]
         p_gt_lb, p_gt_ub, f_lt_lb, f_lt_ub, md_nt_lb, md_nt_ub = self.data.split_ineq_constraints(ineq_rhs)
+
+        # print("===========Before Bound Repair============")
+        
+        # print(f"Line Flows f_lt: {f_lt}")
+        # temp_UI_g, temp_D_nt = self.data.split_eq_constraints(eq_rhs)
+        # temp_md_nt = self.estimate_slack_layer(p_gt, f_lt, temp_D_nt)
+        # print(f"Estimated unmet demand md_nt: {temp_md_nt}")
+        # comp_mask = temp_md_nt < temp_D_nt
+        # print(comp_mask)
         
         if self.args["repair_bounds"]:
             p_gt = self.bound_repair_layer(p_gt, p_gt_lb, p_gt_ub)
@@ -287,7 +345,54 @@ class PrimalNetEndToEnd(nn.Module):
                 #! Note: Lineflows cannot be repaired more, since they depend on other lineflows. 
                 #! For example, if we repair a lineflow such that it cannot export more than (imports + generation),
                 #! then it will affect other lineflows, and we would need to repair them again.
-            f_lt = self.bound_repair_layer(f_lt, -f_lt_lb, f_lt_ub) #! Bounds need to be repaired for this to work!
+
+            
+            if "flow_scale_by_prod" in self.args and self.args["flow_scale_by_prod"]:
+                # More restrictive way to repair line flows based on production capacity at nodes. 
+                total_prod = torch.matmul(p_gt, self.data.node_to_gen_mask.T)  # [B, N]
+ 
+                source_mask = (self.data.lineflow_mask == -1).to(self.DTYPE).to(self.DEVICE)  # [N, L]
+                
+                count_line_per_node = torch.count_nonzero(self.data.lineflow_mask, dim = 0)
+
+                
+                max_outflow_by_prod = torch.matmul(total_prod, source_mask) / count_line_per_node  # [B, L]
+                # print(f"Max outflow by production shape: {max_outflow_by_prod}")
+
+                # The other side 
+                # print(f"Original f_lt_ub: {f_lt_lb}")
+                source_mask = (self.data.lineflow_mask == 1).to(self.DTYPE).to(self.DEVICE)  # [N, L]
+       
+                '''
+                Total Prod: (B,N) Mask: (N,L) --> (B,L) 
+                '''
+                # print(f"Totol prod {total_prod}")
+                # print(f"Source Mask == 1: {source_mask}") # total prod i -> line cap that exit this node i
+                max_inflow_by_prod = torch.matmul(total_prod, source_mask) / count_line_per_node # [B, L]
+                # print(f"Max inflow by production shape: {max_inflow_by_prod}")
+                # print(f"Line LB before adjustment: {f_lt_lb}")
+
+
+                f_lt_ub_adjusted = torch.min(f_lt_ub, max_outflow_by_prod)
+                f_lt_lb_adjusted = torch.min(f_lt_lb, max_inflow_by_prod)
+                # print(f"Adjusted f_lt_ub: {f_lt_ub_adjusted} Adjusted f_lt_lb: {f_lt_lb_adjusted}")
+               
+                f_lt = self.bound_repair_layer(f_lt, -f_lt_lb_adjusted, f_lt_ub_adjusted)
+            else:
+                f_lt = self.bound_repair_layer(f_lt, -f_lt_lb, f_lt_ub) #! Bounds need to be repaired for this to work!
+
+    
+
+        # print("\n===========Before Power Balance Repair============")
+        # print(f"Generation p_gt: {p_gt}")
+        # print(f"Line Flows f_lt: {f_lt}")
+        # temp_UI_g, temp_D_nt = self.data.split_eq_constraints(eq_rhs)
+
+        # temp_md_nt = self.estimate_slack_layer(p_gt, f_lt, temp_D_nt)
+        # print(f"Estimated unmet demand md_nt: {temp_md_nt}")
+        # comp_mask = temp_md_nt < temp_D_nt
+        # print(comp_mask)
+
 
         if self.args["repair_power_balance"]:
             net_flow = torch.matmul(f_lt, self.data.lineflow_mask.T)  # [B, N]
@@ -314,11 +419,21 @@ class PrimalNetEndToEnd(nn.Module):
             # p_gt = torch.where(mask_down, (1 - zeta_down) * p_gt + zeta_down * p_gt_lb, p_gt)
 
             p_gt = p_gt_repaired
+        # print("\n===========After Power Balance Repair============")
+        # print(f"Generation p_gt: {p_gt}")
+        # print(f"Line Flows f_lt: {f_lt}")
 
         if self.args["repair_completion"]:
             UI_g, D_nt = self.data.split_eq_constraints(eq_rhs)
+            
             md_nt = self.estimate_slack_layer(p_gt, f_lt, D_nt)
+        # print(f"Demand D_nt: {D_nt}")
+        # print(f"Estimated unmet demand md_nt: {md_nt}")
+        # comp_mask = md_nt < D_nt
+        # print(f"Is Unmet Demand < Demand: {comp_mask}")
 
+        # print("\n===========Demand============")
+        # print(f"Demand D_nt: {D_nt}")
         y = torch.cat([p_gt, f_lt, md_nt], dim=1)
         # y = torch.cat([md_nt, f_lt, p_gt], dim=1)
 
@@ -472,3 +587,369 @@ def load(args, data, save_dir):
     dual_net.load_state_dict(torch.load(save_dir + '/dual_weights.pth', weights_only=True))
 
     return primal_net, dual_net
+
+
+
+if __name__ == "__main__":
+    import json
+    import os
+    import numpy as np
+    import pickle
+    from gep_config_parser import parse_config
+
+    def compute_node_power_balance_debug(data, X, Y):
+        """
+        Compute net production, net inflow, combined flow, unmet demand and mask
+        for a batch X, Y (here you use batch size 1).
+        """
+        # Split equality RHS (to get demand D_nt)
+        eq_rhs, _ = data.split_X(X)          # [B, neq]
+        UI_g, D_nt = data.split_eq_constraints(eq_rhs)  # D_nt: [B, N]
+
+        # Split decision vars from Y (already repaired output of PrimalNetEndToEnd)
+        p_gt, f_lt, md_nt = data.split_dec_vars_from_Y(Y)  # [B, G], [B, L], [B, N]
+
+        # Net production per node: p_g * node_to_gen_mask^T
+        net_prod = torch.matmul(p_gt, data.node_to_gen_mask.T)   # [B, N]
+
+        # Net flow per node: f_l * lineflow_mask^T
+        net_flow = torch.matmul(f_lt, data.lineflow_mask.T)      # [B, N]
+
+        # Combined flow = generation + net inflow (this matches your EstimateSlackLayer)
+        combined_flow = net_prod + net_flow                      # [B, N]
+
+        # Unmet demand according to the same formula as EstimateSlackLayer
+        md_est = D_nt - combined_flow                            # [B, N]
+
+        # Mask: where unmet demand > demand (your current condition)
+        mask = md_est > -0.00001                                     # [B, N]
+
+        return {
+            "net_prod": net_prod.detach().cpu(),
+            "net_flow": net_flow.detach().cpu(),
+            "combined_flow": combined_flow.detach().cpu(),
+            "D_nt": D_nt.detach().cpu(),
+            "md_est": md_est.detach().cpu(),
+            "mask": mask.detach().cpu(),
+        }
+
+
+    def compute_power_balance_debug(data, X, Y):
+        """
+        Compute net production, net inflow, combined flow, unmet demand and mask
+        for a batch X, Y (here you use batch size 1).
+        """
+        # Split equality RHS (to get demand D_nt)
+        eq_rhs, _ = data.split_X(X)          # [B, neq]
+        UI_g, D_nt = data.split_eq_constraints(eq_rhs)  # D_nt: [B, N]
+
+        # Split decision vars from Y (already repaired output of PrimalNetEndToEnd)
+        p_gt, f_lt, md_nt = data.split_dec_vars_from_Y(Y)  # [B, G], [B, L], [B, N]
+
+        # Net production per node: p_g * node_to_gen_mask^T
+        net_prod = torch.matmul(p_gt, data.node_to_gen_mask.T)   # [B, N]
+
+        # Net flow per node: f_l * lineflow_mask^T
+        net_flow = torch.matmul(f_lt, data.lineflow_mask.T)      # [B, N]
+
+
+        # Combined flow = generation + net inflow (this matches your EstimateSlackLayer)
+        combined_flow = net_prod + net_flow                      # [B, N]
+
+        # Unmet demand according to the same formula as EstimateSlackLayer
+        md_est = D_nt - combined_flow                            # [B, N]
+
+        # Mask: where unmet demand > demand (your current condition)
+        mask = md_est > D_nt                                     # [B, N]
+
+
+        
+        B = p_gt.shape[0]
+        assert B == 1, "Printing per-node flows only makes sense for batch size 1 in debugging."
+
+        p_gt_np = p_gt[0].detach().cpu().numpy()
+        f_lt_np = f_lt[0].detach().cpu().numpy()
+
+        node_to_gen_mask = data.node_to_gen_mask.cpu().numpy()
+        lineflow_mask = data.lineflow_mask.cpu().numpy()
+
+        print("\n===== Detailed per-node breakdown =====")
+        for n in range(node_to_gen_mask.shape[0]):
+            print(f"\n--- Node {n} ---")
+
+            # Generator production at this node
+            gens_at_node = node_to_gen_mask[n] == 1
+            node_gen_prod = p_gt_np[gens_at_node]
+            
+            print("Generators at node:", node_gen_prod)
+
+            # Flows involving this node
+            flows_mask = lineflow_mask[n]  # +1 inflow, -1 outflow, 0 no connection
+            
+            inflow_indices  = np.where(flows_mask ==  1)[0]
+            outflow_indices = np.where(flows_mask == -1)[0]
+
+            print("Incoming flows (line index → flow value):")
+            for li in inflow_indices:
+                print(f"  Line {li}: +{f_lt_np[li]:.2f}")
+
+            print("Outgoing flows (line index → flow value):")
+            for li in outflow_indices:
+                print(f"  Line {li}: {f_lt_np[li]:.2f}")
+
+            # Net flow = sum(flows * +1/-1)
+            net_flow_n = np.sum(f_lt_np * flows_mask)
+            print(f"Net inflow/outflow for node {n}: {net_flow_n:.2f}")
+            print(f"Combined flow: {combined_flow[0,n].item():.2f}")
+            print(f"Unmet Demand at node {n}: {md_est[0,n].item():.2f} Mask: {mask[0,n].item()}")
+        return {
+            "net_prod": net_prod.detach().cpu(),
+            "net_flow": net_flow.detach().cpu(),
+            "combined_flow": combined_flow.detach().cpu(),
+            "D_nt": D_nt.detach().cpu(),
+            "md_est": md_est.detach().cpu(),
+            "mask": mask.detach().cpu(),
+        }
+
+
+    ARGS_FILE_NAME = "config.json"
+    CONFIG_FILE_NAME = "config.toml"
+
+    with open(ARGS_FILE_NAME, "r") as file:
+            args = json.load(file)
+
+    ED_args = args["ED_args"]
+
+    input_data = parse_config(CONFIG_FILE_NAME) # Reads the input data using config.toml's experiment.inputs.data path.
+
+    gep_ed_data = input_data["experiment"]["experiments"][0] # Take first experiment, we don't change the inputs here.
+
+    if args["problem_type"] == "ED":
+        #! TODO: not all configs are correctly parsed here. E.g. when first running BEL and GER with both coal generators, is the same as with both gas generators.
+        # For nodes, just use first letters: ['BEL', 'GER', 'NED'] → 'B-G-N'
+        nodes_str = "-".join([n[0] for n in ED_args['N']])
+        
+        # For generators, count per node: [['BEL', 'WindOn'], ['BEL', 'Gas'],...] = 'B3-G2-N2'
+        gen_counts = {}
+        for g in ED_args['G']:
+            node = g[0]
+            gen_counts[node] = gen_counts.get(node, 0) + 1
+        gens_str = "-".join([f"{node[0]}{count}" for node, count in gen_counts.items()])
+        
+        # For lines, just count: [['BEL', 'GER'], ['BEL', 'NED'], ['GER', 'NED']] → 'L3'
+        lines_str = f"L{len(ED_args['L'])}"
+        
+        # Create a shortened filename
+        data_save_path = (f"data/ED_data/ED_N{nodes_str}_G{gens_str}_{lines_str}"
+                        f"_c{int(ED_args['benders_compact'])}"
+                        f"_s{int(ED_args['scale_problem'])}"
+                        f"_p{int(ED_args['perturb_operating_costs'])}"
+                        f"_smp{ED_args['2n_synthetic_samples']}.pkl")
+
+    def evaluate_individual(data, primal_net, test_indices, index):      
+
+        X = data.X[test_indices]
+        Y_target = data.opt_targets["y_operational"][test_indices]
+        
+
+        X = X[index,:].unsqueeze(0)
+        Y_target = Y_target[index,:].unsqueeze(0)
+
+    
+        # Forward pass through networks
+        Y = primal_net(X)
+
+        ineq_dist = data.ineq_dist(X, Y)
+        eq_resid = data.eq_resid(X, Y)
+
+
+        relative_ineq_dist = data.relative_ineq_dist(X, Y)
+        relative_eq_resid = data.relative_eq_resid(X, Y)
+
+        # Convert lists to arrays for easier handling
+        obj_values = data.obj_fn(X, Y).detach().numpy()
+        ineq_max_vals = torch.max(ineq_dist, dim=1)[0].detach().numpy() # First element is the max, second is the index
+        ineq_mean_vals = torch.mean(ineq_dist, dim=1).detach().numpy()
+        eq_max_vals = torch.max(torch.abs(eq_resid), dim=1)[0].detach().numpy() # First element is the max, second is the index
+        eq_mean_vals = torch.mean(torch.abs(eq_resid), dim=1).detach().numpy()
+        known_obj = data.obj_fn(X, Y_target).detach().numpy()
+        # obj_values is negative
+        opt_gap = (obj_values - known_obj)/np.abs(known_obj) * 100
+
+        return np.mean(obj_values), np.mean(known_obj), np.mean(opt_gap), np.mean(ineq_max_vals), np.mean(ineq_mean_vals), np.mean(eq_max_vals), np.mean(eq_mean_vals), ineq_max_vals, ineq_mean_vals, ineq_dist, X, Y, Y_target
+
+
+    repeats = 1
+    stats_dict = {}
+    const_vio_dict = {}
+    data_ineq_list = []
+
+    # args = json.load(open('config.json'))
+    data_path = f"experiment-output/ch5/ED_NB-G-F_GB2-G2-F2_L3_c0_s0_p0_smp15.pkl"
+    data = pickle.load(open(data_path, 'rb'))
+
+    indices = torch.arange(data.X.shape[0])
+
+
+
+    exp_paths = ["outputs/PDL/ED/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-NoNormRepairAll"]
+    name_list = ["Baseline"]
+
+    exp_paths = ["outputs/PDL/ED/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalScaledSig100"]
+    name_list = ["Baseline"]
+
+    ARGS_FILE_NAME = "config.json"
+
+
+    for run, (path, name) in enumerate(zip(exp_paths, name_list)):
+        stats_dict[name] = {"predicted_obj": [], "known_obj": [], "opt_gap": [], "ineq_max": [], "ineq_mean": [], "eq_max": [], "eq_mean": []}
+        const_vio_dict[name] = {"ineq_max_list": [], "ineq_mean_list": []}
+        with open(os.path.join(path, 'args.json'), 'r') as f:
+            args = json.load(f)
+        # with open(ARGS_FILE_NAME, "r") as file:
+        #     args = json.load(file)
+        # Compute sizes for each set
+        train_size = int(args["train"] * data.X.shape[0])
+        valid_size = int(args["valid"] * data.X.shape[0])
+        # print(f"Train size: {train_size}, Valid size: {valid_size}, Test size: {data.X.shape[0] - train_size - valid_size}")
+
+
+        # Split the indices
+        train_indices = indices[:train_size]
+        valid_indices = indices[train_size:train_size+valid_size]
+        test_indices = indices[train_size+valid_size:]
+
+        args["hidden_size_factor"] = 28 # Set as this for some reason
+        for i, repeat in enumerate(range(repeats)):
+            
+            directory = os.path.join(path, f"repeat:{repeat}")
+            # directory = f"experiment-output/ch5-reproduction-nonconvex/{experiment}/repeat:{repeat}"
+            # dual_net = DualNet(args, data=data)
+            # dual_net.load_state_dict(torch.load(os.path.join(directory, 'dual_weights.pth'), weights_only=True))
+            
+            primal_net = PrimalNetEndToEnd(args, data=data)
+            
+            primal_net.load_state_dict(torch.load(os.path.join(directory, 'primal_weights.pth'), weights_only=True))
+            
+            index = 2957
+            obj_val, known_obj, opt_gap, ineq_max, ineq_mean, eq_max, eq_mean, ineq_max_list, ineq_mean_list, ineq_dist, X_out, Y_out, Y_target = evaluate_individual(data, primal_net, test_indices, index)
+            debug_stats = compute_node_power_balance_debug(data, X_out, Y_out)
+            debug_opt_obj = data.obj_fn(X_out, Y_target).detach().numpy()
+            # print(ineq_max_list)
+            data_ineq_list.append(data.ineq_cm.numpy())
+            stats_dict[name]["predicted_obj"].append(obj_val)
+            stats_dict[name]["known_obj"].append(known_obj)
+            stats_dict[name]["opt_gap"].append(opt_gap)
+            stats_dict[name]["ineq_max"].append(ineq_max)
+            stats_dict[name]["ineq_mean"].append(ineq_mean)
+            stats_dict[name]["eq_max"].append(eq_max)
+            stats_dict[name]["eq_mean"].append(eq_mean)
+            const_vio_dict[name]["opt_gap"] = opt_gap
+            const_vio_dict[name]["ineq_max_list"] = ineq_max_list
+            const_vio_dict[name]["ineq_mean_list"] = ineq_mean_list
+            const_vio_dict[name]["ineq_dist"] = ineq_dist
+            const_vio_dict[name]["X"] = X_out
+            const_vio_dict[name]["Y"] = Y_out
+            const_vio_dict[name]["Y_target"] = Y_target
+            const_vio_dict[name]["debug"] = debug_stats
+            
+            print(f"opt gap predicted vs known: {obj_val} vs {known_obj}, opt gap: {opt_gap}%")
+
+    num_nodes = data.node_to_gen_mask.shape[0]  # e.g. 3 nodes
+    lineflow_mask_np = data.lineflow_mask.cpu().numpy()  # [N, L]
+    print(f"Ineq Dist: {ineq_max_list}")
+    for name, d in const_vio_dict.items():
+        dbg = d["debug"]
+
+        # Reconstruct line flows f_lt for this method (batch size 1)
+        Y = d["Y"]                       # [1, ydim]
+        
+        p_gt_node, f_lt_node, md_nt_node = data.split_dec_vars_from_Y(Y)
+        f_lt_np = f_lt_node[0].detach().cpu().numpy()   # [L]
+
+        print(f"\n========== {name} ==========")
+        print(f"opt gap: {d['opt_gap']:.4f}")
+        
+        ''' 
+        Gen prediction  first 6 features,
+        Flow prediction next 3 feature
+        Unmet demand last 3 features
+        '''
+
+
+        import torch
+
+        def print_instance_diffs(Y, Y_out, name="instance"):
+            # Y, Y_out: shape [1, 12] or [12]
+            y = Y.squeeze(0).detach().cpu()
+            yhat = Y_out.squeeze(0).detach().cpu()
+
+            diff = yhat - y
+
+            groups = [
+                ("Generators", slice(0, 6)),
+                ("Flows",      slice(6, 9)),
+                ("Unmet",      slice(9, 12)),
+            ]
+
+            print(f"\n==== {name} ====")
+            for gname, sl in groups:
+                print(f"\n-- {gname} --")
+                for i, (optv, predv, dv) in enumerate(zip(y[sl], yhat[sl], diff[sl])):
+                    # i is within-group index; global index is sl.start + i
+                    gi = (sl.start or 0) + i
+                    print(i)
+                    print(f"idx {gi:02d}: opt={optv.item(): .6f}  pred={predv.item(): .6f}  diff(pred-opt)={dv.item(): .6f} cost={data.cost_vec[i].item()}")
+
+        # usage:
+        Y_gt = const_vio_dict["Baseline"]["Y_target"]
+        Y_out = const_vio_dict["Baseline"]["Y"]
+        X_out = const_vio_dict["Baseline"]["X"]
+        print_instance_diffs(Y_gt, Y_out, name="Baseline (single sample)")
+
+        
+        
+
+        pred_node_balance = compute_node_power_balance_debug(data, X_out, Y_out)
+        gt_node_balance = compute_node_power_balance_debug(data, X_out, Y_gt)
+
+        # === Extract raw decision variables ===
+        p_gt_pred, f_gt_pred, md_pred = data.split_dec_vars_from_Y(Y_out)
+        p_gt_gt,   f_gt_gt,   md_gt   = data.split_dec_vars_from_Y(Y_gt)
+
+        # === Recompute balance residuals explicitly ===
+        eq_rhs, _ = data.split_X(X_out)
+        _, D_nt = data.split_eq_constraints(eq_rhs)
+
+        net_prod_pred = p_gt_pred @ data.node_to_gen_mask.T
+        net_flow_pred = f_gt_pred @ data.lineflow_mask.T
+        balance_resid_pred = D_nt - (net_prod_pred + net_flow_pred + md_pred)
+
+        net_prod_gt = p_gt_gt @ data.node_to_gen_mask.T
+        net_flow_gt = f_gt_gt @ data.lineflow_mask.T
+        balance_resid_gt = D_nt - (net_prod_gt + net_flow_gt + md_gt)
+
+        combined_pred = net_prod_pred + net_flow_pred
+        combined_gt   = net_prod_gt   + net_flow_gt
+
+        print(f"X is {X_out}")
+
+
+        print("\n--- Baseline Node-wise Power Balance Debug Info ---")  
+        print("GT combined_flow vs Pred combined_flow:")
+        for n in range(num_nodes):
+            gt_cf = gt_node_balance["combined_flow"][0,n].item()
+            pred_cf = pred_node_balance["combined_flow"][0,n].item()
+
+            gt_md = gt_node_balance["md_est"][0,n].item()
+            pred_md = pred_node_balance["md_est"][0,n].item()
+            print(f"Node {n}: GT combined flow = {gt_cf:.6f}, Pred combined flow = {pred_cf:.6f}, Diff = {pred_cf - gt_cf:.6f}")
+            print(f"         GT unmet demand = {gt_md:.6f}, Pred unmet demand = {pred_md:.6f}, Diff = {pred_md - gt_md:.6f}")
+
+
+        print(X_out.shape)
+        print(data.cost_vec.shape)
+
+        print(data.node_to_gen_mask)
+
+        print(const_vio_dict["Baseline"]["ineq_dist"])
