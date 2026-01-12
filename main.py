@@ -10,7 +10,12 @@ from primal_dual import PrimalDualTrainer
 from create_gep_dataset import create_gep_ed_dataset
 from create_QP_dataset import create_QP_dataset, create_nonconvex_QP_dataset, create_varying_G_dataset, create_varying_Q_dataset
 CONFIG_FILE_NAME = "config.toml"
-ARGS_FILE_NAME = "config.json"
+'''
+ARGS_FILE_NAME option:
+- "config.json": Default config for experiments. (3 Node)
+- "config-4node.json": Config for 4-node experiments.
+'''
+ARGS_FILE_NAME = "config-4node.json"
 
 
 if __name__ == "__main__":

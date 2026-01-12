@@ -90,7 +90,6 @@ class PrimalDualTrainer():
         self.early_stopping_patience = args["early_stopping_patience"]
         self.X = data.X.to(self.DTYPE).to(self.DEVICE)
         self.loss_option = args.get("loss_option", "Original")
-        # self.normalize_loss = args.get("normalize_loss", False)
         # self.normalize_by_gt = args.get("normalize_by_gt", False)
 
         if self.problem_type == "ED":

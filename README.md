@@ -27,3 +27,15 @@ To create an environment with the correct packages, type the following commands 
 
 ### Experiments
 All experiment data, as well as the code used to generate the figures throughout the thesis, are located in the folder `experiment-output`.
+
+### Dataset
+In the `data\ED_data` folder: there are a few dataset:
+1. `ED_NB-G-F-S_GB2-G2-F2-S2_L5_c0_s0_p0_smp15`:
+    - N: ["BEL", "GER", "FRA","SWI"]
+    - G: ["BEL", "WindOff"], ["BEL", "Gas"], ["GER", "Gas"], ["GER", "SunPV"], ["FRA", "Nuclear"], ["FRA", "SunPV"],["SWI", "Nuclear"], ["SWI", "SunPV"]
+    - L: ["BEL", "GER"], ["BEL", "FRA"], ["GER", "FRA"],["SWI", "FRA"], ["SWI", "GER"]
+
+2. `ED_NB-G-F-S_GB2-G2-F2-S2_L4_c0_s0_p0_smp15`:
+    - N: ["BEL", "GER", "FRA","SPA"]
+    - "G": ["BEL", "WindOff"], ["BEL", "Gas"], ["GER", "Gas"], ["GER", "SunPV"], ["FRA", "Nuclear"], ["FRA", "SunPV"],["SPA", "Nuclear"], ["SPA", "SunPV"]
+    - L: ["BEL", "GER"], ["BEL", "FRA"], ["GER", "FRA"],["SPA", "FRA"]

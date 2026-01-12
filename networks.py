@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class PrimalNet(nn.Module):
@@ -171,11 +172,13 @@ class FeedForwardNet(nn.Module):
 
 
 class BoundRepairLayer(nn.Module):
-    def __init__(self, scale_sigmoid = False, shifted_sigmoid_scale = False, k = 1.0):
+    def __init__(self, scale_sigmoid = False, shifted_sigmoid_scale = False, k = 1.0, repair_scaler = "Sigmoid", softplus_k = 10.0):
         super().__init__()
         self.scale_sigmoid = scale_sigmoid
         self.shifted_sigmoid_scale = shifted_sigmoid_scale
         self.k = k
+        self.softplus_k = softplus_k
+        self.repair_scaler = repair_scaler
         self.s = 100
     
     def forward(self, x, lb, ub):
@@ -189,36 +192,49 @@ class BoundRepairLayer(nn.Module):
         Returns:
             _type_: _description_
         """
-        if self.scale_sigmoid:
-            
-            # # sig_input = k*(x/(ub+lb)+1e-6)
-            # m = (ub+lb) / 2.0
-            # r = (ub - lb) / 2.0
+        if self.repair_scaler == "ScaledSigmoid":
+            sig_input = x*1/self.k
 
-            # scaled = r*torch.tanh((x-m)/self.s) + m
-            # # scaled = torch.sigmoid(sig_input)
-            # repaired = scaled
-            
-            if self.shifted_sigmoid_scale:
-                
-                sig_input = (x - (lb + ub)/2)*1/self.k
-            else:
-                sig_input = x*1/self.k
             scaled = torch.sigmoid(sig_input)
             
             repaired = lb + (ub - lb) * scaled
-        else:
+        elif self.repair_scaler == "ShiftedScaledSigmoid":
+
+            sig_input = (x - (lb + ub)/2)*1/self.k
+
+            scaled = torch.sigmoid(sig_input)
+            
+            repaired = lb + (ub - lb) * scaled
+        elif self.repair_scaler == "Sigmoid":
             sig_input = x
             scaled = torch.sigmoid(sig_input)
             
             repaired = lb + (ub - lb) * scaled
+        elif self.repair_scaler == "SoftPlus":
+            repaired = self.smooth_clip(x, lb, ub, k=self.softplus_k)
         if False: #! Set to True to attach hooks to inspect gradients
             def print_grad(name):
                 return lambda grad: print(f"Gradient for {name}: {grad.norm():.4e}")
             x.register_hook(print_grad("x"))
             scaled.register_hook(print_grad("sigmoid(kx)"))
             repaired.register_hook(print_grad("repaired output"))
+
+        # Softplus
+
+
+
         return repaired
+    def softplusK(self, x, k=1.0):
+        return F.softplus(k * x) / k
+
+    def s_max(self,x, M, k=1.0):
+        return M - self.softplusK(M - x, k)
+
+    def s_min(self,x, M, k=1.0):
+        return self.softplusK(x - M, k) + M
+
+    def smooth_clip(self,x, L, U, k=1.0):
+        return self.s_max(self.s_min(x, L, k), U, k)
     
 class EstimateSlackLayer(nn.Module):
     def __init__(self, node_to_gen_mask, lineflow_mask):
@@ -312,7 +328,15 @@ class PrimalNetEndToEnd(nn.Module):
             # else:
             #     self.bound_repair_layer = BoundRepairLayer()
             # # self.ramping_repair_layer = RampingRepairLayer()
-            self.bound_repair_layer = BoundRepairLayer(scale_sigmoid= self.args["scale_sigmoid"], shifted_sigmoid_scale=self.args["shifted_sigmoid_scale"], k = self.args["k"])
+            if "repair_scaler" not in self.args:
+                if self.args["scale_sigmoid"]:
+                    self.args["repair_scaler"] = "ScaledSigmoid"
+                elif self.args["shifted_sigmoid_scale"]:
+                    self.args["repair_scaler"] = "ShiftedScaledSigmoid"
+                else:
+                    self.args["repair_scaler"] = "Sigmoid"
+            self.bound_repair_layer = BoundRepairLayer(scale_sigmoid= self.args["scale_sigmoid"], shifted_sigmoid_scale=self.args["shifted_sigmoid_scale"], 
+                                                       k = self.args["k"], repair_scaler= self.args["repair_scaler"], softplus_k = self.args.get("soft_plus_k", 10.0))
         if self.args["repair_completion"]:
             self.estimate_slack_layer = EstimateSlackLayer(data.node_to_gen_mask.to(self.DTYPE).to(self.DEVICE), data.lineflow_mask.to(self.DTYPE).to(self.DEVICE))
     
@@ -330,14 +354,7 @@ class PrimalNetEndToEnd(nn.Module):
         # [B, bounds, T]
         p_gt_lb, p_gt_ub, f_lt_lb, f_lt_ub, md_nt_lb, md_nt_ub = self.data.split_ineq_constraints(ineq_rhs)
 
-        # print("===========Before Bound Repair============")
-        
-        # print(f"Line Flows f_lt: {f_lt}")
-        # temp_UI_g, temp_D_nt = self.data.split_eq_constraints(eq_rhs)
-        # temp_md_nt = self.estimate_slack_layer(p_gt, f_lt, temp_D_nt)
-        # print(f"Estimated unmet demand md_nt: {temp_md_nt}")
-        # comp_mask = temp_md_nt < temp_D_nt
-        # print(comp_mask)
+
         
         if self.args["repair_bounds"]:
             p_gt = self.bound_repair_layer(p_gt, p_gt_lb, p_gt_ub)
@@ -345,37 +362,25 @@ class PrimalNetEndToEnd(nn.Module):
                 #! Note: Lineflows cannot be repaired more, since they depend on other lineflows. 
                 #! For example, if we repair a lineflow such that it cannot export more than (imports + generation),
                 #! then it will affect other lineflows, and we would need to repair them again.
-
-            
             if "flow_scale_by_prod" in self.args and self.args["flow_scale_by_prod"]:
-                # More restrictive way to repair line flows based on production capacity at nodes. 
+                # More restrictive way to repair line flows based on production capacity at nodes.  
                 total_prod = torch.matmul(p_gt, self.data.node_to_gen_mask.T)  # [B, N]
  
                 source_mask = (self.data.lineflow_mask == -1).to(self.DTYPE).to(self.DEVICE)  # [N, L]
                 
                 count_line_per_node = torch.count_nonzero(self.data.lineflow_mask, dim = 0)
 
-                
                 max_outflow_by_prod = torch.matmul(total_prod, source_mask) / count_line_per_node  # [B, L]
-                # print(f"Max outflow by production shape: {max_outflow_by_prod}")
 
-                # The other side 
-                # print(f"Original f_lt_ub: {f_lt_lb}")
                 source_mask = (self.data.lineflow_mask == 1).to(self.DTYPE).to(self.DEVICE)  # [N, L]
        
                 '''
                 Total Prod: (B,N) Mask: (N,L) --> (B,L) 
                 '''
-                # print(f"Totol prod {total_prod}")
-                # print(f"Source Mask == 1: {source_mask}") # total prod i -> line cap that exit this node i
                 max_inflow_by_prod = torch.matmul(total_prod, source_mask) / count_line_per_node # [B, L]
-                # print(f"Max inflow by production shape: {max_inflow_by_prod}")
-                # print(f"Line LB before adjustment: {f_lt_lb}")
-
 
                 f_lt_ub_adjusted = torch.min(f_lt_ub, max_outflow_by_prod)
                 f_lt_lb_adjusted = torch.min(f_lt_lb, max_inflow_by_prod)
-                # print(f"Adjusted f_lt_ub: {f_lt_ub_adjusted} Adjusted f_lt_lb: {f_lt_lb_adjusted}")
                
                 f_lt = self.bound_repair_layer(f_lt, -f_lt_lb_adjusted, f_lt_ub_adjusted)
             else:
