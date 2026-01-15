@@ -15,7 +15,7 @@ ARGS_FILE_NAME option:
 - "config.json": Default config for experiments. (3 Node)
 - "config-4node.json": Config for 4-node experiments.
 '''
-ARGS_FILE_NAME = "config-4node.json"
+ARGS_FILE_NAME = "config.json"
 
 
 if __name__ == "__main__":

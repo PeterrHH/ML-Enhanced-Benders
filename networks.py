@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.preprocessing import StandardScaler
 
 
 class PrimalNet(nn.Module):
@@ -34,6 +35,7 @@ class PrimalNet(nn.Module):
     
     def forward(self, x, total_demands=None):
         #! If we are training, we do not scale the output by the total demands. Only for logging metrics.
+
         if not self.training and (total_demands != None):
             return self.net(x) * total_demands
         else:
@@ -83,6 +85,7 @@ class DualNet(nn.Module):
         self.net = nn.Sequential(*layers)
     
     def forward(self, x, *args):
+        print(f"DualNet input x shape: {x.shape} 0: {x[0,:]}")
         out = self.net(x)
         out_mu = out[:, :self.mu_size]
         out_lamb = out[:, self.mu_size:]
@@ -341,6 +344,7 @@ class PrimalNetEndToEnd(nn.Module):
             self.estimate_slack_layer = EstimateSlackLayer(data.node_to_gen_mask.to(self.DTYPE).to(self.DEVICE), data.lineflow_mask.to(self.DTYPE).to(self.DEVICE))
     
     def forward(self, x, total_demands=None):
+        # print(f"PrimalNet input x shape: {x[0,:]}")
         eq_rhs, ineq_rhs = self.data.split_X(x)
         x_out = self.feed_forward(x)
         if not self.args["repair"]:
@@ -472,6 +476,7 @@ class DualNetEndToEnd(nn.Module):
         self.feed_forward = FeedForwardNet(args, data.xdim, self.hidden_sizes, output_dim=self.out_dim, layernorm=True).to(self.DTYPE).to(self.DEVICE)
     
     def complete_duals(self, lamb):
+        
         eq_cm_D_nt = self.data.eq_cm
         lamb_D_nt = lamb
         obj_coeff = self.data.obj_coeff
@@ -503,6 +508,7 @@ class DualNetEndToEnd(nn.Module):
         
         
     def forward(self, x):
+        
         out_lamb = self.feed_forward(x)
         out_mu = self.complete_duals(out_lamb)
         # print(out_lamb)
@@ -754,6 +760,7 @@ if __name__ == "__main__":
     def evaluate_individual(data, primal_net, test_indices, index):      
 
         X = data.X[test_indices]
+        print(f"X is {X.shape}")
         Y_target = data.opt_targets["y_operational"][test_indices]
         
 
@@ -800,7 +807,7 @@ if __name__ == "__main__":
     exp_paths = ["outputs/PDL/ED/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-NoNormRepairAll"]
     name_list = ["Baseline"]
 
-    exp_paths = ["outputs/PDL/ED/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalScaledSig100"]
+    exp_paths = ["outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalScaledSig100"]
     name_list = ["Baseline"]
 
     ARGS_FILE_NAME = "config.json"
@@ -910,7 +917,7 @@ if __name__ == "__main__":
         Y_gt = const_vio_dict["Baseline"]["Y_target"]
         Y_out = const_vio_dict["Baseline"]["Y"]
         X_out = const_vio_dict["Baseline"]["X"]
-        print_instance_diffs(Y_gt, Y_out, name="Baseline (single sample)")
+        # print_instance_diffs(Y_gt, Y_out, name="Baseline (single sample)")
 
         
         
@@ -940,21 +947,21 @@ if __name__ == "__main__":
         print(f"X is {X_out}")
 
 
-        print("\n--- Baseline Node-wise Power Balance Debug Info ---")  
-        print("GT combined_flow vs Pred combined_flow:")
-        for n in range(num_nodes):
-            gt_cf = gt_node_balance["combined_flow"][0,n].item()
-            pred_cf = pred_node_balance["combined_flow"][0,n].item()
+        # print("\n--- Baseline Node-wise Power Balance Debug Info ---")  
+        # print("GT combined_flow vs Pred combined_flow:")
+        # for n in range(num_nodes):
+        #     gt_cf = gt_node_balance["combined_flow"][0,n].item()
+        #     pred_cf = pred_node_balance["combined_flow"][0,n].item()
 
-            gt_md = gt_node_balance["md_est"][0,n].item()
-            pred_md = pred_node_balance["md_est"][0,n].item()
-            print(f"Node {n}: GT combined flow = {gt_cf:.6f}, Pred combined flow = {pred_cf:.6f}, Diff = {pred_cf - gt_cf:.6f}")
-            print(f"         GT unmet demand = {gt_md:.6f}, Pred unmet demand = {pred_md:.6f}, Diff = {pred_md - gt_md:.6f}")
+        #     gt_md = gt_node_balance["md_est"][0,n].item()
+        #     pred_md = pred_node_balance["md_est"][0,n].item()
+        #     print(f"Node {n}: GT combined flow = {gt_cf:.6f}, Pred combined flow = {pred_cf:.6f}, Diff = {pred_cf - gt_cf:.6f}")
+        #     print(f"         GT unmet demand = {gt_md:.6f}, Pred unmet demand = {pred_md:.6f}, Diff = {pred_md - gt_md:.6f}")
 
 
-        print(X_out.shape)
-        print(data.cost_vec.shape)
+        # print(X_out.shape)
+        # print(data.cost_vec.shape)
 
-        print(data.node_to_gen_mask)
+        # print(data.node_to_gen_mask)
 
-        print(const_vio_dict["Baseline"]["ineq_dist"])
+        # print(const_vio_dict["Baseline"]["ineq_dist"])

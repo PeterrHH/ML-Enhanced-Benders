@@ -84,10 +84,10 @@
     "_Flow_scale_by_prod_Comment": "If true, scale line flow repair bounds based on production capacity at nodes. (More restrictive.)",
     "scale_sigmoid": false,
     "shifted_sigmoid_scale": false,
-    "repair_scaler": "SoftPlus",
+    "repair_scaler": "Sigmoid",
     "_Comment":"RepairLayer Scaler Option: Sigmoid, ScaledSigmoid , ShiftedScaledSigmoid, SoftPlus",
     "k": 100.0,
-    "soft_plus_k": 50.0,
+    "soft_plus_k": 10.0,
 
 
 

@@ -78,7 +78,7 @@
     "dual_classification": false,
     "normalize_loss": false, 
     "normalize_by_gt": false,
-    "loss_option": "Original",
+    "loss_option": "Duality_Gap",
     "_Comments": "loss option: Original, Norm_GT (Normalize by ground truth obj), Norm_Obj (Normalize by obj), Duality_Gap, Log",
     "flow_scale_by_prod": false,
     "_Flow_scale_by_prod_Comment": "If true, scale line flow repair bounds based on production capacity at nodes. (More restrictive.)",
