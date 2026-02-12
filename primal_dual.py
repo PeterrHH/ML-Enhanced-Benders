@@ -134,6 +134,7 @@ class PrimalDualTrainer():
         self.valid_loader = DataLoader(self.valid_dataset, batch_size=len(self.valid_dataset), generator=torch.Generator(device=self.DEVICE))
         # self.test_loader = DataLoader(self.test_dataset, batch_size=len(self.test_dataset))
 
+
         if self.problem_type == "QP":
             self.primal_loss_fn = self.primal_loss_QP
             self.dual_loss_fn = self.dual_loss
@@ -157,6 +158,8 @@ class PrimalDualTrainer():
             else:
                 self.dual_net = DualNet(self.args, self.data).to(dtype=self.DTYPE, device=self.DEVICE)
                 self.dual_loss_fn = self.dual_loss
+
+    
 
         elif self.problem_type == "GEP":
             # TODO: Implement GEP networks
@@ -206,6 +209,33 @@ class PrimalDualTrainer():
 
         self.duality_gap_list =[]
 
+        # Fit the scalers:
+        if args.get("normalize") == "z_score":
+            with torch.no_grad():
+                Xtr = self.X_train  # [B, N+G]
+
+            d = Xtr[:, :self.data.num_n]
+            p = Xtr[:, self.data.num_n:self.data.num_n + self.data.num_g]
+
+            d_mean = d.mean(dim=0)
+            d_std  = d.std(dim=0).clamp_min(1e-8)
+            p_mean = p.mean(dim=0)
+            p_std  = p.std(dim=0).clamp_min(1e-8)
+
+            self.primal_net.d_mean.copy_(d_mean)
+            self.primal_net.d_std.copy_(d_std)
+            self.primal_net.p_mean.copy_(p_mean)
+            self.primal_net.p_std.copy_(p_std)
+        
+            self.dual_net.d_mean.copy_(d_mean)
+            self.dual_net.d_std.copy_(d_std)
+            self.dual_net.p_mean.copy_(p_mean)
+            self.dual_net.p_std.copy_(p_std)
+
+            print(f"Computed and set normalization stats in trainer.")
+            print(f"D mean: {d_mean}, D std: {d_std}")
+            print(f"P mean: {p_mean}, P std: {p_std}")
+
     def freeze(self, network):
         """
         Create a frozen copy of a network
@@ -230,6 +260,8 @@ class PrimalDualTrainer():
         frozen_net.eval()
         
         return frozen_net
+    
+
 
     def train_PDL(self, optuna_trial=None):
         print("Starting Primal-Dual Learning inside the train_PDL function")
@@ -311,6 +343,7 @@ class PrimalDualTrainer():
                     with torch.no_grad():
                         self.primal_net.eval()
                         frozen_dual_net.eval()
+                        # print(f"In eval the primal net p and d are: {self.primal_net.p_mean}, {self.primal_net.d_mean}")
                         obj_val_mean, primal_obj_val_mean ,val_loss_mean, ineq_max, ineq_mean, eq_max, eq_mean, dual_obj_val_mean, dual_loss_mean = self.evaluate(self.valid_dataset.tensors[0], self.valid_dataset.tensors[1], self.primal_net, self.dual_net, self.valid_dataset.tensors[2])    
                         if k > 0:
                             self.save_if_best(obj_val_mean, ineq_max, ineq_mean, eq_max, eq_mean, dual_obj_val_mean)
@@ -375,7 +408,7 @@ class PrimalDualTrainer():
                             mu_k, lamb_k = None, None
                             y = None
 
-                        batch_loss, obj, lagrange_eq, lagrange_ineq, penalty = self.dual_loss_fn(Xtrain, y, mu, lamb, mu_k, lamb_k, X_opt)
+                        batch_loss, obj, lagrange_eq, lagrange_ineq, penalty = self.dual_loss_fn(X = Xtrain, y = y, mu = mu, lamb = lamb, mu_k = mu_k, lamb_k= lamb_k, X_opt = X_opt)
                         batch_loss, obj, lagrange_eq, lagrange_ineq, penalty = batch_loss.mean(), obj.mean(), lagrange_eq.mean(), lagrange_ineq.mean(), penalty.mean()
                         total_train_loss += batch_loss.item()
                         total_obj += obj.item()
@@ -662,7 +695,7 @@ class PrimalDualTrainer():
         # print(f"Dual loss: {loss.mean().item()} Normalized {((X_opt - loss)/X_opt).mean().item()}")
         return loss, torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0)
     
-    def alternate_dual_loss(self, X, Y, mu, lamb, X_opt ,mu_k=None, lamb_k=None):
+    def alternate_dual_loss(self, X, y, mu, lamb, X_opt ,mu_k=None, lamb_k=None):
         #! We maximize the dual obj func, so to use it in the loss, take the negation.
         dual_obj = self.data.dual_obj_fn(X, mu, lamb)
 
@@ -671,13 +704,13 @@ class PrimalDualTrainer():
         if self.loss_option == "Norm_GT":
             loss = loss / X_opt
         elif self.loss_option == "Norm_Obj":
-            scale = self.data.obj_fn(X, Y).detach().abs() + 1e-6
+            scale = self.data.obj_fn(X, y).detach().abs() + 1e-6
             loss = loss / scale
 
 
         elif self.loss_option == "Duality_Gap":
             # Comput the primal and dual obj, and use their difference as the loss.
-            primal_obj = self.data.obj_fn(X, Y).detach()
+            primal_obj = self.data.obj_fn(X, y).detach()
             dual_obj = self.data.dual_obj_fn(X, mu, lamb)
             loss = (primal_obj - dual_obj) 
 

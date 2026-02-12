@@ -26,9 +26,9 @@
         "device": "cpu"
     },
     "Benders_args": {
-       "N": ["BEL", "GER", "FRA"],
-        "G": [["BEL", "WindOff"], ["BEL", "Gas"], ["GER", "Gas"], ["GER", "SunPV"], ["FRA", "Nuclear"], ["FRA", "SunPV"]],
-        "L": [["BEL", "GER"], ["BEL", "FRA"], ["GER", "FRA"]],
+        "N": ["BEL", "GER", "FRA","SPA"],
+        "G": [["BEL", "WindOff"], ["BEL", "Gas"], ["GER", "Gas"], ["GER", "SunPV"], ["FRA", "Nuclear"], ["FRA", "SunPV"],["SPA", "Nuclear"], ["SPA", "SunPV"]],
+        "L": [["BEL", "GER"], ["BEL", "FRA"], ["GER", "FRA"],["SPA", "FRA"]],
         "benders_compact": false,
         "scale_problem": false,
         "scale_input": false,
@@ -39,7 +39,9 @@
         "synthetic_demand_capacity": false,
         "normalize_input": false,
         "repeats": 1,
-        "device": "cpu"
+        "device": "cpu",
+        "primal_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0", 
+        "dual_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
     },
     "Optuna_args": {
         "optuna": false,
@@ -73,12 +75,12 @@
     
     "learn_primal": true,
     "learn_dual": true,
-    "dual_alternate_loss": false,
-    "dual_completion": false,
-    "dual_classification": false,
+    "dual_alternate_loss": true,
+    "dual_completion": true,
+    "dual_classification": true,
     "normalize_loss": false, 
     "normalize_by_gt": false,
-    "loss_option": "Duality_Gap",
+    "loss_option": "Original",
     "_Comments": "loss option: Original, Norm_GT (Normalize by ground truth obj), Norm_Obj (Normalize by obj), Duality_Gap, Log",
     "flow_scale_by_prod": false,
     "_Flow_scale_by_prod_Comment": "If true, scale line flow repair bounds based on production capacity at nodes. (More restrictive.)",

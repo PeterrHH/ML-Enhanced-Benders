@@ -39,3 +39,9 @@ In the `data\ED_data` folder: there are a few dataset:
     - N: ["BEL", "GER", "FRA","SPA"]
     - "G": ["BEL", "WindOff"], ["BEL", "Gas"], ["GER", "Gas"], ["GER", "SunPV"], ["FRA", "Nuclear"], ["FRA", "SunPV"],["SPA", "Nuclear"], ["SPA", "SunPV"]
     - L: ["BEL", "GER"], ["BEL", "FRA"], ["GER", "FRA"],["SPA", "FRA"]
+
+3. `ED_NB-G-F-S-N_GB2-G2-F2-S2-N2_L6_c0_s0_p0_smp15.pkl`:
+ 5 Node
+
+4. `ED_NB-G-F-S-N-S_GB2-G2-F2-S2-N2-S2_L8_c0_s0_p0_smp15.pkl`
+6 Node

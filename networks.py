@@ -83,12 +83,25 @@ class DualNet(nn.Module):
         layers.append(self.out_layer)
 
         self.net = nn.Sequential(*layers)
+
+        self.normalize = args.get("normalize", None)
+        if self.normalize == "z_score":
+            N = data.num_n
+            G = data.num_g
+            self.register_buffer("d_mean", torch.zeros(N, dtype=self.DTYPE))
+            self.register_buffer("d_std",  torch.ones(N, dtype=self.DTYPE))
+
+            # capacity stats
+            self.register_buffer("p_mean", torch.zeros(G, dtype=self.DTYPE))
+            self.register_buffer("p_std",  torch.ones(G, dtype=self.DTYPE))
+
     
     def forward(self, x, *args):
-        print(f"DualNet input x shape: {x.shape} 0: {x[0,:]}")
+        # print(f"DualNet input x shape: {x.shape} 0: {x[0,:]}")
         out = self.net(x)
         out_mu = out[:, :self.mu_size]
         out_lamb = out[:, self.mu_size:]
+        # print(f"DualNet output mu shape: {out_mu.shape} lamb shape: {out_lamb.shape} MU: {out_mu[0,:]} LAMB: {out_lamb[0,:]}")
         return out_mu, out_lamb
 
 
@@ -343,11 +356,59 @@ class PrimalNetEndToEnd(nn.Module):
         if self.args["repair_completion"]:
             self.estimate_slack_layer = EstimateSlackLayer(data.node_to_gen_mask.to(self.DTYPE).to(self.DEVICE), data.lineflow_mask.to(self.DTYPE).to(self.DEVICE))
     
+        self.normalize = args.get("normalize", None)
+        if self.normalize == "z_score":
+            N = data.num_n
+            G = data.num_g
+            L = data.num_l
+            self.register_buffer("d_mean", torch.zeros(N, dtype=self.DTYPE))
+            self.register_buffer("d_std",  torch.ones(N, dtype=self.DTYPE))
+
+            # capacity stats
+            self.register_buffer("p_mean", torch.zeros(G, dtype=self.DTYPE))
+            self.register_buffer("p_std",  torch.ones(G, dtype=self.DTYPE))
+
+            self.register_buffer("f_mean", torch.zeros(L, dtype=self.DTYPE))
+            self.register_buffer("f_std",  torch.ones(L, dtype=self.DTYPE))
+
+    def scale(self, x):
+        if self.normalize == "z_score":
+            d = x[:, :self.data.num_n]
+            p = x[:, self.data.num_n:self.data.num_n + self.data.num_g]
+
+            d = (d - self.d_mean) / self.d_std
+            p = (p - self.p_mean) / self.p_std
+            x_scale = torch.cat([d, p], dim=1)
+        else:
+            x_scale = x
+        return x_scale
+    
+    def inverse_scale(self, p, f):
+        ''' 
+        if repair_completion:
+            x_out is [md, p, f]
+        else:
+            x_out is [p, f, md]
+
+        Here we only worry about p, f
+        '''
+        p = p * self.p_std + self.p_mean
+        return p, f
+
+
     def forward(self, x, total_demands=None):
-        # print(f"PrimalNet input x shape: {x[0,:]}")
-        eq_rhs, ineq_rhs = self.data.split_X(x)
+
+        eq_rhs, ineq_rhs = self.data.split_X(x)  # Eq_rhs: [B, N_eqrhs], Ineq_rhs: [B, N_ineqrhs]
+        # print(f"In Primal Eq Rhs shape: {eq_rhs[0,:]}, Ineq Rhs shape: {ineq_rhs[0,:]} X SHape {x[0,:]} ")
+        if self.normalize:
+            x = self.scale(x)
+            pass
+
+
         x_out = self.feed_forward(x)
+
         if not self.args["repair"]:
+            # TODO: if normalize, rescale it.
             return x_out
         # [B, G, T], [B, L, T]
         if self.args["repair_completion"]:
@@ -359,7 +420,9 @@ class PrimalNetEndToEnd(nn.Module):
         p_gt_lb, p_gt_ub, f_lt_lb, f_lt_ub, md_nt_lb, md_nt_ub = self.data.split_ineq_constraints(ineq_rhs)
 
 
-        
+        if self.normalize:
+            p_gt, f_lt = self.inverse_scale(p_gt, f_lt)
+
         if self.args["repair_bounds"]:
             p_gt = self.bound_repair_layer(p_gt, p_gt_lb, p_gt_ub)
                 # Lineflow lower bound is negative.
@@ -391,16 +454,6 @@ class PrimalNetEndToEnd(nn.Module):
                 f_lt = self.bound_repair_layer(f_lt, -f_lt_lb, f_lt_ub) #! Bounds need to be repaired for this to work!
 
     
-
-        # print("\n===========Before Power Balance Repair============")
-        # print(f"Generation p_gt: {p_gt}")
-        # print(f"Line Flows f_lt: {f_lt}")
-        # temp_UI_g, temp_D_nt = self.data.split_eq_constraints(eq_rhs)
-
-        # temp_md_nt = self.estimate_slack_layer(p_gt, f_lt, temp_D_nt)
-        # print(f"Estimated unmet demand md_nt: {temp_md_nt}")
-        # comp_mask = temp_md_nt < temp_D_nt
-        # print(comp_mask)
 
 
         if self.args["repair_power_balance"]:
@@ -448,8 +501,11 @@ class PrimalNetEndToEnd(nn.Module):
 
         # Only scale if we are not training.
         if not self.training and (total_demands != None):
+            # print(f"Multiplying by total demands: {total_demands} in eval mode")
             return y * total_demands
+            # return y
         else:
+
             return y
 
 class DualNetEndToEnd(nn.Module):
@@ -472,8 +528,33 @@ class DualNetEndToEnd(nn.Module):
             self.DTYPE = torch.float64
             self.DEVICE = torch.device("cpu")
 
+        self.normalize = args.get("normalize", None)
+        if self.normalize == "z_score":
+            N = data.num_n
+            G = data.num_g
+            self.register_buffer("d_mean", torch.zeros(N, dtype=self.DTYPE))
+            self.register_buffer("d_std",  torch.ones(N, dtype=self.DTYPE))
+
+            # capacity stats
+            self.register_buffer("p_mean", torch.zeros(G, dtype=self.DTYPE))
+            self.register_buffer("p_std",  torch.ones(G, dtype=self.DTYPE))
+
+
         #! Only predict lambda, we infer mu from it.
         self.feed_forward = FeedForwardNet(args, data.xdim, self.hidden_sizes, output_dim=self.out_dim, layernorm=True).to(self.DTYPE).to(self.DEVICE)
+    
+    
+    def scale(self, x):
+        if self.normalize == "z_score":
+            d = x[:, :self.data.n_md_vars]
+            p = x[:, self.data.n_md_vars:]
+
+            d = (d - self.d_mean) / self.d_std
+            p = (p - self.p_mean) / self.p_std
+            x_scale = torch.cat([d, p], dim=1)
+        else:
+            x_scale = x
+        return x_scale
     
     def complete_duals(self, lamb):
         
@@ -508,7 +589,9 @@ class DualNetEndToEnd(nn.Module):
         
         
     def forward(self, x):
-        
+        if self.normalize:
+            x = self.scale(x)
+            
         out_lamb = self.feed_forward(x)
         out_mu = self.complete_duals(out_lamb)
         # print(out_lamb)
@@ -537,9 +620,32 @@ class DualClassificationNetEndToEnd(nn.Module):
             self.DTYPE = torch.float64
             self.DEVICE = torch.device("cpu")
 
+        self.normalize = args.get("normalize", None)
+        if self.normalize == "z_score":
+            N = data.num_n
+            G = data.num_g
+            self.register_buffer("d_mean", torch.zeros(N, dtype=self.DTYPE))
+            self.register_buffer("d_std",  torch.ones(N, dtype=self.DTYPE))
+
+            # capacity stats
+            self.register_buffer("p_mean", torch.zeros(G, dtype=self.DTYPE))
+            self.register_buffer("p_std",  torch.ones(G, dtype=self.DTYPE))
+
         #! Only predict lambda, we infer mu from it.
         #! Softmax requires layer norm.
         self.feed_forward = FeedForwardNet(args, data.xdim, self.hidden_sizes, output_dim=self.out_dim, layernorm=True).to(self.DTYPE).to(self.DEVICE)
+    
+    def scale(self, x):
+        if self.normalize == "z_score":
+            d = x[:, :self.data.num_n]
+            p = x[:, self.data.num_n:]
+
+            d = (d - self.d_mean) / self.d_std
+            p = (p - self.p_mean) / self.p_std
+            x_scale = torch.cat([d, p], dim=1)
+        else:
+            x_scale = x
+        return x_scale
     
     def complete_duals(self, lamb):
         eq_cm_D_nt = self.data.eq_cm
@@ -573,6 +679,8 @@ class DualClassificationNetEndToEnd(nn.Module):
         
         
     def forward(self, x):
+        if self.normalize:
+            x = self.scale(x)
         out_lamb_raw_probas = self.feed_forward(x) # [B, n_var*n_classes]
         T = 1
         out_lamb_raw_probas = out_lamb_raw_probas.view(-1, self.n_dual_vars, self.n_classes) # [B, n_var, n_classes]

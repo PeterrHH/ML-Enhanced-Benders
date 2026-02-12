@@ -39,7 +39,9 @@
         "synthetic_demand_capacity": false,
         "normalize_input": false,
         "repeats": 1,
-        "device": "cpu"
+        "device": "cpu",
+        "primal_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0", 
+        "dual_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
     },
     "Optuna_args": {
         "optuna": false,
@@ -73,9 +75,9 @@
     
     "learn_primal": true,
     "learn_dual": true,
-    "dual_alternate_loss": false,
-    "dual_completion": false,
-    "dual_classification": false,
+    "dual_alternate_loss": true,
+    "dual_completion": true,
+    "dual_classification": true,
     "normalize_loss": true, 
     "normalize_by_gt": false,
     "loss_option": "Original",
@@ -86,6 +88,7 @@
     "shifted_sigmoid_scale": false,
     "repair_scaler": "Sigmoid",
     "_Comment":"RepairLayer Scaler Option: Sigmoid, ScaledSigmoid , ShiftedScaledSigmoid, SoftPlus",
+    "normalize": "",
     "k": 100.0,
     "soft_plus_k": 10.0,
 

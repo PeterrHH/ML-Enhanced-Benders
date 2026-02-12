@@ -44,6 +44,14 @@ class BendersSolver():
         self.exact_iterations = 0
         self.inexact_iterations = 0
 
+        self.ub_hist = []
+        self.lb_hist = []
+        self.master_time_hist = []
+        self.sub_time_hist = []
+        self.exact_flag_hist = []
+        self.iter_hist = []
+
+
     @property
     def X(self):
         return torch.cat(self.X_all, dim=0)
@@ -549,6 +557,19 @@ class BendersSolver():
             lower_bound = obj_val_master[0] + obj_val_master[1]
             upper_bound = obj_val_master[0] + primal_obj_val_total
 
+            # --- LOG UB/LB PER ITERATION ---
+            self.ub_hist.append(float(upper_bound))
+            self.lb_hist.append(float(lower_bound))
+            self.iter_hist.append(int(i))
+            self.exact_flag_hist.append(bool(self.exact))
+            self.sub_time_hist.append(float(inference_time_subproblems_total))
+            # master time only exists when i>0 in your code
+            if i == 0:
+                self.master_time_hist.append(0.0)
+            else:
+                self.master_time_hist.append(float(inference_time_master))
+
+            # Check for optimality
             if self.exact:
                 print("Found upper bound:",upper_bound)
                 if upper_bound < self.best_upper_bound:
@@ -646,7 +667,7 @@ if __name__ == "__main__":
     experiment = data["experiment"]
     outputs_config = data["outputs_config"]
 
-    with open("config.json", "r") as file:
+    with open("config-5node.json", "r") as file:
         args = json.load(file)
     
     print(args)
@@ -703,8 +724,19 @@ if __name__ == "__main__":
             # !Load primal and dual net
             # primal_net_directory = "experiment-output/ch7/3nodes/primal_model"
             # dual_net_directory = "experiment-output/ch7/3nodes/dual_model"
-            primal_net_directory = "outputs/PDL/ED/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-DualClassDualityGap/repeat:0"
-            dual_net_directory = "outputs/PDL/ED/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-DualClassDualityGap/repeat:0"
+            # primal_net_directory = "outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
+            # dual_net_directory = "outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
+            if "primal_net_directory" in args["Benders_args"]:
+                primal_net_directory = args["Benders_args"]["primal_net_directory"]
+            else:
+                primal_net_directory = "outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
+            
+            if "dual_net_directory" in args["Benders_args"]:
+                dual_net_directory = args["Benders_args"]["dual_net_directory"]
+            else:
+                dual_net_directory = "outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
+            print(f"Primal Net Directory: {primal_net_directory}")
+            print(f"Dual Net Directory: {dual_net_directory}")
             primal_model_args = json.load(open(os.path.join(primal_net_directory, "args.json")))
             dual_model_args = json.load(open(os.path.join(dual_net_directory, "args.json")))
             
@@ -725,12 +757,14 @@ if __name__ == "__main__":
             start_exact = True
             exact_refinement = False
 
-            benders_setups = [(True, False), # Exact Benders
-                                (False, False), # Inexact Benders
-                                (False, True)] # Inexact Benders with exact refinement
+            # benders_setups = [(True, False), # Exact Benders
+            #                     (False, False), # Inexact Benders
+            #                     (False, True)] # Inexact Benders with exact refinement
+
+            benders_setups = [(False, True)] # Inexact Benders with exact refinement
 
             # experiment_data = {"opt_obj": [], "upper_bound": [], "lower_bound": [], "total_iterations": [], "exact_iterations": [], "inexact_iterations": [], "total_time": [], "total_time_master": [], "total_time_subproblem_exact": [], "total_time_subproblem_pdl": []}
-            samples = 8760 // benders_args["sample_duration"]
+            samples = 8760 // benders_args["sample_duration"] # SAMPLE
             # sample = 0
             for (start_exact, exact_refinement) in benders_setups:
                 all_results = []
@@ -747,6 +781,24 @@ if __name__ == "__main__":
                         # Solving a subproblem
                         upper_bound, lower_bound, benders_cuts_all, investments_all, obj_val_subproblems_all, iterations = solver.solve_with_benders(gep_data, benders_args['benders_compact'], sample)
                         
+                        iter_df = pd.DataFrame({
+                            "sample": sample,
+                            "iter": solver.iter_hist,
+                            "UB": solver.ub_hist,
+                            "LB": solver.lb_hist,
+                            "gap_abs": np.array(solver.ub_hist) - np.array(solver.lb_hist),
+                            "gap_rel": (np.array(solver.ub_hist) - np.array(solver.lb_hist)) / np.maximum(1.0, np.abs(np.array(solver.ub_hist))),
+                            "exact_mode": solver.exact_flag_hist,
+                            "t_master": solver.master_time_hist,
+                            "t_sub": solver.sub_time_hist,
+                        })
+
+                        out_dir = "outputs/Benders/5Node/iter_logs_inexact_refine"
+                        os.makedirs(out_dir, exist_ok=True)
+                        iter_df.to_csv(
+                            os.path.join(out_dir, f"iterlog_sample{sample}_start_exact{start_exact}_ref{exact_refinement}.csv"),
+                            index=False
+                        )
                         # ! If you want to save data for the first sample for plotting, uncomment the following line.
                         # if start_exact and sample == 0:
                         #     solver.save_data(f"experiment-output/ch7/3nodes/benders_data")
@@ -777,11 +829,12 @@ if __name__ == "__main__":
                             "investments": y[:gep_data.num_g].tolist()
                         }
                         all_results.append(result)
+                        break
                         
                 #! Set to True if saving data.
                 if True:
                     experiment_data_df = pd.DataFrame(all_results)
-                    experiment_data_df.to_csv(f"experiment-output/ch7/3nodes/benders_data/experiment_data_sample_duration:{benders_args['sample_duration']}_start_exact:{start_exact}_exact_refinement:{exact_refinement}_run_name:{run_name}.csv", index=False)
+                    experiment_data_df.to_csv(f"outputs/Benders/5Node/experiment_data_sample_duration:{benders_args['sample_duration']}_start_exact:{start_exact}_exact_refinement:{exact_refinement}_run_name:{run_name}.csv", index=False)
 
 
             # ! Plotting optimality gap per iteration
@@ -802,16 +855,16 @@ if __name__ == "__main__":
                     "font.size": 16
                 })
 
-                plt.plot(np.array(solver.primal_opt_gap_all)*100, label="Primal opt gap", color=primal_color, linewidth=2, marker='o')
-                plt.plot(np.array(solver.dual_opt_gap_all)*100, label="Dual opt gap", color=dual_color, linewidth=2, marker='o')
+                # plt.plot(np.array(solver.primal_opt_gap_all)*100, label="Primal opt gap", color=primal_color, linewidth=2, marker='o')
+                # plt.plot(np.array(solver.dual_opt_gap_all)*100, label="Dual opt gap", color=dual_color, linewidth=2, marker='o')
 
-                plt.xlabel("Benders Iteration")
-                plt.ylabel("Optimality Gap (%)")
-                plt.title("Primal and Dual Optimality Gap per Benders Iteration")
-                # Add line at 0
-                plt.axhline(0, color='black', linewidth=1)
-                plt.legend(loc='best', frameon=True)
-                plt.grid(True, linestyle='--', alpha=0.6)
-                plt.tight_layout()
-                plt.savefig("figures/ch7-benders_optimality_gap_per_iteration.pdf", dpi=300, bbox_inches='tight')
-                plt.show()
+                # plt.xlabel("Benders Iteration")
+                # plt.ylabel("Optimality Gap (%)")
+                # plt.title("Primal and Dual Optimality Gap per Benders Iteration")
+                # # Add line at 0
+                # plt.axhline(0, color='black', linewidth=1)
+                # plt.legend(loc='best', frameon=True)
+                # plt.grid(True, linestyle='--', alpha=0.6)
+                # plt.tight_layout()
+                # plt.savefig("experiment-output/ch7/3nodes/benders_test_data_exact.pdf", dpi=300, bbox_inches='tight')
+                # plt.show()
