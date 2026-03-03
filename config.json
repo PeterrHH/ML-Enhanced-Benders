@@ -58,6 +58,8 @@
     "tau": 0.8,
     "rho": 0.5,
     "rho_max": 5000,
+    "penalty": "Per_Const",
+    "_comment_penalty": "Penalty option: Single (penalize only primal violation), Per_Const (individual penalty with a rho value per constraint)",
     "alpha": 10,
     "outer_iterations": 10, 
     "inner_iterations": 100, 

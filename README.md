@@ -30,6 +30,8 @@ All experiment data, as well as the code used to generate the figures throughout
 
 ### Dataset
 In the `data\ED_data` folder: there are a few dataset:
+0. `ED_NB-G-F_GB2-G2-F2_L3_c0_s0_p0_smp15`:
+    - 3 NODES
 1. `ED_NB-G-F-S_GB2-G2-F2-S2_L5_c0_s0_p0_smp15`:
     - N: ["BEL", "GER", "FRA","SWI"]
     - G: ["BEL", "WindOff"], ["BEL", "Gas"], ["GER", "Gas"], ["GER", "SunPV"], ["FRA", "Nuclear"], ["FRA", "SunPV"],["SWI", "Nuclear"], ["SWI", "SunPV"]

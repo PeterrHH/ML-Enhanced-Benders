@@ -77,8 +77,26 @@ class PrimalDualTrainer():
         self.outer_iterations = args["outer_iterations"]
         self.inner_iterations = args["inner_iterations"]
         self.tau = args["tau"] # Tolerance scalar, determine how much violation improvement is enough to not increase rho
-        self.rho = args["rho"] # Lagrangian penalty parameter, updated during training, increase if violation does not decrease sufficiently
-        self.rho_max = args["rho_max"] # maximum rho, to prevent it from becoming too large when increasing rho 
+        self.rho_init = float(args["rho"]) # Lagrangian penalty parameter, updated during training, increase if violation does not decrease sufficiently
+        self.rho_max = float(args["rho_max"]) # Maximum rho, to prevent it from becoming too large when increasing rho 
+        self.rho = self.rho_init
+        self.rho_ineq = None
+        self.rho_eq = None
+
+        self.prev_v_ineq = None
+        self.prev_v_eq = None
+        if args["penalty"] == "Single":
+            # Initialize a single rho for all constraints
+            self.rho = args["rho"] 
+            self.rho_max = args["rho_max"] 
+        elif args["penalty"] == "Per_Const":
+            # Initialize a rho for each constraint
+            self.rho_ineq = torch.full((self.data.nineq,), self.rho_init, dtype=self.DTYPE, device=self.DEVICE)
+            self.rho_eq   = torch.full((self.data.neq,),   self.rho_init, dtype=self.DTYPE, device=self.DEVICE)
+        else:
+            # Raise error
+            raise ValueError(f"Penalty option {args['penalty']} not supported")
+
         self.alpha = args["alpha"] # Growth factor for rho, when it needs to be increased
         self.batch_size = args["batch_size"]
         self.primal_lr = args["primal_lr"]
@@ -366,7 +384,11 @@ class PrimalDualTrainer():
                                 raise optuna.TrialPruned()
                         
                         if self.rho > 0:
-                            self.primal_scheduler.step(torch.sign(val_loss_mean) * (torch.abs(val_loss_mean) / self.rho))
+                            if self.args["penalty"] == "Single":
+                                rho_scale = self.rho
+                            elif self.args["penalty"] == "Per_Const":
+                                rho_scale = float(torch.mean(self.rho_ineq).item()) 
+                            self.primal_scheduler.step(torch.sign(val_loss_mean) * (torch.abs(val_loss_mean) / rho_scale))
                         else:
                             self.primal_scheduler.step(val_loss_mean)
 
@@ -506,10 +528,41 @@ class PrimalDualTrainer():
             print("-----------------------------------------")
             if self.args["learn_primal"]:
                 # Update rho from the second iteration onward.
-                if k > 0 and v_k > self.tau * prev_v_k:
-                    print(f"Updating rho. v_k: {v_k}, prev_v_k: {prev_v_k}, tau: {self.tau}")
-                    self.rho = np.min([self.alpha * self.rho, self.rho_max])
-                prev_v_k = v_k
+                if self.args["penalty"] == "Single":
+                    if k > 0 and v_k > self.tau * prev_v_k:
+
+                        print(f"Updating single rho. v_k: {v_k}, prev_v_k: {prev_v_k}, tau: {self.tau}")
+                        self.rho = np.min([self.alpha * self.rho, self.rho_max])
+                    prev_v_k = v_k
+                elif self.args["penalty"] == "Per_Const":
+
+                    # Compute the violation per ineq constraint and the eq constarint
+                    with torch.no_grad():
+                        y_full = frozen_primal_net(self.X_train, self.total_demands_train)  # [26214, ydim]
+                        
+                        v_ineq, v_eq = self.constraint_violation_stats(self.X_train, y_full)
+                    
+                    if k > 0 and (self.prev_v_ineq is not None):
+                        # Find the constraints that have not improved sufficiently, and increase their corresponding rho
+                        eps = 1e-10
+                        bad_ineq = v_ineq > (self.tau * self.prev_v_ineq + eps)
+                        bad_eq   = v_eq   > (self.tau * self.prev_v_eq+ eps)
+
+                        if bad_ineq.any() or bad_eq.any():
+                            v_eq_gen_ub = v_ineq[len(self.data.G):len(self.data.G)*2]
+                            print(f"v_ineq for generator constraints: {v_eq_gen_ub}")
+                            print(f"Updating per-constraint rho: bad_ineq={bad_ineq.sum().item()}, bad_eq={bad_eq.sum().item()}")
+                            print(f"Updating rhos nieq min:{self.rho_ineq.min().item()} max: {self.rho_ineq.max().item()}")
+
+                        # Multiply only those constraints
+                        self.rho_ineq[bad_ineq] = torch.clamp(self.alpha * self.rho_ineq[bad_ineq], max=self.rho_max)
+                        self.rho_eq[bad_eq]     = torch.clamp(self.alpha * self.rho_eq[bad_eq],     max=self.rho_max)
+
+                        pass
+                    self.prev_v_ineq = v_ineq
+                    self.prev_v_eq = v_eq
+                    self.log_rho_snapshot(outer_iter=k, v_k=v_k)
+   
         
         self.save(self.save_dir)
         with open(os.path.join(self.save_dir, "train_time.txt"), "w") as f:
@@ -620,9 +673,20 @@ class PrimalDualTrainer():
             eq = self.data.eq_resid(X, Y)
             lagrange_eq = torch.sum(lamb * eq, dim=1)
             lagrange_ineq = torch.sum(mu * ineq, dim=1).clamp(min=0)  # Shape (batch_size,)
-            violation_ineq = torch.sum(torch.maximum(ineq, torch.zeros_like(ineq)) ** 2, dim=1)
-            violation_eq = torch.sum(eq ** 2, dim=1)
-            penalty = self.rho/2 * (violation_ineq + violation_eq)
+            if self.args["penalty"] == "Single":
+                violation_ineq = torch.sum(torch.maximum(ineq, torch.zeros_like(ineq)) ** 2, dim=1)
+                violation_eq = torch.sum(eq ** 2, dim=1)
+                penalty = self.rho * 0.5 * (violation_ineq + violation_eq)
+            elif self.args["penalty"] == "Per_Const":
+                ineq_pos = torch.relu(ineq)                           # [B, nineq]
+                vio_ineq = ineq_pos ** 2                              # [B, nineq]
+                vio_eq   = eq ** 2                                    # [B, neq]
+
+                # broadcast rho vectors to batch: [1,n] -> [B,n]
+                penalty_ineq = 0.5 * torch.sum(vio_ineq * self.rho_ineq.view(1, -1), dim=1)  # [B]
+                penalty_eq   = 0.5 * torch.sum(vio_eq   * self.rho_eq.view(1, -1),   dim=1)  # [B]
+                penalty = penalty_ineq + penalty_eq  
+                            
             loss = obj + lagrange_ineq + lagrange_eq + penalty
             if self.loss_option == "Norm_GT":
           
@@ -655,6 +719,7 @@ class PrimalDualTrainer():
     def dual_loss(self, X, y, mu, lamb, mu_k, lamb_k, X_opt):
         # mu = [batch, g]
         # lamb = [batch, h]
+        # TODO: Update the rho value here, to enable per constraint
 
         # g(y)
         ineq = self.data.ineq_resid(X, y) # [batch, g]
@@ -728,7 +793,11 @@ class PrimalDualTrainer():
         ineq = self.data.ineq_resid(X, Y)  # Assume shape (num_samples, n_ineq)
         
         # Calculate sigma_x(y) for each inequality constraint
-        sigma_y = torch.maximum(ineq, -mu_k / self.rho)  # Element-wise max
+        if self.args["penalty"] == "Single":
+            sigma_y = torch.maximum(ineq, -mu_k / self.rho)  # Element-wise max
+        elif self.args["penalty"] == "Per_Const":
+            rho_ineq = self.rho_ineq.view(1, -1)          # [1, nineq] for broadcasting
+            sigma_y = torch.maximum(ineq, -mu_k / (rho_ineq + 1e-12))
         
         # Calculate the infinity norm of sigma_x(y)
         sigma_y_inf_norm = torch.abs(sigma_y).max(dim=1).values  # Shape: (num_samples,)
@@ -809,6 +878,42 @@ class PrimalDualTrainer():
         dual_feasible_rate = feas_mask.float().mean().item() if feas_mask is not None else 1.0
 
         return dual_gap_mean, dual_feasible_rate
+    
+    def log_rho_snapshot(self, outer_iter, v_k=None):
+        """
+        Save per-constraint rho values (and some summaries) to CSV.
+        One row per outer iteration.
+        """
+        if self.args["penalty"] != "Per_Const":
+            return  # nothing to do
+
+        row = {
+            "outer_iter": int(outer_iter),
+            "step": int(self.step),
+        }
+        if v_k is not None:
+            row["v_k"] = float(v_k)
+
+        # Summaries
+        row["rho_ineq_mean"] = float(self.rho_ineq.mean().item())
+        row["rho_ineq_max"]  = float(self.rho_ineq.max().item())
+        row["rho_eq_mean"]   = float(self.rho_eq.mean().item()) if self.data.neq > 0 else 0.0
+        row["rho_eq_max"]    = float(self.rho_eq.max().item())  if self.data.neq > 0 else 0.0
+
+        # Per-constraint entries
+        rho_ineq_cpu = self.rho_ineq.detach().cpu().numpy()
+        for i, val in enumerate(rho_ineq_cpu):
+            row[f"rho_g_{i}"] = float(val)
+
+        if self.data.neq > 0:
+            rho_eq_cpu = self.rho_eq.detach().cpu().numpy()
+            for j, val in enumerate(rho_eq_cpu):
+                row[f"rho_h_{j}"] = float(val)
+
+        csv_path = os.path.join(self.save_dir, "rho_per_constraint.csv")
+        df = pd.DataFrame([row])
+        write_header = not os.path.exists(csv_path)
+        df.to_csv(csv_path, mode="a", index=False, header=write_header)
 
     def save_metric_plot(self, primal_obj_list, dual_obj_list, duality_gap_list, save_dir = "./"):
         iters = list(range(len(self.primal_obj_list)))
@@ -874,3 +979,17 @@ class PrimalDualTrainer():
         plt.savefig(plot4_path, dpi=300)
         plt.close()
         print(f"Saved: {plot4_path}")
+
+    @torch.no_grad()
+    def constraint_violation_stats(self, X, Y):
+        """
+        Returns per-constraint violation statistics (mean squared) for ineq and eq.
+        - ineq: mean(ReLU(g)^2) over samples -> shape [nineq]
+        - eq:   mean(h^2) over samples        -> shape [neq]
+        """
+        ineq = self.data.ineq_resid(X, Y)  # [N, nineq]
+        eq   = self.data.eq_resid(X, Y)    # [N, neq]
+
+        v_ineq = (torch.relu(ineq) ** 2).mean(dim=0)  # [nineq]
+        v_eq   = (eq ** 2).mean(dim=0)                # [neq]
+        return v_ineq, v_eq

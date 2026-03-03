@@ -14,6 +14,8 @@ CONFIG_FILE_NAME = "config.toml"
 ARGS_FILE_NAME option:
 - "config.json": Default config for experiments. (3 Node)
 - "config-4node.json": Config for 4-node experiments.
+- "config-5node.json": Config for 5-node experiments.
+- "config-6node.json": Config for 6-node experiments.
 '''
 ARGS_FILE_NAME = "config-6node.json"
 
