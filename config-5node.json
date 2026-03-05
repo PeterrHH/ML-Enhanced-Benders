@@ -64,7 +64,7 @@
     "tau": 0.8,
     "rho": 0.5,
     "rho_max": 5000,
-    "penalty": "Per_Const",
+    "penalty": "Single",
     "_comment_penalty": "Penalty option: Single (penalize only primal violation), Per_Const (individual penalty with a rho value per constraint)",
     "alpha": 10,
     "outer_iterations": 10, 
@@ -96,6 +96,7 @@
     "shifted_sigmoid_scale": false,
     "repair_scaler": "Sigmoid",
     "_Comment":"RepairLayer Scaler Option: Sigmoid, ScaledSigmoid , ShiftedScaledSigmoid, SoftPlus",
+    "use_blend_repair": true,
     "k": 100.0,
     "soft_plus_k": 10.0,
 

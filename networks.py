@@ -338,6 +338,9 @@ class PrimalNetEndToEnd(nn.Module):
             self.args["shifted_sigmoid_scale"] = False
         if "k" not in self.args:
             self.args["k"] = 1.0
+        if "use_blend_repair" not in self.args:
+            self.args["use_blend_repair"] = False
+
         if self.args["repair_bounds"]:
             # if "scale_sigmoid" in self.args and self.args["scale_sigmoid"]:
             #     self.bound_repair_layer = BoundRepairLayer(scale_sigmoid = True)
@@ -394,7 +397,77 @@ class PrimalNetEndToEnd(nn.Module):
         '''
         p = p * self.p_std + self.p_mean
         return p, f
+    
+    def _box_slacks(self, y, lb, ub):
+        """
+        Box constraints lb <= y <= ub
+        Return two slacks:
+        s_lb = y - lb     (>=0 if y >= lb, i.e. slack is positive when y is feasible, negative when y is infeasible)
+        s_up  = ub - y     (>=0 if y <= ub, i.e. slack is positive when y is feasible, negative when y is infeasible)
+        """
+        s_lb = y - lb
+        s_up  = ub - y
+        return s_lb, s_up
 
+    def _compute_alpha_from_slacks(self, slack_pairs_TN, slack_pairs_SN, tol=1e-12):
+        """
+        slack_pairs_*: list of tuples [(s_lb, s_up), ...] for different variable blocks.
+        Each s_* is [B, dim].
+        Returns alpha: [B, 1] in [0,1].
+        """
+        alpha = None
+
+        for (sL_TN, sU_TN), (sL_SN, sU_SN) in zip(slack_pairs_TN, slack_pairs_SN):
+            # flatten per sample
+            # violations where slack < 0
+            for sTN, sSN in [(sL_TN, sL_SN), (sU_TN, sU_SN)]:
+                # sTN, sSN are [B, dim]
+                viol = sTN < 0.0
+                if viol.any():
+                    denom = (sSN - sTN).clamp_min(tol)  # should be positive if SN is feasible
+                    a = torch.where(viol, (-sTN) / denom, torch.zeros_like(sTN))
+                    a_max = a.max(dim=1, keepdim=True).values  # [B,1]
+                    alpha = a_max if alpha is None else torch.maximum(alpha, a_max)
+
+        if alpha is None:
+            # already feasible
+            return torch.zeros((slack_pairs_TN[0][0].shape[0], 1), dtype=self.DTYPE, device=self.DEVICE)
+        return alpha.clamp(0.0, 1.0)
+
+    def _blend_repair(self, p, f, md, p_lb, p_ub, f_lb, f_ub, md_lb, md_ub, D_nt):
+        """
+        Apply alpha-blend repair with safe point (p=0,f=0,md=D).
+        Returns repaired (p,f,md) and alpha [B,1].
+        """
+        # --- Safe point ---
+        pSN  = torch.zeros_like(p)
+        fSN  = torch.zeros_like(f)
+        # safest is md = D
+        mdSN = D_nt  # [B,N]
+
+        # --- Slacks for TN ---
+        s_p_TN  = self._box_slacks(p,  p_lb,  p_ub)
+        s_f_TN  = self._box_slacks(f,  f_lb,  f_ub)
+        s_md_TN = self._box_slacks(md, md_lb, md_ub)
+
+        # --- Slacks for SN ---
+        s_p_SN  = self._box_slacks(pSN,  p_lb,  p_ub)
+        s_f_SN  = self._box_slacks(fSN,  f_lb,  f_ub)
+        s_md_SN = self._box_slacks(mdSN, md_lb, md_ub)
+
+        # --- Alpha ---
+        alpha = self._compute_alpha_from_slacks(
+            slack_pairs_TN=[s_p_TN, s_f_TN, s_md_TN],
+            slack_pairs_SN=[s_p_SN, s_f_SN, s_md_SN],
+            tol=1e-12
+        )  # [B,1]
+
+        # --- Blend (broadcast alpha) ---
+        p_new  = (1 - alpha) * p  + alpha * pSN
+        f_new  = (1 - alpha) * f  + alpha * fSN
+        md_new = (1 - alpha) * md + alpha * mdSN
+
+        return p_new, f_new, md_new, alpha
 
     def forward(self, x, total_demands=None):
 
@@ -481,23 +554,32 @@ class PrimalNetEndToEnd(nn.Module):
             # p_gt = torch.where(mask_down, (1 - zeta_down) * p_gt + zeta_down * p_gt_lb, p_gt)
 
             p_gt = p_gt_repaired
-        # print("\n===========After Power Balance Repair============")
-        # print(f"Generation p_gt: {p_gt}")
-        # print(f"Line Flows f_lt: {f_lt}")
+
 
         if self.args["repair_completion"]:
             UI_g, D_nt = self.data.split_eq_constraints(eq_rhs)
             
             md_nt = self.estimate_slack_layer(p_gt, f_lt, D_nt)
-        # print(f"Demand D_nt: {D_nt}")
-        # print(f"Estimated unmet demand md_nt: {md_nt}")
-        # comp_mask = md_nt < D_nt
-        # print(f"Is Unmet Demand < Demand: {comp_mask}")
 
-        # print("\n===========Demand============")
-        # print(f"Demand D_nt: {D_nt}")
+        if self.args.get("use_blend_repair", False):
+            # True bounds for f:
+            f_lb_true = -f_lt_lb
+            f_ub_true =  f_lt_ub
+
+            # md bounds are already md_nt_lb, md_nt_ub (typically [0, D])
+            # D_nt available from split_eq_constraints above
+            p_gt, f_lt, md_nt, alpha = self._blend_repair(
+                p=p_gt, f=f_lt, md=md_nt,
+                p_lb=p_gt_lb, p_ub=p_gt_ub,
+                f_lb=f_lb_true, f_ub=f_ub_true,
+                md_lb=md_nt_lb, md_ub=md_nt_ub,
+                D_nt=D_nt
+            )
+            # Store for logging potentially
+            self.last_blend_alpha = alpha.detach()
+
+
         y = torch.cat([p_gt, f_lt, md_nt], dim=1)
-        # y = torch.cat([md_nt, f_lt, p_gt], dim=1)
 
         # Only scale if we are not training.
         if not self.training and (total_demands != None):

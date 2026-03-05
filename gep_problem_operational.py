@@ -78,7 +78,10 @@ class GEPOperationalProblemSet():
         self.ydim = self.n_prod_vars + self.n_line_vars + self.n_md_vars
 
         # Generate unit investment data:
-        self.pUnitInvestment = self.generate_ui_data(m=self.ED_args["2n_synthetic_samples"], max_inv=self.ED_args["max_investment"])
+        if args["ED_args"].get("gen_data_constraint", False):
+            self.pUnitInvestment = self.generate_ui_data_constraint(m=self.ED_args["2n_synthetic_samples"], max_inv=self.ED_args["max_investment"])
+        else:
+            self.pUnitInvestment = self.generate_ui_data(m=self.ED_args["2n_synthetic_samples"], max_inv=self.ED_args["max_investment"])
         # self.pUnitInvestment = self.sparsify_batch(self.pUnitInvestment) #! This is likely not necessary, unsparsified data set already contains the data.
 
         # Masks for node balance
@@ -152,6 +155,94 @@ class GEPOperationalProblemSet():
     def save_data(self, save_path):
         with open(save_path, 'wb') as file:
             pickle.dump(self, file)
+
+    def generate_ui_data_constraint(
+        self,
+        m: int = 15,
+        max_inv: float = 100000.0,
+        zero_fraction: float = 0.15,
+        renewable_fixed_value: float = 0.0,
+    ):
+        """
+        Constraint-aware unit investment sampling.
+
+        - Uses Sobol points in [0,1]^|G|
+        - Scales each generator dimension by a per-generator UB derived from
+        (max nodal demand + export capability) / unit_cap.
+        - Optionally sparsifies by setting a fraction of entries to exactly 0.
+        - Fixes renewables to a hard-coded investment for now.
+
+        Returns:
+            points: torch.Tensor of shape [2^m, |G|]
+        """
+
+        # --- helpers (local to keep the change self-contained) ---
+        def _is_renewable(g):
+            # g like (node, tech). Adjust the tech parsing to your naming.
+            node, tech = g
+            tech = str(tech).lower()
+            return tech in {"SunPV", "WindOn", "WindOff"}
+
+        def _compute_ub_per_generator():
+            """
+            Conservative UB:
+                sum_{g in node} Pmax_g * u_g <= max_t(D_n,t) + sum_{l out of n} Fmax_l
+            -> per generator:
+                u_g <= (max_t(D_n,t) + export_cap_n) / Pmax_g
+            """
+            ub_g = torch.zeros(self.num_g, dtype=self.DTYPE)
+
+            # Node max demand over time
+            node_max_demand = {}
+            for n in self.N:
+                node_max_demand[n] = max(self.pDemand[(n, t)] for t in self.T)
+
+            # Node export capacity: sum of upper bounds on outgoing lines
+            node_export_cap = {n: 0.0 for n in self.N}
+            for (start_node, end_node) in self.L:
+                # You used pExpCap as the upper bound for +f <= pExpCap
+                node_export_cap[start_node] += float(self.pExpCap[(start_node, end_node)])
+
+            node_cap = {n: float(node_max_demand[n]) + float(node_export_cap[n]) for n in self.N}
+
+            for g_idx, g in enumerate(self.G):
+                n, _ = g
+                pmax = float(self.pUnitCap[g])
+                if pmax <= 0:
+                    ub = 0.0
+                else:
+                    ub = node_cap[n] / pmax
+
+                # Clamp by global max_inv as a final guardrail
+                ub_g[g_idx] = min(float(ub), float(max_inv))
+
+            return ub_g
+
+        # --- Sobol sampling in [0,1]^G ---
+        dimensions = self.num_g
+        sobol_sampler = qmc.Sobol(d=dimensions)
+        base_points = sobol_sampler.random_base2(m=m)  # [2^m, G]
+        np.random.shuffle(base_points)
+
+        dtype_np = np.float32 if self.args["device"] == "mps" else np.float64
+        points01 = torch.tensor(base_points.astype(dtype_np))
+
+        # --- scale by constraint-aware per-generator UBs ---
+        ub_g = _compute_ub_per_generator()  # [G]
+        points = points01 * ub_g.unsqueeze(0)
+
+        # --- fix renewables for now ---
+        renewable_mask = torch.zeros(self.num_g, dtype=torch.bool)
+        for g_idx, g in enumerate(self.G):
+            if _is_renewable(g):
+                renewable_mask[g_idx] = True
+
+        if renewable_mask.any():
+            points[:, renewable_mask] = float(renewable_fixed_value)
+
+        # --- final clamp ---
+        points = torch.clamp(points, min=0.0, max=float(max_inv))
+        return points
 
     def generate_ui_data(self, m=15, max_inv=100000, zero_fraction=0.15):
         dimensions = self.num_g
@@ -493,7 +584,13 @@ class GEPOperationalProblemSet():
                 Xi.append(p_gt_ub)
             X.append(Xi)
         X = np.array(X)
-        np.random.shuffle(X)
+        # np.random.shuffle(X)
+
+        X = torch.tensor(np.array(X), dtype=self.DTYPE)
+        perm = torch.randperm(X.shape[0])
+
+        X = X[perm]
+        self.pUnitInvestment = self.pUnitInvestment[perm]
         X = torch.tensor(X)
         
         return X

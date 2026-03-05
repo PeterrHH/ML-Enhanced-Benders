@@ -93,6 +93,7 @@
     "shifted_sigmoid_scale": false,
     "repair_scaler": "Sigmoid",
     "_Comment":"RepairLayer Scaler Option: Sigmoid, ScaledSigmoid , ShiftedScaledSigmoid, SoftPlus",
+    "use_blend_repair": true,
     "k": 100.0,
     "soft_plus_k": 10.0,
 

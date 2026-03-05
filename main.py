@@ -17,7 +17,7 @@ ARGS_FILE_NAME option:
 - "config-5node.json": Config for 5-node experiments.
 - "config-6node.json": Config for 6-node experiments.
 '''
-ARGS_FILE_NAME = "config-6node.json"
+ARGS_FILE_NAME = "config.json"
 
 
 if __name__ == "__main__":
@@ -111,11 +111,19 @@ if __name__ == "__main__":
             lines_str = f"L{len(ED_args['L'])}"
             
             # Create a shortened filename
-            data_save_path = (f"data/ED_data/ED_N{nodes_str}_G{gens_str}_{lines_str}"
-                            f"_c{int(ED_args['benders_compact'])}"
-                            f"_s{int(ED_args['scale_problem'])}"
-                            f"_p{int(ED_args['perturb_operating_costs'])}"
-                            f"_smp{ED_args['2n_synthetic_samples']}.pkl")
+            if ED_args.get("gen_data_constraint", False):
+                data_save_path = (f"data/ED_data/Constraint/ED_N{nodes_str}_G{gens_str}_{lines_str}"
+                                f"_c{int(ED_args['benders_compact'])}"
+                                f"_s{int(ED_args['scale_problem'])}"
+                                f"_p{int(ED_args['perturb_operating_costs'])}"
+                                f"_ui_constraint{ED_args['max_investment']}"
+                                f"_smp{ED_args['2n_synthetic_samples']}_GenConst.pkl")
+            else:
+                data_save_path = (f"data/ED_data/ED_N{nodes_str}_G{gens_str}_{lines_str}"
+                                f"_c{int(ED_args['benders_compact'])}"
+                                f"_s{int(ED_args['scale_problem'])}"
+                                f"_p{int(ED_args['perturb_operating_costs'])}"
+                                f"_smp{ED_args['2n_synthetic_samples']}.pkl")
             
         elif args["problem_type"] == "GEP":
             data_save_path = f"data/GEP_data/N:{ED_args['N']}_G:{ED_args['G']}_L:{ED_args['L']}_scale-prob:{ED_args['scale_problem']}.pkl"
