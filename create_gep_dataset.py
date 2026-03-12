@@ -126,9 +126,23 @@ def create_gep_ed_dataset(args, problem_args, inputs, problem_type, save_path):
         data = GEPOperationalProblemSet(args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap)
     elif problem_type == "GEP":
         data = GEPProblemSet(problem_args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap)
-
+    
     with open(save_path, 'wb') as file:
         pickle.dump(data, file)
-
+    print(f"Data saved to {save_path}")
     return data
 
+if __name__ == "__main__":
+    import json
+
+    ARGS_FILE_NAME = "config.json"
+    CONFIG_FILE_NAME = "config.toml"
+    with open(ARGS_FILE_NAME, "r") as file:
+        args = json.load(file)
+    input_data = parse_config(CONFIG_FILE_NAME) # Reads the input data using config.toml's experiment.inputs.data path.
+    
+    gep_ed_data = input_data["experiment"]["experiments"][0] 
+    ED_args = args["ED_args"]
+    ED_args["gen_data_constraint"] = True
+    data_save_path = (f"data/ED_data/Constraint/TestLB.pkl")
+    data = create_gep_ed_dataset(args=args, problem_args=ED_args, inputs=gep_ed_data, problem_type=args["problem_type"], save_path=data_save_path)

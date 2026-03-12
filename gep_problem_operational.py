@@ -79,7 +79,14 @@ class GEPOperationalProblemSet():
 
         # Generate unit investment data:
         if args["ED_args"].get("gen_data_constraint", False):
-            self.pUnitInvestment = self.generate_ui_data_constraint(m=self.ED_args["2n_synthetic_samples"], max_inv=self.ED_args["max_investment"])
+            # Generate with no Lower Bound
+            self.pUnitInvestment = self.generate_ui_data_constraint(m=self.ED_args["2n_synthetic_samples"], 
+                                                                    max_inv=self.ED_args["max_investment"],
+                                                                    lb_activated = self.args["ED_args"].get("gen_data_constraint_lb", False),
+                                                                    alpha = self.args["ED_args"].get("gen_data_constraint_lb_alpha", 0.2),
+                                                                    renewable_lb_zero = self.args["ED_args"].get("gen_data_constraint_lb_renewable_zero", True),
+                                                                    renewable_ub_max_inv = self.args["ED_args"].get("gen_data_constraint_ub_renewable_max_inv", True))
+
         else:
             self.pUnitInvestment = self.generate_ui_data(m=self.ED_args["2n_synthetic_samples"], max_inv=self.ED_args["max_investment"])
         # self.pUnitInvestment = self.sparsify_batch(self.pUnitInvestment) #! This is likely not necessary, unsparsified data set already contains the data.
@@ -158,90 +165,93 @@ class GEPOperationalProblemSet():
 
     def generate_ui_data_constraint(
         self,
-        m: int = 15,
-        max_inv: float = 100000.0,
-        zero_fraction: float = 0.15,
-        renewable_fixed_value: float = 0.0,
+        m=15,
+        max_inv=1000.0,
+        lb_activated=False,
+        alpha=0.1,
+        renewable_lb_zero=True,
+        renewable_ub_max_inv=True,
+        beta = 1.05
     ):
         """
-        Constraint-aware unit investment sampling.
+        Constraint-aware unit investment sampling with optional lower bounds.
 
-        - Uses Sobol points in [0,1]^|G|
-        - Scales each generator dimension by a per-generator UB derived from
-        (max nodal demand + export capability) / unit_cap.
-        - Optionally sparsifies by setting a fraction of entries to exactly 0.
-        - Fixes renewables to a hard-coded investment for now.
-
-        Returns:
-            points: torch.Tensor of shape [2^m, |G|]
+        Current design:
+        - Sobol sampling in [0,1]^|G|
+        - Upper bound is max_inv for all generators by default
+        - Optional lower bound for non-renewables:
+            lb_g = alpha * max_t(D_n,t) / Pmax_g
+        - Renewables can be forced to have lb = 0
         """
 
-        # --- helpers (local to keep the change self-contained) ---
         def _is_renewable(g):
-            # g like (node, tech). Adjust the tech parsing to your naming.
-            node, tech = g
+            _, tech = g
             tech = str(tech).lower()
-            return tech in {"SunPV", "WindOn", "WindOff"}
+            return tech in {"sunpv", "windon", "windoff"}
 
-        def _compute_ub_per_generator():
-            """
-            Conservative UB:
-                sum_{g in node} Pmax_g * u_g <= max_t(D_n,t) + sum_{l out of n} Fmax_l
-            -> per generator:
-                u_g <= (max_t(D_n,t) + export_cap_n) / Pmax_g
-            """
-            ub_g = torch.zeros(self.num_g, dtype=self.DTYPE)
+        def _compute_lb_ub_per_generator():
+            lb_g = torch.zeros(self.num_g, dtype=self.DTYPE)
+            ub_g = torch.full((self.num_g,), float(max_inv), dtype=self.DTYPE)
 
-            # Node max demand over time
+
+            # max demand per node
             node_max_demand = {}
             for n in self.N:
                 node_max_demand[n] = max(self.pDemand[(n, t)] for t in self.T)
 
-            # Node export capacity: sum of upper bounds on outgoing lines
+            # total export per node
             node_export_cap = {n: 0.0 for n in self.N}
             for (start_node, end_node) in self.L:
-                # You used pExpCap as the upper bound for +f <= pExpCap
                 node_export_cap[start_node] += float(self.pExpCap[(start_node, end_node)])
-
-            node_cap = {n: float(node_max_demand[n]) + float(node_export_cap[n]) for n in self.N}
 
             for g_idx, g in enumerate(self.G):
                 n, _ = g
                 pmax = float(self.pUnitCap[g])
-                if pmax <= 0:
-                    ub = 0.0
+
+                computed_ub = (
+                    float(node_max_demand[n]) + float(node_export_cap[n])
+                )  * beta / pmax if pmax > 0 else 0.0
+
+                is_ren = _is_renewable(g)
+
+                # Upper bound
+                if is_ren and renewable_ub_max_inv:
+                    # Renewables uses max_inv as upper bound
+                    ub = float(max_inv)
                 else:
-                    ub = node_cap[n] / pmax
+                    # Non-renewables use the cap: (maxD + maxTotalOutflow)*beta, beta (slightly above 1)
+                    ub = min(float(computed_ub), float(max_inv))
 
-                # Clamp by global max_inv as a final guardrail
-                ub_g[g_idx] = min(float(ub), float(max_inv))
+                # Lower bound
+                if lb_activated:
+                    if is_ren and renewable_lb_zero:
+                        lb = 0.0
+                    else:
+                        lb = float(alpha * node_max_demand[n] / pmax) if pmax > 0 else 0.0
+                else:
+                    lb = 0.0
 
-            return ub_g
+                # Safety
+                lb = min(lb, ub)
 
-        # --- Sobol sampling in [0,1]^G ---
+                lb_g[g_idx] = lb
+                ub_g[g_idx] = ub
+
+            return lb_g, ub_g
+
         dimensions = self.num_g
         sobol_sampler = qmc.Sobol(d=dimensions)
-        base_points = sobol_sampler.random_base2(m=m)  # [2^m, G]
+        base_points = sobol_sampler.random_base2(m=m)
         np.random.shuffle(base_points)
 
         dtype_np = np.float32 if self.args["device"] == "mps" else np.float64
         points01 = torch.tensor(base_points.astype(dtype_np))
 
-        # --- scale by constraint-aware per-generator UBs ---
-        ub_g = _compute_ub_per_generator()  # [G]
-        points = points01 * ub_g.unsqueeze(0)
+        lb_g, ub_g = _compute_lb_ub_per_generator()
 
-        # --- fix renewables for now ---
-        renewable_mask = torch.zeros(self.num_g, dtype=torch.bool)
-        for g_idx, g in enumerate(self.G):
-            if _is_renewable(g):
-                renewable_mask[g_idx] = True
-
-        if renewable_mask.any():
-            points[:, renewable_mask] = float(renewable_fixed_value)
-
-        # --- final clamp ---
+        points = lb_g.unsqueeze(0) + points01 * (ub_g - lb_g).unsqueeze(0)
         points = torch.clamp(points, min=0.0, max=float(max_inv))
+
         return points
 
     def generate_ui_data(self, m=15, max_inv=100000, zero_fraction=0.15):
@@ -958,3 +968,5 @@ def solve_matrix_problem_simple(obj_coeff, eq_cm, ineq_cm, eq_rhs, ineq_rhs, ver
         return x.X, m.ObjVal, dual_eq, dual_ineq
     else:
         raise RuntimeError(f"Optimization failed with status {m.Status}")
+
+

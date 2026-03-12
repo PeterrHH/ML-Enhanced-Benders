@@ -660,14 +660,28 @@ class BendersSolver():
             
 
 if __name__ == "__main__":
+    '''
+    ARGS_FILE_NAME option:
+    - "config.json": Default config for experiments. (3 Node)
+    - "config-4node.json": Config for 4-node experiments.
+    - "config-5node.json": Config for 5-node experiments.
+    - "config-6node.json": Config for 6-node experiments.
+    '''
         ## Step 1: parse the input data
     print("Parsing the config file")
+    RUN_CONFIG_FILE = "config-5node.json"
+    NumNode = None
+    if RUN_CONFIG_FILE == "config.json":
+        NumNode = 3
+    elif RUN_CONFIG_FILE == "config-5node.json":
+        NumNode = 5
 
     data = parse_config(CONFIG_FILE_NAME)
     experiment = data["experiment"]
     outputs_config = data["outputs_config"]
 
-    with open("config-5node.json", "r") as file:
+
+    with open(RUN_CONFIG_FILE, "r") as file:
         args = json.load(file)
     
     print(args)
@@ -729,11 +743,13 @@ if __name__ == "__main__":
             if "primal_net_directory" in args["Benders_args"]:
                 primal_net_directory = args["Benders_args"]["primal_net_directory"]
             else:
+                raise ValueError("Please provide a directory for the primal net in the config file under Benders_args with key 'primal_net_directory'")
                 primal_net_directory = "outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
             
             if "dual_net_directory" in args["Benders_args"]:
                 dual_net_directory = args["Benders_args"]["dual_net_directory"]
             else:
+                raise ValueError("Please provide a directory for the dual net in the config file under Benders_args with key 'dual_net_directory'")
                 dual_net_directory = "outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
             print(f"Primal Net Directory: {primal_net_directory}")
             print(f"Dual Net Directory: {dual_net_directory}")
@@ -762,6 +778,19 @@ if __name__ == "__main__":
             #                     (False, True)] # Inexact Benders with exact refinement
 
             benders_setups = [(False, True)] # Inexact Benders with exact refinement
+
+            if benders_args["benders_setup"] == "Exact":
+                benders_setups = [(True, False)]
+            elif benders_args["benders_setup"] == "Inexact":
+                benders_setups = [(False, False)]
+            elif benders_args["benders_setup"] == "Inexact_Refine":
+                benders_setups = [(False, True)]
+            elif benders_args["benders_setup"] == "All":
+                benders_setups = [(True, False), # Exact Benders
+                                    (False, False), # Inexact Benders
+                                    (False, True)] # Inexact Benders with exact refinement
+            else:
+                raise ValueError("Invalid Benders setup specified in config file. Please choose from 'exact', 'inexact', 'inexact_refine' or 'all'.")
 
             # experiment_data = {"opt_obj": [], "upper_bound": [], "lower_bound": [], "total_iterations": [], "exact_iterations": [], "inexact_iterations": [], "total_time": [], "total_time_master": [], "total_time_subproblem_exact": [], "total_time_subproblem_pdl": []}
             samples = 8760 // benders_args["sample_duration"] # SAMPLE
@@ -792,8 +821,8 @@ if __name__ == "__main__":
                             "t_master": solver.master_time_hist,
                             "t_sub": solver.sub_time_hist,
                         })
-
-                        out_dir = "outputs/Benders/5Node/iter_logs_inexact_refine"
+                        specific_name = args["Benders_args"].get("specific_name", "")
+                        out_dir = f"outputs/Benders/{NumNode}Node/iter_logs_inexact_refine_{specific_name}"
                         os.makedirs(out_dir, exist_ok=True)
                         iter_df.to_csv(
                             os.path.join(out_dir, f"iterlog_sample{sample}_start_exact{start_exact}_ref{exact_refinement}.csv"),
@@ -829,12 +858,18 @@ if __name__ == "__main__":
                             "investments": y[:gep_data.num_g].tolist()
                         }
                         all_results.append(result)
-                        break
+                        # break
                         
                 #! Set to True if saving data.
                 if True:
                     experiment_data_df = pd.DataFrame(all_results)
-                    experiment_data_df.to_csv(f"outputs/Benders/5Node/experiment_data_sample_duration:{benders_args['sample_duration']}_start_exact:{start_exact}_exact_refinement:{exact_refinement}_run_name:{run_name}.csv", index=False)
+                    if not os.path.exists(args["Benders_args"]["exp_save_directory"]):
+                        os.makedirs(args["Benders_args"]["exp_save_directory"])
+                    specific_name = args["Benders_args"].get("specific_name", "")
+                    data_save_path = os.path.join(args["Benders_args"]["exp_save_directory"], f"experiment_data_sample_duration:{benders_args['sample_duration']}_start_exact:{start_exact}_exact_refinement:{exact_refinement}_run_name:{run_name}_{specific_name}.csv")
+                    
+                    
+                    experiment_data_df.to_csv(data_save_path, index=False)
 
 
             # ! Plotting optimality gap per iteration
