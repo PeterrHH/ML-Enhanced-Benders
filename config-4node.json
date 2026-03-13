@@ -80,7 +80,6 @@
     "dual_alternate_loss": true,
     "dual_completion": true,
     "dual_classification": true,
-    "normalize_loss": false, 
     "normalize_by_gt": false,
     "loss_option": "Original",
     "_Comments": "loss option: Original, Norm_GT (Normalize by ground truth obj), Norm_Obj (Normalize by obj), Duality_Gap, Log",

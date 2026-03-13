@@ -127,6 +127,7 @@ if __name__ == "__main__":
                                 f"_smp{ED_args['2n_synthetic_samples']}.pkl")
             
         elif args["problem_type"] == "GEP":
+            # SOLVER CODE
             data_save_path = f"data/GEP_data/N:{ED_args['N']}_G:{ED_args['G']}_L:{ED_args['L']}_scale-prob:{ED_args['scale_problem']}.pkl"
         
         print(f"Data save path: {data_save_path} and does it exist? {os.path.exists(data_save_path)}")

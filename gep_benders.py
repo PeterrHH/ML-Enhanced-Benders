@@ -9,6 +9,7 @@ import pandas as pd
 import time
 import matplotlib.pyplot as plt
 
+
 from gep_problem import GEPProblemSet
 from gep_problem_operational import GEPOperationalProblemSet
 from create_gep_dataset import create_gep_ed_dataset
@@ -660,21 +661,48 @@ class BendersSolver():
             
 
 if __name__ == "__main__":
+    import argparse
     '''
     ARGS_FILE_NAME option:
     - "config.json": Default config for experiments. (3 Node)
     - "config-4node.json": Config for 4-node experiments.
     - "config-5node.json": Config for 5-node experiments.
     - "config-6node.json": Config for 6-node experiments.
+
+    TO use the solver directly, solve with python gep_benders.py --solve-direct
+    by default solve direct is False
     '''
-        ## Step 1: parse the input data
+    ## Step 1: parse the input data
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-s", "--solve-direct",
+        action="store_true",
+        help="Solve the full GEP directly with Gurobi, without Benders decomposition.",
+        default=False
+    )
+    parser.add_argument(
+        "-c", "--config",
+        type=str,
+        default="config.json",
+        help="Path to run config JSON file, e.g. config.json, config-5node.json, config-6node.json"
+    )
+    args_cli = parser.parse_args()
+
+
+
     print("Parsing the config file")
-    RUN_CONFIG_FILE = "config-5node.json"
+    RUN_CONFIG_FILE = args_cli.config
     NumNode = None
     if RUN_CONFIG_FILE == "config.json":
         NumNode = 3
+    elif RUN_CONFIG_FILE == "config-4node.json":
+        NumNode = 4
     elif RUN_CONFIG_FILE == "config-5node.json":
         NumNode = 5
+    elif RUN_CONFIG_FILE == "config-6node.json":
+        NumNode = 6
+    else:
+        raise ValueError("Invalid config file name.")
 
     data = parse_config(CONFIG_FILE_NAME)
     experiment = data["experiment"]
@@ -685,6 +713,10 @@ if __name__ == "__main__":
         args = json.load(file)
     
     print(args)
+
+
+
+
 
     # Train the model:
     for i, experiment_instance in enumerate(experiment["experiments"]):
@@ -799,74 +831,109 @@ if __name__ == "__main__":
                 all_results = []
                 for repeat in range(1):
                     for sample in range(samples):
-                        solver = BendersSolver(gep_data=gep_data, operational_data=operational_data, primal_net=primal_net, dual_net=dual_net, sample=sample, exact=start_exact, exact_refinement=exact_refinement, max_investment=benders_args["max_investment"])
-                        # solution sample 1 = 2790.09
-                        # Solve for the ground truth
-                        y, obj = solver.solve_matrix_problem(gep_data, sample) # solution = Obj: 2374.99
+                        if args_cli.solve_direct:
+                            # Solve Directly with Solver
+                            solver = BendersSolver(gep_data=gep_data, operational_data=operational_data, primal_net=primal_net, dual_net=dual_net, sample=sample, exact=start_exact, exact_refinement=exact_refinement, max_investment=benders_args["max_investment"])
+                            start_time_direct = time.time()
+                            y, obj = solver.solve_matrix_problem(gep_data, sample, inv_decision=None)
+                            total_time_direct = time.time() - start_time_direct
 
-                        # Solve single sample with Benders decomposition
-                        # sample = 1 # solution = Obj: 2374.99
-                        # compact = False
-                        # Solving a subproblem
-                        upper_bound, lower_bound, benders_cuts_all, investments_all, obj_val_subproblems_all, iterations = solver.solve_with_benders(gep_data, benders_args['benders_compact'], sample)
-                        
-                        iter_df = pd.DataFrame({
-                            "sample": sample,
-                            "iter": solver.iter_hist,
-                            "UB": solver.ub_hist,
-                            "LB": solver.lb_hist,
-                            "gap_abs": np.array(solver.ub_hist) - np.array(solver.lb_hist),
-                            "gap_rel": (np.array(solver.ub_hist) - np.array(solver.lb_hist)) / np.maximum(1.0, np.abs(np.array(solver.ub_hist))),
-                            "exact_mode": solver.exact_flag_hist,
-                            "t_master": solver.master_time_hist,
-                            "t_sub": solver.sub_time_hist,
-                        })
-                        specific_name = args["Benders_args"].get("specific_name", "")
-                        out_dir = f"outputs/Benders/{NumNode}Node/iter_logs_inexact_refine_{specific_name}"
-                        os.makedirs(out_dir, exist_ok=True)
-                        iter_df.to_csv(
-                            os.path.join(out_dir, f"iterlog_sample{sample}_start_exact{start_exact}_ref{exact_refinement}.csv"),
-                            index=False
-                        )
-                        # ! If you want to save data for the first sample for plotting, uncomment the following line.
-                        # if start_exact and sample == 0:
-                        #     solver.save_data(f"experiment-output/ch7/3nodes/benders_data")
-                        
-                        print(f"Known optimum: {obj}")
-                        print(y[:gep_data.num_g])
-                        print(f"Iterations: {iterations}")
-                        print(f"Total time master: {solver.total_time_master}, Total time subproblem_exact: {solver.total_time_subproblem_exact}, Total time subproblem_pdl: {solver.total_time_subproblem_pdl}")
-                        print(f"Total time: {solver.total_time_master + solver.total_time_subproblem_exact + solver.total_time_subproblem_pdl}")
+                            print(f"Direct exact GEP optimum: {obj}")
+                            print(f"Direct investment decision: {y[:gep_data.num_g]}")
+                            print(f"Direct total time: {total_time_direct}")
 
-                        obj_val_master, investments_iter_k, inference_time_master = solver.solve_master_problem(gep_data,False,sample,investments_all,None,benders_cuts_all, investment=y[:gep_data.num_g])
+                            result = {
+                                "repeat": repeat,
+                                "sample": sample,
+                                "method": "direct_exact",
+                                "opt_obj": obj,
+                                "upper_bound": obj,
+                                "lower_bound": obj,
+                                "total_iterations": 1,
+                                "exact_iterations": 1,
+                                "inexact_iterations": 0,
+                                "total_time": total_time_direct,
+                                "total_time_master": 0.0,
+                                "total_time_subproblem_exact": 0.0,
+                                "total_time_subproblem_pdl": 0.0,
+                                "investments": y[:gep_data.num_g].tolist()
+                            }
+                            all_results.append(result)
+                            continue
 
-                        # Store results in a dict for this run
-                        result = {
-                            "repeat": repeat,
-                            "sample": sample,
-                            "opt_obj": obj,
-                            "upper_bound": upper_bound,
-                            "lower_bound": lower_bound,
-                            "total_iterations": iterations,
-                            "exact_iterations": solver.exact_iterations,
-                            "inexact_iterations": solver.inexact_iterations,
-                            "total_time": solver.total_time_master + solver.total_time_subproblem_exact + solver.total_time_subproblem_pdl,
-                            "total_time_master": solver.total_time_master,
-                            "total_time_subproblem_exact": solver.total_time_subproblem_exact,
-                            "total_time_subproblem_pdl": solver.total_time_subproblem_pdl,
-                            # Optionally, add investments or other details:
-                            "investments": y[:gep_data.num_g].tolist()
-                        }
-                        all_results.append(result)
-                        # break
+                        else:
+                            solver = BendersSolver(gep_data=gep_data, operational_data=operational_data, primal_net=primal_net, dual_net=dual_net, sample=sample, exact=start_exact, exact_refinement=exact_refinement, max_investment=benders_args["max_investment"])
+                            # solution sample 1 = 2790.09
+                            # Solve for the ground truth
+                            y, obj = solver.solve_matrix_problem(gep_data, sample) # solution = Obj: 2374.99
+
+                            # Solve single sample with Benders decomposition
+                            # sample = 1 # solution = Obj: 2374.99
+                            # compact = False
+                            # Solving a subproblem
+                            upper_bound, lower_bound, benders_cuts_all, investments_all, obj_val_subproblems_all, iterations = solver.solve_with_benders(gep_data, benders_args['benders_compact'], sample)
+                            
+                            iter_df = pd.DataFrame({
+                                "sample": sample,
+                                "iter": solver.iter_hist,
+                                "UB": solver.ub_hist,
+                                "LB": solver.lb_hist,
+                                "gap_abs": np.array(solver.ub_hist) - np.array(solver.lb_hist),
+                                "gap_rel": (np.array(solver.ub_hist) - np.array(solver.lb_hist)) / np.maximum(1.0, np.abs(np.array(solver.ub_hist))),
+                                "exact_mode": solver.exact_flag_hist,
+                                "t_master": solver.master_time_hist,
+                                "t_sub": solver.sub_time_hist,
+                            })
+                            specific_name = args["Benders_args"].get("specific_name", "")
+                            out_dir = f"outputs/Benders/{NumNode}Node/iter_logs_inexact_refine_{specific_name}"
+                            os.makedirs(out_dir, exist_ok=True)
+                            iter_df.to_csv(
+                                os.path.join(out_dir, f"iterlog_sample{sample}_start_exact{start_exact}_ref{exact_refinement}.csv"),
+                                index=False
+                            )
+                            # ! If you want to save data for the first sample for plotting, uncomment the following line.
+                            # if start_exact and sample == 0:
+                            #     solver.save_data(f"experiment-output/ch7/3nodes/benders_data")
+                            
+                            print(f"Known optimum: {obj}")
+                            print(y[:gep_data.num_g])
+                            print(f"Iterations: {iterations}")
+                            print(f"Total time master: {solver.total_time_master}, Total time subproblem_exact: {solver.total_time_subproblem_exact}, Total time subproblem_pdl: {solver.total_time_subproblem_pdl}")
+                            print(f"Total time: {solver.total_time_master + solver.total_time_subproblem_exact + solver.total_time_subproblem_pdl}")
+
+                            obj_val_master, investments_iter_k, inference_time_master = solver.solve_master_problem(gep_data,False,sample,investments_all,None,benders_cuts_all, investment=y[:gep_data.num_g])
+
+                            # Store results in a dict for this run
+                            result = {
+                                "repeat": repeat,
+                                "sample": sample,
+                                "opt_obj": obj,
+                                "upper_bound": upper_bound,
+                                "lower_bound": lower_bound,
+                                "total_iterations": iterations,
+                                "exact_iterations": solver.exact_iterations,
+                                "inexact_iterations": solver.inexact_iterations,
+                                "total_time": solver.total_time_master + solver.total_time_subproblem_exact + solver.total_time_subproblem_pdl,
+                                "total_time_master": solver.total_time_master,
+                                "total_time_subproblem_exact": solver.total_time_subproblem_exact,
+                                "total_time_subproblem_pdl": solver.total_time_subproblem_pdl,
+                                # Optionally, add investments or other details:
+                                "investments": y[:gep_data.num_g].tolist()
+                            }
+                            all_results.append(result)
+                            # break
                         
                 #! Set to True if saving data.
                 if True:
                     experiment_data_df = pd.DataFrame(all_results)
                     if not os.path.exists(args["Benders_args"]["exp_save_directory"]):
                         os.makedirs(args["Benders_args"]["exp_save_directory"])
-                    specific_name = args["Benders_args"].get("specific_name", "")
-                    data_save_path = os.path.join(args["Benders_args"]["exp_save_directory"], f"experiment_data_sample_duration:{benders_args['sample_duration']}_start_exact:{start_exact}_exact_refinement:{exact_refinement}_run_name:{run_name}_{specific_name}.csv")
+                    
+                    if args_cli.solve_direct:
+                        specific_name = "direct_exact"
+                    else:
+                        specific_name = args["Benders_args"].get("specific_name", "")
+                    data_save_path = os.path.join(args["Benders_args"]["exp_save_directory"], f"Gurobi_Solution.csv")
                     
                     
                     experiment_data_df.to_csv(data_save_path, index=False)

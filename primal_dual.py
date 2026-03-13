@@ -686,8 +686,11 @@ class PrimalDualTrainer():
                 penalty_ineq = 0.5 * torch.sum(vio_ineq * self.rho_ineq.view(1, -1), dim=1)  # [B]
                 penalty_eq   = 0.5 * torch.sum(vio_eq   * self.rho_eq.view(1, -1),   dim=1)  # [B]
                 penalty = penalty_ineq + penalty_eq  
-                            
-            loss = obj + lagrange_ineq + lagrange_eq + penalty
+            if self.args["use_primal_penalty"]:
+                loss = obj + lagrange_ineq + lagrange_eq + penalty
+            else:
+                penalty = torch.zeros_like(penalty)
+                loss = obj + lagrange_ineq + lagrange_eq
             if self.loss_option == "Norm_GT":
           
                 loss = loss / X_opt
@@ -741,7 +744,6 @@ class PrimalDualTrainer():
         dual_resid_eq = torch.norm(dual_resid_eq, dim=1)  # Norm along constraint dimension
 
         loss = (dual_resid_ineq + dual_resid_eq)
-        # if self.normalize_loss:
         if self.loss_option == "Norm_GT":
             loss = loss / X_opt
         elif self.loss_option == "Norm_Obj":
