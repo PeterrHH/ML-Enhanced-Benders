@@ -47,3 +47,12 @@ In the `data\ED_data` folder: there are a few dataset:
 
 4. `ED_NB-G-F-S-N-S_GB2-G2-F2-S2-N2-S2_L8_c0_s0_p0_smp15.pkl`
 6 Node
+
+### Running 
+1. Run Experiment for ED
+
+2. Run Experiment for GEP
+```
+python gep_benders -c config.json
+```
+Add -s flag when solving directly with Gurobi without Benders

@@ -52,6 +52,8 @@ class BendersSolver():
         self.exact_flag_hist = []
         self.iter_hist = []
 
+        self.inv_hist = []  # list[list[float]] length = #iters
+
 
     @property
     def X(self):
@@ -511,6 +513,8 @@ class BendersSolver():
             print("The investment decisions are", investments_iter_k)
             investments_iter_k = torch.tensor(investments_iter_k)
 
+            self.inv_hist.append(investments_iter_k.detach().cpu().numpy().tolist())
+
             if self.exact == False and i > 0 and torch.allclose(investments_iter_k, investments_all[-1], atol=1e-6):
                 print("!! Investments are the same as last iteration")
                 if self.exact_refinement:
@@ -884,6 +888,7 @@ if __name__ == "__main__":
                                 "t_master": solver.master_time_hist,
                                 "t_sub": solver.sub_time_hist,
                             })
+                            iter_df["investment"] = [json.dumps(v) for v in solver.inv_hist]
                             specific_name = args["Benders_args"].get("specific_name", "")
                             out_dir = f"outputs/Benders/{NumNode}Node/iter_logs_inexact_refine_{specific_name}"
                             os.makedirs(out_dir, exist_ok=True)
@@ -891,6 +896,7 @@ if __name__ == "__main__":
                                 os.path.join(out_dir, f"iterlog_sample{sample}_start_exact{start_exact}_ref{exact_refinement}.csv"),
                                 index=False
                             )
+
                             # ! If you want to save data for the first sample for plotting, uncomment the following line.
                             # if start_exact and sample == 0:
                             #     solver.save_data(f"experiment-output/ch7/3nodes/benders_data")

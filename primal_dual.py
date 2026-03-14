@@ -708,6 +708,9 @@ class PrimalDualTrainer():
                 # Comput the primal and dual obj, and use their difference as the loss.
                 dual_obj = self.data.dual_obj_fn(X, mu, lamb).detach()
                 # loss = (obj + dual_obj) / (obj.detach().abs() + 1e-6)
+                # if self.args["dual_alternate_loss"]:
+                #     loss = (obj - dual_obj)
+                # else:
                 loss = (obj + dual_obj) 
             elif self.loss_option == "Log":
                 eps = 1e-8
@@ -779,6 +782,7 @@ class PrimalDualTrainer():
             # Comput the primal and dual obj, and use their difference as the loss.
             primal_obj = self.data.obj_fn(X, y).detach()
             dual_obj = self.data.dual_obj_fn(X, mu, lamb)
+            # print(f"In alt dual loss, dual objective: {dual_obj.mean().item()}")
             loss = (primal_obj - dual_obj) 
 
         #! Dual constraints are never violated, so we do not include penalty and lagrangian terms.

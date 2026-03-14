@@ -49,8 +49,8 @@
         "primal_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BendersBaseline/repeat:0", 
         "dual_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BendersBaseline/repeat:0",
         "exp_save_directory":"outputs/Benders/3Node",
-        "specific_name":"Baseline",
-        "benders_setup": "Inexact_Refine",
+        "specific_name":"Exact_Solve",
+        "benders_setup": "Exact",
         "_Comment_benders_setup": "Benders setup options: [Exact, Inexact, Inexact_Refine, All], All is when all three are run"
     },
     "Optuna_args": {
@@ -93,7 +93,7 @@
     "dual_completion": true,
     "dual_classification": true,
     "normalize_by_gt": false,
-    "loss_option": "Original",
+    "loss_option": "Duality_Gap",
     "_Comments": "loss option: Original, Norm_GT (Normalize by ground truth obj), Norm_Obj (Normalize by obj), Duality_Gap, Log",
     "flow_scale_by_prod": false,
     "_Flow_scale_by_prod_Comment": "If true, scale line flow repair bounds based on production capacity at nodes. (More restrictive.)",
