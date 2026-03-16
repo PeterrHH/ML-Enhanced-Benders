@@ -19,7 +19,7 @@ from networks import DualClassificationNetEndToEnd, DualNet, DualNetEndToEnd, Pr
 CONFIG_FILE_NAME        = "config.toml"
 
 class BendersSolver():
-    def __init__(self, gep_data, operational_data, sample, primal_net=None, dual_net=None, exact=True, exact_refinement=True, max_investment=100000):
+    def __init__(self, gep_data, operational_data, sample, primal_net=None, dual_net=None, exact=True, exact_refinement=True, max_investment=100000, init_investment = "Zero"):
         self.gep_data = gep_data
         self.operational_data = operational_data
         self.primal_net = primal_net
@@ -53,6 +53,7 @@ class BendersSolver():
         self.iter_hist = []
 
         self.inv_hist = []  # list[list[float]] length = #iters
+        self.investment_init_method = init_investment # Zero by Default, also option: "HalfMax"
 
 
     @property
@@ -495,8 +496,16 @@ class BendersSolver():
 
             # Find the investment decisions
             if i == 0:
+
                 # Generate initial investment solution
-                investments_iter_k = [0. for _ in range(data.num_g)] #TODO find better initial solution?
+                if self.investment_init_method == "Zero":
+                    investments_iter_k = [0. for _ in range(data.num_g)] #TODO find better initial solution?
+                elif self.investment_init_method == "HalfMax":
+                    investments_iter_k = (
+                        self.operational_data.pUnitInvestment.max(dim=0).values / 2
+                    ).to(torch.float64)
+                else:
+                    raise ValueError(f"Invalid investment initialization method: {self.investment_init_method}")
                 # investments_iter_k = self.operational_data.opt_targets['y_investment'][0] #! Test with optimal solution
                 # Calculate objective of master problem of this solution
                 obj_val_master = 0
@@ -515,7 +524,7 @@ class BendersSolver():
 
             self.inv_hist.append(investments_iter_k.detach().cpu().numpy().tolist())
 
-            if self.exact == False and i > 0 and torch.allclose(investments_iter_k, investments_all[-1], atol=1e-6):
+            if self.exact == False and i > 0 and torch.allclose(investments_iter_k.to(torch.float64), investments_all[-1].to(torch.float64), atol=1e-6):
                 print("!! Investments are the same as last iteration")
                 if self.exact_refinement:
                     self.exact = True
@@ -837,7 +846,9 @@ if __name__ == "__main__":
                     for sample in range(samples):
                         if args_cli.solve_direct:
                             # Solve Directly with Solver
-                            solver = BendersSolver(gep_data=gep_data, operational_data=operational_data, primal_net=primal_net, dual_net=dual_net, sample=sample, exact=start_exact, exact_refinement=exact_refinement, max_investment=benders_args["max_investment"])
+                            solver = BendersSolver(gep_data=gep_data, operational_data=operational_data, primal_net=primal_net, dual_net=dual_net, sample=sample, 
+                                                   exact=start_exact, exact_refinement=exact_refinement, max_investment=benders_args["max_investment"],
+                                                   init_investment=benders_args["init_investment"])
                             start_time_direct = time.time()
                             y, obj = solver.solve_matrix_problem(gep_data, sample, inv_decision=None)
                             total_time_direct = time.time() - start_time_direct
@@ -866,7 +877,9 @@ if __name__ == "__main__":
                             continue
 
                         else:
-                            solver = BendersSolver(gep_data=gep_data, operational_data=operational_data, primal_net=primal_net, dual_net=dual_net, sample=sample, exact=start_exact, exact_refinement=exact_refinement, max_investment=benders_args["max_investment"])
+                            solver = BendersSolver(gep_data=gep_data, operational_data=operational_data, primal_net=primal_net, dual_net=dual_net, sample=sample, 
+                                                   exact=start_exact, exact_refinement=exact_refinement, max_investment=benders_args["max_investment"],
+                                                   init_investment=benders_args["init_investment"])
                             # solution sample 1 = 2790.09
                             # Solve for the ground truth
                             y, obj = solver.solve_matrix_problem(gep_data, sample) # solution = Obj: 2374.99
@@ -890,7 +903,8 @@ if __name__ == "__main__":
                             })
                             iter_df["investment"] = [json.dumps(v) for v in solver.inv_hist]
                             specific_name = args["Benders_args"].get("specific_name", "")
-                            out_dir = f"outputs/Benders/{NumNode}Node/iter_logs_inexact_refine_{specific_name}"
+                            benders_setup_str = args["Benders_args"].get("benders_setup", "")
+                            out_dir = f"outputs/Benders/{NumNode}Node/iter_logs_{benders_setup_str}_{specific_name}"
                             os.makedirs(out_dir, exist_ok=True)
                             iter_df.to_csv(
                                 os.path.join(out_dir, f"iterlog_sample{sample}_start_exact{start_exact}_ref{exact_refinement}.csv"),
@@ -937,11 +951,11 @@ if __name__ == "__main__":
                     
                     if args_cli.solve_direct:
                         specific_name = "direct_exact"
+                        data_save_path = os.path.join(args["Benders_args"]["exp_save_directory"], f"Gurobi_Solution.csv")
+                
                     else:
                         specific_name = args["Benders_args"].get("specific_name", "")
-                    data_save_path = os.path.join(args["Benders_args"]["exp_save_directory"], f"Gurobi_Solution.csv")
-                    
-                    
+                        data_save_path = os.path.join(args["Benders_args"]["exp_save_directory"], f"experiment_data_sample_duration:{benders_args['sample_duration']}_start_exact:{start_exact}_exact_refinement:{exact_refinement}_{specific_name}.csv")
                     experiment_data_df.to_csv(data_save_path, index=False)
 
 

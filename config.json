@@ -28,8 +28,8 @@
         "gen_data_constraint_lb": false,
         "gen_data_constraint_lb_alpha": 0.1,
         "gen_data_constraint_lb_renewable_zero": true,
-        "gen_data_constraint_ub_renewable_max_inv": true,
-        "specific_name": "GenConst"
+        "gen_data_constraint_ub_renewable_max_inv": false,
+        "specific_name": "GenConstRenewUBFalse"
     },
     "Benders_args": {
        "N": ["BEL", "GER", "FRA"],
@@ -46,12 +46,14 @@
         "normalize_input": false,
         "repeats": 1,
         "device": "cpu",
-        "primal_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BendersBaseline/repeat:0", 
-        "dual_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BendersBaseline/repeat:0",
+        "primal_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BaselineConstraintRenewables2/repeat:0", 
+        "dual_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BaselineConstraintRenewables2/repeat:0",
         "exp_save_directory":"outputs/Benders/3Node",
-        "specific_name":"Exact_Solve",
-        "benders_setup": "Exact",
-        "_Comment_benders_setup": "Benders setup options: [Exact, Inexact, Inexact_Refine, All], All is when all three are run"
+        "specific_name":"ConstraintRenewablesUBFlex",
+        "benders_setup": "Inexact_Refine",
+        "_Comment_benders_setup": "Benders setup options: [Exact, Inexact, Inexact_Refine, All], All is when all three are run",
+        "init_investment": "Zero",
+        "_Comment_init_investment": "Options for initial investment solution for Benders: Zero, HalfMax"
     },
     "Optuna_args": {
         "optuna": false,
@@ -93,7 +95,7 @@
     "dual_completion": true,
     "dual_classification": true,
     "normalize_by_gt": false,
-    "loss_option": "Duality_Gap",
+    "loss_option": "Original",
     "_Comments": "loss option: Original, Norm_GT (Normalize by ground truth obj), Norm_Obj (Normalize by obj), Duality_Gap, Log",
     "flow_scale_by_prod": false,
     "_Flow_scale_by_prod_Comment": "If true, scale line flow repair bounds based on production capacity at nodes. (More restrictive.)",

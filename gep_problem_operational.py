@@ -215,9 +215,13 @@ class GEPOperationalProblemSet():
                 is_ren = _is_renewable(g)
 
                 # Upper bound
-                if is_ren and renewable_ub_max_inv:
-                    # Renewables uses max_inv as upper bound
-                    ub = float(max_inv)
+                if is_ren:
+                    if renewable_ub_max_inv:
+                        # If True, Renewables uses max_inv as upper bound
+                        ub = float(max_inv)
+                    else: 
+                        # If False, Renewables use the computed upper bound based on demand and export capacity if larger than max inv
+                        ub = max(float(max_inv), float(computed_ub))
                 else:
                     # Non-renewables use the cap: (maxD + maxTotalOutflow)*beta, beta (slightly above 1)
                     ub = min(float(computed_ub), float(max_inv))

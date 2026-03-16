@@ -28,11 +28,11 @@
         "repeats": 1,
         "device": "cpu",
         "gen_data_constraint": true,
-        "gen_data_constraint_lb": true,
+        "gen_data_constraint_lb": false,
         "gen_data_constraint_lb_alpha": 0.1,
         "gen_data_constraint_lb_renewable_zero": true,
         "gen_data_constraint_ub_renewable_max_inv": true,
-        "specific_name": "GenConstLB"
+        "specific_name": "GenConstLBRenewTrue"
     },
     "Benders_args": {
         "N": ["BEL", "GER", "FRA","SPA", "NED"],
@@ -52,10 +52,10 @@
         "normalize_input": false,
         "repeats": 1,
         "device": "cpu",
-        "primal_net_directory":"outputs/PDL/ED/5Nodes-FraBelGerSpaNed/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-Baseline/repeat:0", 
-        "dual_net_directory":"outputs/PDL/ED/5Nodes-FraBelGerSpaNed/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-Baseline/repeat:0",
+        "primal_net_directory":"outputs/PDL/ED/5Nodes-FraBelGerSpaNed/Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-ConstraintNoLB_Baseline2/repeat:0", 
+        "dual_net_directory":"outputs/PDL/ED/5Nodes-FraBelGerSpaNed/Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-ConstraintNoLB_Baseline2/repeat:0",
         "exp_save_directory":"outputs/Benders/5Node",
-        "specific_name":"Baseline",
+        "specific_name":"ConstNoLB",
         "benders_setup": "Inexact_Refine",
         "_Comment_benders_setup": "Benders setup options: [Exact, Inexact, Inexact_Refine, All], All is when all three are run"
     },
@@ -76,6 +76,8 @@
     "rho_max": 5000,
     "penalty": "Single",
     "_comment_penalty": "Penalty option: Single (penalize only primal violation), Per_Const (individual penalty with a rho value per constraint)",
+    "use_primal_penalty": true,
+    "use_blend_repair": true,
     "alpha": 10,
     "outer_iterations": 10, 
     "inner_iterations": 100, 
@@ -105,7 +107,6 @@
     "shifted_sigmoid_scale": false,
     "repair_scaler": "Sigmoid",
     "_Comment":"RepairLayer Scaler Option: Sigmoid, ScaledSigmoid , ShiftedScaledSigmoid, SoftPlus",
-    "use_blend_repair": true,
     "k": 100.0,
     "soft_plus_k": 10.0,
 
