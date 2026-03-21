@@ -808,7 +808,10 @@ if __name__ == "__main__":
             primal_model_args["decay"] = best_args["decay"]
             primal_model_args["batch_size"] = best_args["batch_size"]
             primal_net = PrimalNetEndToEnd(primal_model_args, operational_data)
-            dual_net = DualClassificationNetEndToEnd(dual_model_args, operational_data)
+            if args["dual_classification"]:
+                dual_net = DualClassificationNetEndToEnd(dual_model_args, operational_data)
+            else:
+                dual_net = DualNetEndToEnd(dual_model_args, operational_data)
             primal_net.load_state_dict(torch.load(os.path.join(primal_net_directory, "primal_weights.pth"), weights_only=True))
             dual_net.load_state_dict(torch.load(os.path.join(dual_net_directory, "dual_weights.pth"), weights_only=True))
             primal_net.eval()

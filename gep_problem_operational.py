@@ -171,62 +171,84 @@ class GEPOperationalProblemSet():
         alpha=0.1,
         renewable_lb_zero=True,
         renewable_ub_max_inv=True,
-        beta = 1.05
+        beta=1.2,                       
+        renewable_ava_percentile=90,    
     ):
         """
         Constraint-aware unit investment sampling with optional lower bounds.
-
+    
         Current design:
         - Sobol sampling in [0,1]^|G|
-        - Upper bound is max_inv for all generators by default
+        - Non-renewables: ub = min(computed_ub, max_inv)
+            where computed_ub = (maxD + export) * beta / P_max
+        - Renewables (if renewable_ub_max_inv=False):
+            ub = max(max_inv, computed_ub)
+            where computed_ub = (maxD + export) * beta / (P_max * ava_p90)
+            and ava_p90 is the p-th percentile of non-zero availability
         - Optional lower bound for non-renewables:
             lb_g = alpha * max_t(D_n,t) / Pmax_g
         - Renewables can be forced to have lb = 0
         """
-
+    
         def _is_renewable(g):
             _, tech = g
             tech = str(tech).lower()
             return tech in {"sunpv", "windon", "windoff"}
-
+    
         def _compute_lb_ub_per_generator():
             lb_g = torch.zeros(self.num_g, dtype=self.DTYPE)
             ub_g = torch.full((self.num_g,), float(max_inv), dtype=self.DTYPE)
-
-
+    
             # max demand per node
             node_max_demand = {}
             for n in self.N:
                 node_max_demand[n] = max(self.pDemand[(n, t)] for t in self.T)
-
+    
             # total export per node
             node_export_cap = {n: 0.0 for n in self.N}
             for (start_node, end_node) in self.L:
                 node_export_cap[start_node] += float(self.pExpCap[(start_node, end_node)])
-
+    
             for g_idx, g in enumerate(self.G):
                 n, _ = g
                 pmax = float(self.pUnitCap[g])
-
+                is_ren = _is_renewable(g)
+    
+                # -------------------------------------------------------
+                # Compute effective availability for the denominator
+                # For renewables: use the p-th percentile of non-zero hours
+                # For non-renewables: availability = 1.0 (always available)
+                # -------------------------------------------------------
+                if is_ren:
+                    ava_values = [self.pGenAva.get((*g, t), 1.0) for t in self.T]
+                    ava_nonzero = [a for a in ava_values if a > 0]
+                    if ava_nonzero:
+                        ava_eff = float(np.percentile(ava_nonzero, renewable_ava_percentile))
+                    else:
+                        ava_eff = 1.0
+                else:
+                    ava_eff = 1.0
+    
+                # -------------------------------------------------------
+                # Computed upper bound: (maxD + export) * beta / (P_max * ava)
+                # -------------------------------------------------------
                 computed_ub = (
                     float(node_max_demand[n]) + float(node_export_cap[n])
-                )  * beta / pmax if pmax > 0 else 0.0
-
-                is_ren = _is_renewable(g)
-
+                ) * beta / (pmax * ava_eff) if pmax > 0 else 0.0
+                # print(f"AVA EFF IS {ava_eff:.3f} FOR {g}, computed_ub: {computed_ub:.1f} is ren {is_ren}")
                 # Upper bound
                 if is_ren:
                     if renewable_ub_max_inv:
-                        # If True, Renewables uses max_inv as upper bound
                         ub = float(max_inv)
-                    else: 
-                        # If False, Renewables use the computed upper bound based on demand and export capacity if larger than max inv
-                        ub = max(float(max_inv), float(computed_ub))
+                    else:
+                        ub = min(float(max_inv), float(computed_ub))
+                        print(f"COMPUTED UB FOR {g}: {computed_ub:.1f} "
+                            f"(ava_p{renewable_ava_percentile}={ava_eff:.3f}), "
+                            f"MAX_INV: {max_inv}, ub: {ub:.1f}")
                 else:
-                    # Non-renewables use the cap: (maxD + maxTotalOutflow)*beta, beta (slightly above 1)
                     ub = min(float(computed_ub), float(max_inv))
-
-                # Lower bound
+    
+                # Lower bounds
                 if lb_activated:
                     if is_ren and renewable_lb_zero:
                         lb = 0.0
@@ -234,28 +256,28 @@ class GEPOperationalProblemSet():
                         lb = float(alpha * node_max_demand[n] / pmax) if pmax > 0 else 0.0
                 else:
                     lb = 0.0
-
+    
                 # Safety
                 lb = min(lb, ub)
-
+    
                 lb_g[g_idx] = lb
                 ub_g[g_idx] = ub
-
+    
             return lb_g, ub_g
-
+    
         dimensions = self.num_g
         sobol_sampler = qmc.Sobol(d=dimensions)
         base_points = sobol_sampler.random_base2(m=m)
         np.random.shuffle(base_points)
-
+    
         dtype_np = np.float32 if self.args["device"] == "mps" else np.float64
         points01 = torch.tensor(base_points.astype(dtype_np))
-
+    
         lb_g, ub_g = _compute_lb_ub_per_generator()
-
+    
         points = lb_g.unsqueeze(0) + points01 * (ub_g - lb_g).unsqueeze(0)
-        points = torch.clamp(points, min=0.0, max=float(max_inv))
-
+        points = torch.clamp(points, min=lb_g.unsqueeze(0), max=ub_g.unsqueeze(0))
+    
         return points
 
     def generate_ui_data(self, m=15, max_inv=100000, zero_fraction=0.15):

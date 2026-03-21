@@ -17,13 +17,15 @@ ARGS_FILE_NAME option:
 - "config-5node.json": Config for 5-node experiments.
 - "config-6node.json": Config for 6-node experiments.
 '''
-ARGS_FILE_NAME = "config-5node.json"
+ARGS_FILE_NAME = "config.json"
 
 
 if __name__ == "__main__":
     # Load the arguments
     with open(ARGS_FILE_NAME, "r") as file:
         args = json.load(file)
+
+    
 
     QP_args = args["QP_args"]
 
@@ -99,7 +101,7 @@ if __name__ == "__main__":
             #! TODO: not all configs are correctly parsed here. E.g. when first running BEL and GER with both coal generators, is the same as with both gas generators.
             # For nodes, just use first letters: ['BEL', 'GER', 'NED'] → 'B-G-N'
             nodes_str = "-".join([n[0] for n in ED_args['N']])
-            
+            nodes_count = len(ED_args['N'])
             # For generators, count per node: [['BEL', 'WindOn'], ['BEL', 'Gas'],...] = 'B3-G2-N2'
             gen_counts = {}
             for g in ED_args['G']:
@@ -113,13 +115,22 @@ if __name__ == "__main__":
             # Create a shortened filename
             if ED_args.get("gen_data_constraint", False):
                 lb_setting_name = ED_args.get("gen_data_constraint_lb", False)
-                renewable_ub_max_inv = ED_args.get("gen_data_constraint_ub_renewable_max_inv", False)
-                data_save_path = (f"data/ED_data/Constraint/ED_N{nodes_str}_G{gens_str}_{lines_str}"
+                renewable_ub_max_inv = ED_args.get("gen_data_constraint_ub_renewable_max_inv", True)
+                gen_data_renew_availability = ED_args.get("gen_data_renew_availability", 100)
+                if gen_data_renew_availability == 100:
+                    data_save_path = (f"data/ED_data/Constraint/{nodes_count}Loc/ED_N{nodes_str}_G{gens_str}_{lines_str}"
                                 f"_c{int(ED_args['benders_compact'])}"
                                 f"_s{int(ED_args['scale_problem'])}"
                                 f"_p{int(ED_args['perturb_operating_costs'])}"
                                 f"_ui_constraint{ED_args['max_investment']}"
                                 f"_smp{ED_args['2n_synthetic_samples']}_GenConst_lb{lb_setting_name}_renewMaxInv{renewable_ub_max_inv}.pkl")
+                else:
+                    data_save_path = (f"data/ED_data/Constraint/{nodes_count}Loc/ED_N{nodes_str}_G{gens_str}_{lines_str}"
+                                f"_c{int(ED_args['benders_compact'])}"
+                                f"_s{int(ED_args['scale_problem'])}"
+                                f"_p{int(ED_args['perturb_operating_costs'])}"
+                                f"_ui_constraint{ED_args['max_investment']}"
+                                f"_smp{ED_args['2n_synthetic_samples']}_GenConst_lb{lb_setting_name}_renewPerc{gen_data_renew_availability}.pkl")
             else:
                 data_save_path = (f"data/ED_data/ED_N{nodes_str}_G{gens_str}_{lines_str}"
                                 f"_c{int(ED_args['benders_compact'])}"

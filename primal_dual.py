@@ -108,7 +108,17 @@ class PrimalDualTrainer():
         self.early_stopping_patience = args["early_stopping_patience"]
         self.X = data.X.to(self.DTYPE).to(self.DEVICE)
         self.loss_option = args.get("loss_option", "Original")
-        # self.normalize_by_gt = args.get("normalize_by_gt", False)
+       
+        self.dual_regularization = args.get("dual_regularization", "NA")
+        self.mu_barrier = float(args.get("mu_barrier_init", 1.0))       # Initial barrier weight (paper: mu^(0)=1)
+        self.mu_barrier_decay = float(args.get("mu_barrier_decay", 0.99))  # Per-outer-iter decay  (paper: 0.99)
+        self.mu_barrier_min = float(args.get("mu_barrier_min", 1e-4))    # Floor to avoid zero
+
+        self.old_mu = self.mu_barrier
+
+
+        
+
 
         if self.problem_type == "ED":
             self.total_demands = data.total_demands.to(self.DTYPE).to(self.DEVICE)
@@ -177,7 +187,7 @@ class PrimalDualTrainer():
                 self.dual_net = DualNet(self.args, self.data).to(dtype=self.DTYPE, device=self.DEVICE)
                 self.dual_loss_fn = self.dual_loss
 
-    
+
 
         elif self.problem_type == "GEP":
             # TODO: Implement GEP networks
@@ -202,6 +212,12 @@ class PrimalDualTrainer():
         self.best_primal_objs = [float('inf') for _ in range(len(self.max_violation_save_thresholds))]
         self.best_dual_obj = -1*float('inf')
 
+
+        ### GAMBEL ANNELING FOR DUALS
+        self.gumbel_tau_decay = args.get("gumbel_tau_decay", 0.95)
+        self.gumbel_tau_min = args.get("gumbel_tau_min", 0.1)
+        if args.get("dual_gumbel", False):
+            self.dual_net.tau = float(args.get("gumbel_tau_init", 1.0))
 
 
         pred_y = self.primal_net(self.X_train, self.total_demands_train)
@@ -420,11 +436,18 @@ class PrimalDualTrainer():
                     for (Xtrain, total_demands, X_opt) in self.train_loader:
                         compute_begin_time = time.time()
                         self.dual_optim.zero_grad()
-                        mu, lamb = self.dual_net(Xtrain)
+                        if self.dual_regularization == "S3L":
+                            mu, lamb = self.dual_net(Xtrain, mu=self.mu_barrier)
+                        else:
+                            mu, lamb = self.dual_net(Xtrain)
                         # print(lamb.mean(), lamb.max(), lamb.min())
                         if self.args["learn_primal"]:
                             with torch.no_grad():
-                                mu_k, lamb_k = frozen_dual_net(Xtrain)
+                                if self.dual_regularization == "S3L":
+                                    mu_k, lamb_k = frozen_dual_net(Xtrain, mu=self.mu_barrier)
+                                else:
+                                    mu_k, lamb_k = frozen_dual_net(Xtrain)
+
                                 y = frozen_primal_net(Xtrain, total_demands).detach()
                         else:
                             mu_k, lamb_k = None, None
@@ -488,6 +511,12 @@ class PrimalDualTrainer():
                             self.dual_scheduler.step(torch.sign(dual_loss_mean) * (torch.abs(dual_loss_mean) / self.rho))
                         else:
                             self.dual_scheduler.step(dual_loss_mean)
+                        
+                        if self.dual_regularization == "S3L":
+                            old_mu = self.mu_barrier
+                            self.mu_barrier = max(self.mu_barrier * self.mu_barrier_decay, self.mu_barrier_min)
+
+            
     
             if self.logger:
                 with torch.no_grad():
@@ -522,10 +551,24 @@ class PrimalDualTrainer():
                 write_header = not os.path.exists(csv_path)
                 eval_df.to_csv(csv_path, mode="a", index=False, header=write_header)
                 print(f" --- Primal opt gap: {primal_opt_gap:.4f}, Dual opt gap: {dual_opt_gap:.4f}, Duality gap: {duality_gap:.4f} --- ")
+            else:
+                print(f" ---  Dual opt gap: {dual_opt_gap:.4f} --- ")
 
             end_time = time.time()
-            print(f"Epoch {k} done. Time taken: {end_time - begin_time}. Rho: {self.rho}. Violation: {v_k}. Primal LR: {self.primal_optim.param_groups[0]['lr']}, Dual LR: {self.dual_optim.param_groups[0]['lr']}")
+            if self.args["learn_primal"]:
+                print(f"Epoch {k} done. Time taken: {end_time - begin_time}. Rho: {self.rho}. Violation: {v_k}. Primal LR: {self.primal_optim.param_groups[0]['lr']}, Dual LR: {self.dual_optim.param_groups[0]['lr']}")
+            else:
+                print(f"Epoch {k} done. Time taken: {end_time - begin_time}. Primal LR: {self.primal_optim.param_groups[0]['lr']}, Dual LR: {self.dual_optim.param_groups[0]['lr']}")
             print("-----------------------------------------")
+            print(f"[S3L] mu_barrier Has eolved to: {self.old_mu:.6f} -> {self.mu_barrier:.6f}")
+
+            if self.args.get("dual_gumbel", False) and hasattr(self.dual_net, 'tau'):
+                old_tau = self.dual_net.tau
+                self.dual_net.tau = max(0.1, self.dual_net.tau * 0.95)  # anneal toward 0.1
+                print(f"[Gumbel] tau: {old_tau:.3f} -> {self.dual_net.tau:.3f}")
+
+            self.old_mu = self.mu_barrier
+
             if self.args["learn_primal"]:
                 # Update rho from the second iteration onward.
                 if self.args["penalty"] == "Single":
@@ -604,6 +647,7 @@ class PrimalDualTrainer():
     def evaluate(self, X, total_demands, primal_net, dual_net, X_Opt, outer_iter=None, inner_iter=None):        
         # Forward pass through networks
         Y = primal_net(X, total_demands)
+
         mu, lamb = dual_net(X)
 
         ineq_dist = self.data.ineq_dist(X, Y)
@@ -770,11 +814,26 @@ class PrimalDualTrainer():
         dual_obj = self.data.dual_obj_fn(X, mu, lamb)
 
         loss = -dual_obj
+        barrier_term = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+        if self.dual_regularization == "S3L" and self.mu_barrier > 0:
+            
+            mu_clamped = mu.clamp(min=1e-8)  # Avoid log(0) by clamping mu to a small positive value
+
+            # Log-barrier: sum over all inequality dual variables per sample
+            # Shape: [batch, nineq] -> sum -> [batch]
+            log_barrier_mu = torch.sum(torch.log(mu_clamped), dim=1)  # [batch]
+
+            # The barrier encourages mu > 0 (interior point).
+            # We subtract it from the loss (since loss = -dual_obj,
+            # subtracting the barrier = adding it to the objective).
+            barrier_term = -self.mu_barrier * log_barrier_mu  # [batch]
+            loss = loss + barrier_term
+ 
 
         if self.loss_option == "Norm_GT":
             loss = loss / X_opt
         elif self.loss_option == "Norm_Obj":
-            scale = self.data.obj_fn(X, y).detach().abs() + 1e-6
+            scale = X[:, :self.data.num_n].sum(dim=1).abs() + 1e-6  # total demand
             loss = loss / scale
 
 
@@ -825,6 +884,7 @@ class PrimalDualTrainer():
     def compute_primal_dual_metric(self, X, total_demands, primal_net, dual_net, X_Opt):        
         # Forward pass through networks
         Y = primal_net(X, total_demands)
+
         mu, lamb = dual_net(X)
 
         ineq_dist = self.data.ineq_dist(X, Y)

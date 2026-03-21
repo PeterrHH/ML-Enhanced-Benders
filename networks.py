@@ -595,6 +595,7 @@ class DualNetEndToEnd(nn.Module):
         super().__init__()
         self.data = data
         self.hidden_sizes = [int(hidden_size_factor*data.xdim)] * n_layers
+        
         self.args = args
         self.ED_args = args["ED_args"]
 
@@ -624,6 +625,14 @@ class DualNetEndToEnd(nn.Module):
 
         #! Only predict lambda, we infer mu from it.
         self.feed_forward = FeedForwardNet(args, data.xdim, self.hidden_sizes, output_dim=self.out_dim, layernorm=True).to(self.DTYPE).to(self.DEVICE)
+        
+        self.register_buffer('f_l_lb', torch.tensor(
+            [-data.pImpCap[l] for l in data.L], dtype=self.DTYPE
+        ))
+        self.register_buffer('f_l_ub', torch.tensor(
+            [data.pExpCap[l] for l in data.L], dtype=self.DTYPE
+        ))
+
     
     
     def scale(self, x):
@@ -668,16 +677,99 @@ class DualNetEndToEnd(nn.Module):
         ], dim=1)
 
         return out_mu
+    
+    def complete_duals_smooth(self, lamb, X, mu_barrier):
+        """
+        S3L smooth dual completion . Implemented from paper Dual Interior Point Optimization Learning
+        When mu_barrier=0, reduces exactly to relu completion (Theorem 1).
         
+        Args:
+            lamb:        [B, neq]  — predicted equality duals (lambda)
+            X:           [B, xdim] — input features (contains p_g_max and D_n)
+            mu_barrier:  float     — barrier parameter, annealed toward 0 during training
+        """
+        # Compute reduced costs 
+        z = self.data.obj_coeff + torch.matmul(lamb, self.data.eq_cm)  # [B, n_vars]
+
+        # Step 2: extract bounds for each variable type
+        n_g = self.data.num_g
+        n_l = self.data.num_l
+        n_n = self.data.num_n
+
+        # Generator bounds: l=0, u=p_g_max (from input X)
+        p_g_max = X[:, n_n:n_n + n_g]                    # [B, n_g]
+        l_pg = torch.zeros_like(p_g_max)
+        u_pg = p_g_max
+
+        # Flow bounds: l=-f_l_max, u=f_l_max (fixed, from data)
+        l_fl = self.f_l_lb.unsqueeze(0).expand(X.shape[0], -1)
+        u_fl = self.f_l_ub.unsqueeze(0).expand(X.shape[0], -1)
+
+        # Unmet demand bounds: l=0, u=D_n (from input X)
+        D_n = X[:, :n_n]                                  # [B, n_n]
+        l_md = torch.zeros_like(D_n)
+        u_md = D_n
+
+        # Concatenate bounds in same order as z
+        l = torch.cat([l_pg, l_fl, l_md], dim=1)          # [B, n_vars]
+        u = torch.cat([u_pg, u_fl, u_md], dim=1)          # [B, n_vars]
+
+        # Step 3: smooth completion
+        if mu_barrier > 0:
+            # S3L Theorem 2 — smooth, always strictly positive
+            v = mu_barrier / (u - l).clamp(min=1e-8)      # [B, n_vars]
+            w = z / 2                                       # [B, n_vars]
+            sq = torch.sqrt(v**2 + w**2)                   # [B, n_vars]
+
+            mu_lb = v + w + sq                             # always > 0
+            mu_ub = v - w + sq                             # always > 0
+        else:
+            # S3L Theorem 1 — reduces to relu when barrier=0
+            mu_lb = torch.relu(z)
+            mu_ub = torch.relu(-z)
+
+        # Step 4: split into variable groups — same structure as before
+        p_g_lb = mu_lb[:, :n_g]
+        p_g_ub = mu_ub[:, :n_g]
+
+        f_l_lb = mu_lb[:, n_g:n_g + n_l]
+        f_l_ub = mu_ub[:, n_g:n_g + n_l]
+
+        md_n_lb = mu_lb[:, n_g + n_l:]
+        md_n_ub = mu_ub[:, n_g + n_l:]
+
+        out_mu = torch.cat([
+            p_g_lb, p_g_ub,
+            f_l_lb, f_l_ub,
+            md_n_lb, md_n_ub
+        ], dim=1)
+
+        return out_mu
+    
         
-    def forward(self, x):
+    def forward(self, x, mu = None):
+        x_raw = x
         if self.normalize:
             x = self.scale(x)
-            
+
+        
         out_lamb = self.feed_forward(x)
-        out_mu = self.complete_duals(out_lamb)
+
+        if self.args.get("clamp_lambda", False):
+            lambda_min = -float(self.data.pVOLL)                    # -10.0
+            lambda_max = -float(self.data.cost_vec.min().item())    # -0.0001
+            out_lamb = lambda_min + (lambda_max - lambda_min) * torch.sigmoid(out_lamb)
+
+        if self.args.get("dual_regularization", "NA") == "S3L" and mu is not None:
+            out_mu = self.complete_duals_smooth(out_lamb, x_raw, mu_barrier=mu)
+        else:
+            out_mu = self.complete_duals(out_lamb)
         # print(out_lamb)
         return out_mu, out_lamb
+    
+
+
+
     
 class DualClassificationNetEndToEnd(nn.Module):
     def __init__(self, args, data, hidden_size_factor=5.0, n_layers=4):
@@ -691,7 +783,7 @@ class DualClassificationNetEndToEnd(nn.Module):
         self.classes = -1 * torch.concat([self.data.cost_vec.unique(), torch.tensor([self.data.pVOLL])])
         self.n_classes = self.classes.numel()
         self.n_dual_vars = data.neq
-
+        
         #! For each dual variable, We now predict probabilities for each class
         self.out_dim = self.n_classes * self.n_dual_vars
 
@@ -716,7 +808,16 @@ class DualClassificationNetEndToEnd(nn.Module):
         #! Only predict lambda, we infer mu from it.
         #! Softmax requires layer norm.
         self.feed_forward = FeedForwardNet(args, data.xdim, self.hidden_sizes, output_dim=self.out_dim, layernorm=True).to(self.DTYPE).to(self.DEVICE)
-    
+
+        self.register_buffer('f_l_lb', torch.tensor(
+            [-data.pImpCap[l] for l in data.L], dtype=self.DTYPE
+        ))
+        self.register_buffer('f_l_ub', torch.tensor(
+            [data.pExpCap[l] for l in data.L], dtype=self.DTYPE
+        ))
+
+        self.tau = 1.0
+            
     def scale(self, x):
         if self.normalize == "z_score":
             d = x[:, :self.data.num_n]
@@ -759,27 +860,149 @@ class DualClassificationNetEndToEnd(nn.Module):
 
         return out_mu
         
+    def complete_duals_smooth(self, lamb, X, mu_barrier):
+        """
+        S3L smooth dual completion . Implemented from paper Dual Interior Point Optimization Learning
+        When mu_barrier=0, reduces exactly to relu completion (Theorem 1).
         
-    def forward(self, x):
+        Args:
+            lamb:        [B, neq]  — predicted equality duals (lambda)
+            X:           [B, xdim] — input features (contains p_g_max and D_n)
+            mu_barrier:  float     — barrier parameter, annealed toward 0 during training
+        """
+        # Compute reduced costs 
+        z = self.data.obj_coeff + torch.matmul(lamb, self.data.eq_cm)  # [B, n_vars]
+
+        # Step 2: extract bounds for each variable type
+        n_g = self.data.num_g
+        n_l = self.data.num_l
+        n_n = self.data.num_n
+
+        # Generator bounds: l=0, u=p_g_max (from input X)
+        p_g_max = X[:, n_n:n_n + n_g]                    # [B, n_g]
+        l_pg = torch.zeros_like(p_g_max)
+        u_pg = p_g_max
+
+        # Flow bounds: l=-f_l_max, u=f_l_max (fixed, from data)
+        l_fl = self.f_l_lb.unsqueeze(0).expand(X.shape[0], -1)
+        u_fl = self.f_l_ub.unsqueeze(0).expand(X.shape[0], -1)
+
+        # Unmet demand bounds: l=0, u=D_n (from input X)
+        D_n = X[:, :n_n]                                  # [B, n_n]
+        l_md = torch.zeros_like(D_n)
+        u_md = D_n
+
+        # Concatenate bounds in same order as z
+        l = torch.cat([l_pg, l_fl, l_md], dim=1)          # [B, n_vars]
+        u = torch.cat([u_pg, u_fl, u_md], dim=1)          # [B, n_vars]
+
+        # Step 3: smooth completion
+        if mu_barrier > 0:
+            # S3L Theorem 2 — smooth, always strictly positive
+            v = mu_barrier / (u - l).clamp(min=1e-8)      # [B, n_vars]
+            w = z / 2                                       # [B, n_vars]
+            sq = torch.sqrt(v**2 + w**2)                   # [B, n_vars]
+
+            mu_lb = v + w + sq                             # always > 0
+            mu_ub = v - w + sq                             # always > 0
+        else:
+            # S3L Theorem 1 — reduces to relu when barrier=0
+            mu_lb = torch.relu(z)
+            mu_ub = torch.relu(-z)
+
+        # Step 4: split into variable groups — same structure as before
+        p_g_lb = mu_lb[:, :n_g]
+        p_g_ub = mu_ub[:, :n_g]
+
+        f_l_lb = mu_lb[:, n_g:n_g + n_l]
+        f_l_ub = mu_ub[:, n_g:n_g + n_l]
+
+        md_n_lb = mu_lb[:, n_g + n_l:]
+        md_n_ub = mu_ub[:, n_g + n_l:]
+
+        out_mu = torch.cat([
+            p_g_lb, p_g_ub,
+            f_l_lb, f_l_ub,
+            md_n_lb, md_n_ub
+        ], dim=1)
+
+        return out_mu
+    
+    def forward(self, x, mu=None):
+        x_raw = x
         if self.normalize:
             x = self.scale(x)
-        out_lamb_raw_probas = self.feed_forward(x) # [B, n_var*n_classes]
-        T = 1
-        out_lamb_raw_probas = out_lamb_raw_probas.view(-1, self.n_dual_vars, self.n_classes) # [B, n_var, n_classes]
+        out_lamb_raw_probas = self.feed_forward(x)
+        out_lamb_raw_probas = out_lamb_raw_probas.view(-1, self.n_dual_vars, self.n_classes)
 
         if self.training:
-            out_lamb_probas = torch.softmax(out_lamb_raw_probas, dim=-1)
+            if self.args.get("dual_gumbel", False):
+                # tau = getattr(self, 'tau', 1.0)
+                # y_hard = F.gumbel_softmax(
+                #     out_lamb_raw_probas,
+                #     tau=tau,
+                #     hard=True,
+                #     dim=-1
+                # )
+                # out_lamb = (y_hard * self.classes).sum(dim=-1)
+                probs = torch.softmax(out_lamb_raw_probas, dim=-1)  # [B, n_vars, n_classes]
+                
+                hard_idx = probs.argmax(dim=-1, keepdim=True)       # [B, n_vars, 1]
+                y_hard = torch.zeros_like(probs).scatter_(-1, hard_idx, 1.0)  # one-hot
+                
+                # The trick: forward sees y_hard, backward sees probs
+                st = y_hard - probs.detach() + probs                # [B, n_vars, n_classes]
+                
+                out_lamb = (st * self.classes).sum(dim=-1)          # [B, n_vars]
 
-            out_lamb = torch.sum(out_lamb_probas * self.classes, dim=-1)
-            out_mu = self.complete_duals(out_lamb)
+            else:
+                out_lamb_probas = torch.softmax(out_lamb_raw_probas, dim=-1)
+                out_lamb = torch.sum(out_lamb_probas * self.classes, dim=-1)
 
+            if self.args.get("dual_regularization", "NA") == "S3L" and mu is not None:
+                out_mu = self.complete_duals_smooth(out_lamb, x_raw, mu_barrier=mu)
+            else:
+                out_mu = self.complete_duals(out_lamb)
             return out_mu, out_lamb
 
         else:
             predicted_class = out_lamb_raw_probas.argmax(dim=-1)
             out_lamb = self.classes[predicted_class]
-            out_mu = self.complete_duals(out_lamb)
+            if self.args.get("dual_regularization", "NA") == "S3L" and mu is not None:
+                out_mu = self.complete_duals_smooth(out_lamb, x_raw, mu_barrier=mu)
+            else:
+                out_mu = self.complete_duals(out_lamb)
             return out_mu, out_lamb
+        
+    # def forward(self, x, mu = None):
+    #     x_raw = x
+    #     if self.normalize:
+    #         x = self.scale(x)
+    #     out_lamb_raw_probas = self.feed_forward(x) # [B, n_var*n_classes]
+    #     T = 1
+    #     out_lamb_raw_probas = out_lamb_raw_probas.view(-1, self.n_dual_vars, self.n_classes) # [B, n_var, n_classes]
+
+    #     if self.training:
+    #         out_lamb_probas = torch.softmax(out_lamb_raw_probas, dim=-1)
+
+    #         out_lamb = torch.sum(out_lamb_probas * self.classes, dim=-1)
+    #         if self.args.get("dual_regularization", "NA") == "S3L" and mu is not None:
+    #             out_mu = self.complete_duals_smooth(out_lamb, x_raw, mu_barrier=mu)
+    #         else:
+    #             out_mu = self.complete_duals(out_lamb)
+
+    #         return out_mu, out_lamb
+
+    #     else:
+    #         predicted_class = out_lamb_raw_probas.argmax(dim=-1)
+    #         out_lamb = self.classes[predicted_class]
+    #         if self.args.get("dual_regularization", "NA") == "S3L" and mu is not None:
+    #             out_mu = self.complete_duals_smooth(out_lamb, x_raw, mu_barrier=mu)
+    #         else:
+    #             out_mu = self.complete_duals(out_lamb)
+
+    #         # out_mu = self.complete_duals(out_lamb)
+    #         return out_mu, out_lamb
          
 def load(args, data, save_dir):
     primal_net = PrimalNetEndToEnd(args, data=data)
