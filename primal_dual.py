@@ -116,8 +116,17 @@ class PrimalDualTrainer():
 
         self.old_mu = self.mu_barrier
 
+        if args.get("use_prod_surplus_input", False):
+            surplus = torch.zeros(self.X.shape[0], self.data.num_n)
+            d = self.X[:, :self.data.num_n]
+            p = self.X[:, self.data.num_n:self.data.num_n + self.data.num_g]
+            for i, node in enumerate(self.data.N):
+                local_gen_mask = [j for j, g in enumerate(self.data.G) if g[0] == node]
+                surplus[:, i] = d[:, i] - p[:, local_gen_mask].sum(dim=1)
+            self.X = torch.cat([self.X, surplus], dim=1)
+            self.data.xdim += self.data.num_n
 
-        
+                
 
 
         if self.problem_type == "ED":
@@ -742,8 +751,9 @@ class PrimalDualTrainer():
                 lagrange_ineq = lagrange_ineq / X_opt
                 penalty = penalty / X_opt
             elif self.loss_option == "Norm_Obj":
-                scale = obj.detach().abs() + 1e-6
-                loss = loss / scale
+                # scale = obj.detach().abs() + 1e-6
+                # loss = loss / scale
+                scale = X[:, :self.data.num_n].sum(dim=1).abs() + 1e-6  # total demand
                 lagrange_eq = lagrange_eq / scale
                 lagrange_ineq = lagrange_ineq / scale
                 penalty = penalty / scale

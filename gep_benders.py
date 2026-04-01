@@ -536,8 +536,8 @@ class BendersSolver():
                     print(f"Duality gap: {(self.best_upper_bound - lower_bound)/np.abs(self.best_upper_bound)}")
                     break
             else:
-                if self.exact == False:
-                    print("!! !! Different investments than last iteration")
+                # if self.exact == False:
+                #     # print("!! !! Different investments than last iteration")
                 investments_all.append(investments_iter_k)
             
             if self.exact:
@@ -765,16 +765,28 @@ if __name__ == "__main__":
 
             gep_data_save_path = f"data/GEP_data/sample_duration:{benders_args['sample_duration']}_N:{nodes_str}_G:{gens_str}_L:{lines_str}.pkl"
             # Prep problem data:
-            if not os.path.exists(ed_data_save_path):
-                directory = os.path.dirname(ed_data_save_path)
-                os.makedirs(directory, exist_ok=True)
-                create_gep_ed_dataset(args=args, problem_args=benders_args, inputs=experiment_instance, problem_type="ED", save_path=ed_data_save_path)
-            if not os.path.exists(gep_data_save_path):
-                directory = os.path.dirname(gep_data_save_path)
-                os.makedirs(directory, exist_ok=True)
-                create_gep_ed_dataset(args=args, problem_args=benders_args, inputs=experiment_instance, problem_type="GEP", save_path=gep_data_save_path)
+            if args_cli.solve_direct:
+                if not os.path.exists(gep_data_save_path):
+                    directory = os.path.dirname(gep_data_save_path)
+                    os.makedirs(directory, exist_ok=True)
+                    create_gep_ed_dataset(
+                        args=args,
+                        problem_args=benders_args,
+                        inputs=experiment_instance,
+                        problem_type="GEP",
+                        save_path=gep_data_save_path
+                    )
+            else:
+                if not os.path.exists(ed_data_save_path):
+                    directory = os.path.dirname(ed_data_save_path)
+                    os.makedirs(directory, exist_ok=True)
+                    create_gep_ed_dataset(args=args, problem_args=benders_args, inputs=experiment_instance, problem_type="ED", save_path=ed_data_save_path)
+                if not os.path.exists(gep_data_save_path):
+                    directory = os.path.dirname(gep_data_save_path)
+                    os.makedirs(directory, exist_ok=True)
+                    create_gep_ed_dataset(args=args, problem_args=benders_args, inputs=experiment_instance, problem_type="GEP", save_path=gep_data_save_path)
 
-             # Load data:
+                # Load data:
             with open(ed_data_save_path, 'rb') as file:
                 operational_data = pickle.load(file)
             with open(gep_data_save_path, 'rb') as file:
@@ -785,37 +797,38 @@ if __name__ == "__main__":
             # dual_net_directory = "experiment-output/ch7/3nodes/dual_model"
             # primal_net_directory = "outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
             # dual_net_directory = "outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
-            if "primal_net_directory" in args["Benders_args"]:
-                primal_net_directory = args["Benders_args"]["primal_net_directory"]
-            else:
-                raise ValueError("Please provide a directory for the primal net in the config file under Benders_args with key 'primal_net_directory'")
-                primal_net_directory = "outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
-            
-            if "dual_net_directory" in args["Benders_args"]:
-                dual_net_directory = args["Benders_args"]["dual_net_directory"]
-            else:
-                raise ValueError("Please provide a directory for the dual net in the config file under Benders_args with key 'dual_net_directory'")
-                dual_net_directory = "outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
-            print(f"Primal Net Directory: {primal_net_directory}")
-            print(f"Dual Net Directory: {dual_net_directory}")
-            primal_model_args = json.load(open(os.path.join(primal_net_directory, "args.json")))
-            dual_model_args = json.load(open(os.path.join(dual_net_directory, "args.json")))
-            
-            best_args = {'primal_lr': 0.0006785456069117277, 'hidden_size_factor': 28, 'n_layers': 2, 'decay': 0.9989743016070536, 'batch_size': 2048}  #! Temporary, for primal net
-            primal_model_args["primal_lr"] = best_args["primal_lr"]
-            primal_model_args["hidden_size_factor"] = best_args["hidden_size_factor"]
-            primal_model_args["n_layers"] = best_args["n_layers"]
-            primal_model_args["decay"] = best_args["decay"]
-            primal_model_args["batch_size"] = best_args["batch_size"]
-            primal_net = PrimalNetEndToEnd(primal_model_args, operational_data)
-            if args["dual_classification"]:
-                dual_net = DualClassificationNetEndToEnd(dual_model_args, operational_data)
-            else:
-                dual_net = DualNetEndToEnd(dual_model_args, operational_data)
-            primal_net.load_state_dict(torch.load(os.path.join(primal_net_directory, "primal_weights.pth"), weights_only=True))
-            dual_net.load_state_dict(torch.load(os.path.join(dual_net_directory, "dual_weights.pth"), weights_only=True))
-            primal_net.eval()
-            dual_net.eval()
+            if not args_cli.solve_direct:
+                if "primal_net_directory" in args["Benders_args"]:
+                    primal_net_directory = args["Benders_args"]["primal_net_directory"]
+                else:
+                    raise ValueError("Please provide a directory for the primal net in the config file under Benders_args with key 'primal_net_directory'")
+                    primal_net_directory = "outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
+                
+                if "dual_net_directory" in args["Benders_args"]:
+                    dual_net_directory = args["Benders_args"]["dual_net_directory"]
+                else:
+                    raise ValueError("Please provide a directory for the dual net in the config file under Benders_args with key 'dual_net_directory'")
+                    dual_net_directory = "outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
+                print(f"Primal Net Directory: {primal_net_directory}")
+                print(f"Dual Net Directory: {dual_net_directory}")
+                primal_model_args = json.load(open(os.path.join(primal_net_directory, "args.json")))
+                dual_model_args = json.load(open(os.path.join(dual_net_directory, "args.json")))
+                
+                best_args = {'primal_lr': 0.0006785456069117277, 'hidden_size_factor': 28, 'n_layers': 2, 'decay': 0.9989743016070536, 'batch_size': 2048}  #! Temporary, for primal net
+                primal_model_args["primal_lr"] = best_args["primal_lr"]
+                primal_model_args["hidden_size_factor"] = best_args["hidden_size_factor"]
+                primal_model_args["n_layers"] = best_args["n_layers"]
+                primal_model_args["decay"] = best_args["decay"]
+                primal_model_args["batch_size"] = best_args["batch_size"]
+                primal_net = PrimalNetEndToEnd(primal_model_args, operational_data)
+                if args["dual_classification"]:
+                    dual_net = DualClassificationNetEndToEnd(dual_model_args, operational_data)
+                else:
+                    dual_net = DualNetEndToEnd(dual_model_args, operational_data)
+                primal_net.load_state_dict(torch.load(os.path.join(primal_net_directory, "primal_weights.pth"), weights_only=True), strict = False)
+                dual_net.load_state_dict(torch.load(os.path.join(dual_net_directory, "dual_weights.pth"), weights_only=True), strict = False)
+                primal_net.eval()
+                dual_net.eval()
 
             # Solve single sample with matrix formulation
             start_exact = True
@@ -849,6 +862,8 @@ if __name__ == "__main__":
                     for sample in range(samples):
                         if args_cli.solve_direct:
                             # Solve Directly with Solver
+                            primal_net = None
+                            dual_net = None
                             solver = BendersSolver(gep_data=gep_data, operational_data=operational_data, primal_net=primal_net, dual_net=dual_net, sample=sample, 
                                                    exact=start_exact, exact_refinement=exact_refinement, max_investment=benders_args["max_investment"],
                                                    init_investment=benders_args["init_investment"])
@@ -907,7 +922,11 @@ if __name__ == "__main__":
                             iter_df["investment"] = [json.dumps(v) for v in solver.inv_hist]
                             specific_name = args["Benders_args"].get("specific_name", "")
                             benders_setup_str = args["Benders_args"].get("benders_setup", "")
-                            out_dir = f"outputs/Benders/{NumNode}Node/iter_logs_{benders_setup_str}_{specific_name}"
+                            # if samples == 1:
+                            #     out_dir = f"outputs/Benders/{NumNode}Node/Full_Time/iter_logs_{benders_setup_str}_{specific_name}"
+                            # else:
+                            out_dir = f"outputs/Benders/{NumNode}Node/Sample_{benders_args['sample_duration']}/iter_logs_{benders_setup_str}_{specific_name}"
+
                             os.makedirs(out_dir, exist_ok=True)
                             iter_df.to_csv(
                                 os.path.join(out_dir, f"iterlog_sample{sample}_start_exact{start_exact}_ref{exact_refinement}.csv"),
@@ -954,11 +973,18 @@ if __name__ == "__main__":
                     
                     if args_cli.solve_direct:
                         specific_name = "direct_exact"
-                        data_save_path = os.path.join(args["Benders_args"]["exp_save_directory"], f"Gurobi_Solution.csv")
+                        out_dir = f"outputs/Benders/{NumNode}Node/Sample_{benders_args['sample_duration']}"
+                        os.makedirs(out_dir, exist_ok=True)
+                        data_save_path = os.path.join(args["Benders_args"]["exp_save_directory"], f"Sample_{str(benders_args['sample_duration'])}", f"Gurobi_Solution.csv")
                 
                     else:
                         specific_name = args["Benders_args"].get("specific_name", "")
-                        data_save_path = os.path.join(args["Benders_args"]["exp_save_directory"], f"experiment_data_sample_duration:{benders_args['sample_duration']}_start_exact:{start_exact}_exact_refinement:{exact_refinement}_{specific_name}.csv")
+                        
+                        if samples == 1:
+                            data_save_path = os.path.join(args["Benders_args"]["exp_save_directory"], f"Sample_{str(benders_args['sample_duration'])}",f"experiment_data_full_time_sample_duration:{benders_args['sample_duration']}_start_exact:{start_exact}_exact_refinement:{exact_refinement}_{specific_name}.csv")
+                        else:
+                            data_save_path = os.path.join(args["Benders_args"]["exp_save_directory"], f"Sample_{str(benders_args['sample_duration'])}", f"experiment_data_sample_duration:{benders_args['sample_duration']}_start_exact:{start_exact}_exact_refinement:{exact_refinement}_{specific_name}.csv")
+                        
                     experiment_data_df.to_csv(data_save_path, index=False)
 
 
@@ -993,3 +1019,9 @@ if __name__ == "__main__":
                 # plt.tight_layout()
                 # plt.savefig("experiment-output/ch7/3nodes/benders_test_data_exact.pdf", dpi=300, bbox_inches='tight')
                 # plt.show()
+
+
+'''
+PseudoCode
+'''
+

@@ -185,6 +185,77 @@ class FeedForwardNet(nn.Module):
     def forward(self, x):
         x_out = self.net(x)
         return x_out
+    
+
+class FeedForwardNetSeparateHead(nn.Module):
+    """
+    Shared MLP backbone with independent classification head per dual variable.
+    
+    Instead of one flat Linear(hidden -> n_dual_vars * n_classes) output in FeedForwardNet,
+    each dual variable gets its own Linear(hidden -> n_classes) head.
+    This prevents gradient interference between nodes during training.
+    """
+    def __init__(self, args, input_dim, hidden_sizes, n_heads, n_classes):
+        """
+        Args:
+            input_dim:    Number of input features
+            hidden_sizes: List of hidden layer sizes for shared backbone
+            n_heads:      Number of independent heads (= n_dual_vars = n nodes)
+            n_classes:    Number of classes per head (= number of cost classes)
+        """
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.hidden_sizes = hidden_sizes
+        self.n_heads = n_heads
+        self.n_classes = n_classes
+
+        if args["device"] == "mps":
+            self.DTYPE = torch.float32
+            self.DEVICE = torch.device("mps")
+        else:
+            self.DTYPE = torch.float64
+            self.DEVICE = torch.device("cpu")
+
+        torch.set_default_dtype(self.DTYPE)
+        torch.set_default_device(self.DEVICE)
+
+        # --- Shared backbone (no output layer) ---
+        backbone_layers = []
+        backbone_layers.append(nn.LayerNorm(input_dim))  # always on for dual net
+
+        layer_sizes = [input_dim] + hidden_sizes
+        for in_size, out_size in zip(layer_sizes[:-1], layer_sizes[1:]):
+            backbone_layers.append(nn.Linear(in_size, out_size))
+            backbone_layers.append(nn.ReLU())
+
+        # Kaiming init on backbone linears
+        for layer in backbone_layers:
+            if isinstance(layer, nn.Linear):
+                nn.init.kaiming_normal_(layer.weight)
+
+        self.backbone = nn.Sequential(*backbone_layers)
+
+        # --- Per-node classification heads ---
+        # Each head: Linear(hidden -> n_classes), no activation (softmax applied outside)
+        self.heads = nn.ModuleList([
+            nn.Linear(hidden_sizes[-1], n_classes)
+            for _ in range(n_heads)
+        ])
+
+        # Kaiming init on heads
+        for head in self.heads:
+            nn.init.kaiming_normal_(head.weight)
+
+    def forward(self, x):
+        h = self.backbone(x)  # [B, hidden]
+
+        # Each head independently classifies its node
+        logits = torch.stack(
+            [head(h) for head in self.heads], dim=1
+        )  # [B, n_heads, n_classes]
+
+        return logits.view(x.shape[0], -1)  # [B, n_heads*n_classes]
 
 
 class BoundRepairLayer(nn.Module):
@@ -625,7 +696,7 @@ class DualNetEndToEnd(nn.Module):
 
         #! Only predict lambda, we infer mu from it.
         self.feed_forward = FeedForwardNet(args, data.xdim, self.hidden_sizes, output_dim=self.out_dim, layernorm=True).to(self.DTYPE).to(self.DEVICE)
-        
+
         self.register_buffer('f_l_lb', torch.tensor(
             [-data.pImpCap[l] for l in data.L], dtype=self.DTYPE
         ))
@@ -807,7 +878,18 @@ class DualClassificationNetEndToEnd(nn.Module):
 
         #! Only predict lambda, we infer mu from it.
         #! Softmax requires layer norm.
-        self.feed_forward = FeedForwardNet(args, data.xdim, self.hidden_sizes, output_dim=self.out_dim, layernorm=True).to(self.DTYPE).to(self.DEVICE)
+        if args.get("SeperatePredicationHead", False):
+            self.feed_forward = FeedForwardNetSeparateHead(
+                args,
+                input_dim=data.xdim,
+                hidden_sizes=self.hidden_sizes,
+                n_heads=self.n_dual_vars,
+                n_classes=self.n_classes
+            ).to(self.DTYPE).to(self.DEVICE)
+            # print("======= Using separate prediction heads for each dual variable. ========== ")
+        else:
+            self.feed_forward = FeedForwardNet(args, data.xdim, self.hidden_sizes, output_dim=self.out_dim, layernorm=True).to(self.DTYPE).to(self.DEVICE)
+
 
         self.register_buffer('f_l_lb', torch.tensor(
             [-data.pImpCap[l] for l in data.L], dtype=self.DTYPE
@@ -945,15 +1027,18 @@ class DualClassificationNetEndToEnd(nn.Module):
                 #     dim=-1
                 # )
                 # out_lamb = (y_hard * self.classes).sum(dim=-1)
-                probs = torch.softmax(out_lamb_raw_probas, dim=-1)  # [B, n_vars, n_classes]
-                
-                hard_idx = probs.argmax(dim=-1, keepdim=True)       # [B, n_vars, 1]
-                y_hard = torch.zeros_like(probs).scatter_(-1, hard_idx, 1.0)  # one-hot
-                
-                # The trick: forward sees y_hard, backward sees probs
-                st = y_hard - probs.detach() + probs                # [B, n_vars, n_classes]
-                
-                out_lamb = (st * self.classes).sum(dim=-1)          # [B, n_vars]
+                gumbel_noise = -torch.log(-torch.log(torch.rand_like(out_lamb_raw_probas) + 1e-20) + 1e-20)
+                noisy_logits = (out_lamb_raw_probas + gumbel_noise) / self.tau
+
+                # Soft probabilities (differentiable)
+                probs = torch.softmax(noisy_logits, dim=-1)
+
+                # Straight-through for hard selection
+                hard_idx = probs.argmax(dim=-1, keepdim=True)
+                y_hard = torch.zeros_like(probs).scatter_(-1, hard_idx, 1.0)
+                st = y_hard - probs.detach() + probs
+
+                out_lamb = (st * self.classes).sum(dim=-1)
 
             else:
                 out_lamb_probas = torch.softmax(out_lamb_raw_probas, dim=-1)

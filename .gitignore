@@ -221,3 +221,6 @@ boosting-crossover-with-ai/
 
 experiment-output/ch7/3nodes/*
 outputs/Benders
+figures/*
+icons/*
+availability_with_icons.png

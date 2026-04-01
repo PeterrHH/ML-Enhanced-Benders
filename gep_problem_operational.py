@@ -85,7 +85,8 @@ class GEPOperationalProblemSet():
                                                                     lb_activated = self.args["ED_args"].get("gen_data_constraint_lb", False),
                                                                     alpha = self.args["ED_args"].get("gen_data_constraint_lb_alpha", 0.2),
                                                                     renewable_lb_zero = self.args["ED_args"].get("gen_data_constraint_lb_renewable_zero", True),
-                                                                    renewable_ub_max_inv = self.args["ED_args"].get("gen_data_constraint_ub_renewable_max_inv", True))
+                                                                    renewable_ub_max_inv = self.args["ED_args"].get("gen_data_constraint_ub_renewable_max_inv", True),
+                                                                    renewable_ava_percentile= self.args["ED_args"].get("gen_data_renew_availability", 100))
 
         else:
             self.pUnitInvestment = self.generate_ui_data(m=self.ED_args["2n_synthetic_samples"], max_inv=self.ED_args["max_investment"])

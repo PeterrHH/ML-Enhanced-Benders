@@ -24,13 +24,13 @@
         "normalize_input": false,
         "repeats": 1,
         "device": "cpu",
-        "gen_data_constraint": true,
+        "gen_data_constraint": false,
         "gen_data_constraint_lb": false,
         "gen_data_constraint_lb_alpha": 0.1,
         "gen_data_constraint_lb_renewable_zero": true,
         "gen_data_constraint_ub_renewable_max_inv": true,
         "_comment":"renewable max inv means for renewabels UB is set to max investment if True, if False, UB is set to max(production capacity, max investment)",
-        "gen_data_renew_availability": 100,
+        "gen_data_renew_availability": 50,
         "_GenAvailablity_comment": "if = 100, availability is the max(availablity) for the renewable, if < 100, availability is set to the specified percentile of availability in the original data",
         "specific_name": "GenConstRenewUBTrue"
     },
@@ -49,10 +49,10 @@
         "normalize_input": false,
         "repeats": 1,
         "device": "cpu",
-        "primal_net_directory":"outputs/PDL/ED/4Nodes-FraBelGerSpa/Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-ConstRenewPerc90/repeat:0", 
-        "dual_net_directory":"outputs/PDL/ED/4Nodes-FraBelGerSpa/Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-ConstRenewPerc90/repeat:0",
+        "primal_net_directory":"outputs/PDL/ED/4Nodes-FraBelGerSpa/Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-ConstSepHeadNormDemand/repeat:0", 
+        "dual_net_directory":"outputs/PDL/ED/4Nodes-FraBelGerSpa/Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-ConstSepHeadNormDemand/repeat:0",
         "exp_save_directory":"outputs/Benders/4Node",
-        "specific_name":"ConstRenewPerc90",
+        "specific_name":"ConstD_1_SepHead_NormDemand",
         "benders_setup": "Inexact_Refine",
         "_Comment_benders_setup": "Benders setup options: [Exact, Inexact, Inexact_Refine, All], All is when all three are run",
         "init_investment": "Zero",
@@ -123,7 +123,16 @@
         "max_violation_save_thresholds": [],
         "early_stopping_patience": 0,
 
-        "dual_regularization": true,
+        "dual_regularization": "NA",
         "mu_barrier_init": 1.0,      
-        "mu_barrier_decay": 0.99    
+        "mu_barrier_decay": 0.99,
+        
+        "dual_gumbel": false,
+        "gumbel_tau_init": 1.0,
+        "gumbel_tau_decay": 0.95,
+        "gumbel_tau_min": 0.1,
+    
+        "use_prod_surplus_input": false,
+
+        "SeperatePredicationHead": true
 }   
