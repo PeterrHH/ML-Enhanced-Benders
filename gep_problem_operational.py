@@ -80,7 +80,14 @@ class GEPOperationalProblemSet():
         # Generate unit investment data:
         if args["ED_args"].get("gen_data_constraint", False):
             # Generate with no Lower Bound
-            self.pUnitInvestment = self.generate_ui_data_constraint(m=self.ED_args["2n_synthetic_samples"], 
+            if args["ED_args"].get("gen_data_node_constraint", False):
+                self.pUnitInvestment = self.generate_ui_data_node_constraint(
+                    m=self.ED_args["2n_synthetic_samples"],
+                    max_inv=self.ED_args["max_investment"],
+                    renewable_ava_percentile=self.args["ED_args"].get("gen_data_renew_availability", 90),
+                )
+            else:
+                self.pUnitInvestment = self.generate_ui_data_constraint(m=self.ED_args["2n_synthetic_samples"], 
                                                                     max_inv=self.ED_args["max_investment"],
                                                                     lb_activated = self.args["ED_args"].get("gen_data_constraint_lb", False),
                                                                     alpha = self.args["ED_args"].get("gen_data_constraint_lb_alpha", 0.2),
@@ -163,6 +170,101 @@ class GEPOperationalProblemSet():
     def save_data(self, save_path):
         with open(save_path, 'wb') as file:
             pickle.dump(self, file)
+
+    def generate_ui_data_node_constraint(
+        self,
+        m=15,
+        max_inv=1000.0,
+        renewable_ava_percentile=90,
+        r_choices=None,
+        r_probs=None,
+        alpha_choices=(0.2, 1.0, 5.0),
+    ):
+        """
+        Node-level effective-capacity investment sampling.
+
+        For each node n:
+            sum_g q_g * pUnitCap_g * u_g ~= r_n * C_n
+
+        where:
+            C_n = max_t D_n,t + export capacity from node n
+            q_g = 1 for dispatchable generators
+            q_g = renewable availability percentile for renewables
+
+        The node budget is then split across local generators using Dirichlet sampling.
+        """
+
+        def _is_renewable(g):
+            _, tech = g
+            return str(tech).lower() in {"sunpv", "windon", "windoff"}
+
+        if r_choices is None:
+            r_choices = np.array([0.5, 0.8, 0.95, 1.0, 1.1, 1.4, 1.8])
+
+        if r_probs is None:
+            r_probs = np.array([0.05, 0.10, 0.20, 0.25, 0.20, 0.12, 0.08])
+
+        # Number of investment samples
+        n_samples = 2 ** m
+        all_points = torch.zeros((n_samples, self.num_g), dtype=self.DTYPE)
+
+        # Node capacity bound C_n
+        node_C = {}
+        for n in self.N:
+            max_demand = max(float(self.pDemand[(n, t)]) for t in self.T)
+
+            export_cap = 0.0
+            for l in self.L:
+                start_node, end_node = l
+                if start_node == n:
+                    export_cap += float(self.pExpCap[l])
+                elif end_node == n:
+                    export_cap += float(self.pImpCap[l])
+
+            node_C[n] = max_demand + export_cap
+
+        # Effective availability q_g
+        q_g = {}
+        for g in self.G:
+            if _is_renewable(g):
+                vals = [float(self.pGenAva.get((*g, t), 1.0)) for t in self.T]
+                nonzero_vals = [v for v in vals if v > 0]
+
+                if len(nonzero_vals) > 0:
+                    q_g[g] = max(float(np.percentile(nonzero_vals, renewable_ava_percentile)), 1e-6)
+                else:
+                    q_g[g] = 1.0
+            else:
+                q_g[g] = 1.0
+
+        # Sample node budgets and split locally
+        for i in range(n_samples):
+            inv = {}
+
+            for n in self.N:
+                gens_at_node = [g for g in self.G if g[0] == n]
+
+                if len(gens_at_node) == 0:
+                    continue
+
+                r_n = np.random.choice(r_choices, p=r_probs)
+                E_n = r_n * node_C[n]
+
+                alpha = np.random.choice(alpha_choices)
+                shares = np.random.dirichlet(alpha * np.ones(len(gens_at_node)))
+
+                for share, g in zip(shares, gens_at_node):
+                    p_unit = float(self.pUnitCap[g])
+                    q_eff = max(float(q_g[g]), 1e-8)
+
+                    u_g = share * E_n / (q_eff * p_unit)
+                    u_g = min(max(u_g, 0.0), float(max_inv))
+
+                    inv[g] = u_g
+
+            all_points[i] = torch.tensor([inv[g] for g in self.G], dtype=self.DTYPE)
+
+        return all_points
 
     def generate_ui_data_constraint(
         self,

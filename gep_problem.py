@@ -83,16 +83,28 @@ class GEPProblemSet():
             self.lineflow_mask[end_idx, l_idx] = 1
         
         # Create constraint matrices, rhs and obj_fns
-        print("Populating ineq constraints")
-        self.ineq_cm, self.ineq_rhs = self.build_ineq_cm_rhs()
-        print("Populating eq constraints")
-        self.eq_cm, self.eq_rhs = self.build_eq_cm_rhs()
+        # print("Populating ineq constraints")
+        # self.ineq_cm, self.ineq_rhs = self.build_ineq_cm_rhs()
+        # print("Populating eq constraints")
+        # self.eq_cm, self.eq_rhs = self.build_eq_cm_rhs()
+        # print("Creating objective coefficients")
+        # self.obj_coeff = self.build_obj_coeff()
+        # print("Creating input for NN: X")
+        # # self.X = self.build_X()
+        # self.X = torch.concat([self.eq_rhs, self.ineq_rhs], dim=1)
+        # self.xdim = self.X.shape[1]
+
+
         print("Creating objective coefficients")
         self.obj_coeff = self.build_obj_coeff()
-        print("Creating input for NN: X")
-        # self.X = self.build_X()
+
+        print("Building compact per-sample RHS / X")
+        self.eq_rhs, self.ineq_rhs = self.build_rhs_only()
         self.X = torch.concat([self.eq_rhs, self.ineq_rhs], dim=1)
         self.xdim = self.X.shape[1]
+
+
+
 
         # Split x into training, val, test sets.
     
@@ -106,6 +118,30 @@ class GEPProblemSet():
     
     @property
     def opt_targets(self): return self._opt_targets
+
+    def build_rhs_only(self):
+        eq_rhss = []
+        ineq_rhss = []
+
+        for time_range in self.time_ranges:
+            _, ineq_rhs = self.build_ineq_cm_rhs_sample(time_range)
+            _, eq_rhs = self.build_eq_cm_rhs_sample(time_range)
+            eq_rhss.append(eq_rhs)
+            ineq_rhss.append(ineq_rhs)
+
+        return torch.stack(eq_rhss), torch.stack(ineq_rhss)
+    
+
+    def get_ineq_cm_rhs(self, sample_idx):
+        return self.build_ineq_cm_rhs_sample(self.time_ranges[sample_idx])
+
+    def get_eq_cm_rhs(self, sample_idx):
+        return self.build_eq_cm_rhs_sample(self.time_ranges[sample_idx])
+
+    def get_sample_matrices(self, sample_idx):
+        ineq_cm, ineq_rhs = self.get_ineq_cm_rhs(sample_idx)
+        eq_cm, eq_rhs = self.get_eq_cm_rhs(sample_idx)
+        return ineq_cm, ineq_rhs, eq_cm, eq_rhs
     
     def split_ineq_constraints(self, ineq):
         # TODO: Fix for inclusion of 3.1k.

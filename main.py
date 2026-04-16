@@ -117,20 +117,22 @@ if __name__ == "__main__":
                 lb_setting_name = ED_args.get("gen_data_constraint_lb", False)
                 renewable_ub_max_inv = ED_args.get("gen_data_constraint_ub_renewable_max_inv", True)
                 gen_data_renew_availability = ED_args.get("gen_data_renew_availability", 100)
+                node_constraint = ED_args.get("gen_data_node_constraint", False)
+                node_tag = "_NodeConst" if node_constraint else ""
                 if gen_data_renew_availability == 100:
                     data_save_path = (f"data/ED_data/Constraint/{nodes_count}Loc/ED_N{nodes_str}_G{gens_str}_{lines_str}"
                                 f"_c{int(ED_args['benders_compact'])}"
                                 f"_s{int(ED_args['scale_problem'])}"
                                 f"_p{int(ED_args['perturb_operating_costs'])}"
                                 f"_ui_constraint{ED_args['max_investment']}"
-                                f"_smp{ED_args['2n_synthetic_samples']}_GenConst_lb{lb_setting_name}_renewMaxInv{renewable_ub_max_inv}.pkl")
+                                f"_smp{ED_args['2n_synthetic_samples']}_GenConst_lb{lb_setting_name}_renewMaxInv{renewable_ub_max_inv}{node_tag}.pkl")
                 else:
                     data_save_path = (f"data/ED_data/Constraint/{nodes_count}Loc/ED_N{nodes_str}_G{gens_str}_{lines_str}"
                                 f"_c{int(ED_args['benders_compact'])}"
                                 f"_s{int(ED_args['scale_problem'])}"
                                 f"_p{int(ED_args['perturb_operating_costs'])}"
                                 f"_ui_constraint{ED_args['max_investment']}"
-                                f"_smp{ED_args['2n_synthetic_samples']}_GenConst_lb{lb_setting_name}_renewPerc{gen_data_renew_availability}.pkl")
+                                f"_smp{ED_args['2n_synthetic_samples']}_GenConst_lb{lb_setting_name}_renewPerc{gen_data_renew_availability}{node_tag}.pkl")
             else:
                 data_save_path = (f"data/ED_data/ED_N{nodes_str}_G{gens_str}_{lines_str}"
                                 f"_c{int(ED_args['benders_compact'])}"

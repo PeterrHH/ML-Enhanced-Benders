@@ -9,6 +9,9 @@ import pandas as pd
 import time
 import matplotlib.pyplot as plt
 
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+
 
 from gep_problem import GEPProblemSet
 from gep_problem_operational import GEPOperationalProblemSet
@@ -17,6 +20,183 @@ from gep_config_parser import *
 from networks import DualClassificationNetEndToEnd, DualNet, DualNetEndToEnd, PrimalNetEndToEnd
 
 CONFIG_FILE_NAME        = "config.toml"
+
+def build_capacity_demand_features(data, sample):
+    """
+    Build cheap timestep features without solving ED and without a reference investment.
+
+    Feature vector per timestep:
+        z_t = [D_{1,t}, ..., D_{N,t}, A_{1,t}Pmax_1, ..., A_{G,t}Pmax_G]
+
+    This avoids using an arbitrary u_ref.
+    """
+    ineq_cm_sample, _, eq_cm_sample, eq_rhs_sample = data.get_sample_matrices(sample)
+
+    T = len(data.time_ranges[sample])
+    num_rows_per_t_ineq = 2 * (data.num_g + data.num_l + data.num_n)
+    num_rows_per_t_eq = data.num_n
+
+    demand_features = np.zeros((T, data.num_n), dtype=float)
+    capacity_potential_features = np.zeros((T, data.num_g), dtype=float)
+
+    for t in range(T):
+        # Demand RHS from node-balance equality rows.
+        row_eq = t * num_rows_per_t_eq
+        demand_features[t, :] = (
+            eq_rhs_sample[row_eq:row_eq + data.num_n]
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+        # Capacity potential A_{g,t} Pmax_g from rows:
+        #     p_g - A_{g,t} Pmax_g u_g <= 0
+        row_ineq = data.num_g + t * num_rows_per_t_ineq
+
+        for g in range(data.num_g):
+            p_ub_row = row_ineq + data.num_g + g
+            apmax = float((-ineq_cm_sample[p_ub_row, g]).detach().cpu().numpy())
+            capacity_potential_features[t, g] = apmax
+
+    X = np.concatenate([demand_features, capacity_potential_features], axis=1)
+
+    return X, demand_features, capacity_potential_features
+
+
+def make_single_group(T):
+    return [list(range(T))]
+
+
+def make_full_multicut_groups(T):
+    return [[t] for t in range(T)]
+
+
+def make_kmeans_capacity_demand_groups(data, sample, K, random_state=0):
+    """
+    KMeans grouping based on [demand, A*Pmax].
+    No ED solve and no reference investment required.
+    """
+    X, _, _ = build_capacity_demand_features(data, sample)
+
+    if K <= 1:
+        labels = np.zeros(X.shape[0], dtype=int)
+        return make_single_group(X.shape[0]), labels, X
+
+    K_eff = min(K, X.shape[0])
+
+    X_scaled = StandardScaler().fit_transform(X)
+
+    labels = KMeans(
+        n_clusters=K_eff,
+        random_state=random_state,
+        n_init="auto"
+    ).fit_predict(X_scaled)
+
+    groups = [np.where(labels == k)[0].tolist() for k in range(K_eff)]
+
+    return groups, labels, X
+
+
+def make_stress_bin_groups(data, sample, K):
+    """
+    Stress grouping without reference investment.
+
+    stress_t = total_demand_t / (total_capacity_potential_t + eps)
+
+    where total_capacity_potential_t = sum_g A_{g,t} Pmax_g.
+    """
+    _, demand_features, capacity_potential_features = build_capacity_demand_features(
+        data=data,
+        sample=sample,
+    )
+
+    total_demand = demand_features.sum(axis=1)
+    total_capacity_potential = capacity_potential_features.sum(axis=1)
+
+    stress = total_demand / (total_capacity_potential + 1e-9)
+
+    T = len(stress)
+
+    if K <= 1:
+        labels = np.zeros(T, dtype=int)
+        return make_single_group(T), labels, stress
+
+    K_eff = min(K, T)
+
+    order = np.argsort(stress)
+    split = np.array_split(order, K_eff)
+
+    groups = [list(x) for x in split]
+
+    labels = np.empty(T, dtype=int)
+    for k, group in enumerate(groups):
+        labels[group] = k
+
+    return groups, labels, stress
+
+
+def make_cut_groups(data, sample, cut_selection="single", cut_selection_k=1, random_state=0):
+    """
+    Create timestep groups for cut aggregation.
+
+    cut_selection options:
+        single  : all timesteps in one group
+        kmeans  : KMeans on [D, A*Pmax], no u_ref
+        stress  : stress bins using total_demand / total_A_Pmax
+        full    : one group per timestep
+    """
+    T = len(data.time_ranges[sample])
+    cut_selection = cut_selection.lower()
+
+    if cut_selection == "single":
+        groups = make_single_group(T)
+        info = {
+            "labels": np.zeros(T, dtype=int),
+            "group_sizes": [len(g) for g in groups],
+        }
+
+    elif cut_selection == "full":
+        groups = make_full_multicut_groups(T)
+        info = {
+            "labels": np.arange(T),
+            "group_sizes": [len(g) for g in groups],
+        }
+
+    elif cut_selection == "kmeans":
+        groups, labels, X = make_kmeans_capacity_demand_groups(
+            data=data,
+            sample=sample,
+            K=cut_selection_k,
+            random_state=random_state,
+        )
+        info = {
+            "labels": labels,
+            "features": X,
+            "group_sizes": [len(g) for g in groups],
+        }
+
+    elif cut_selection == "stress":
+        groups, labels, stress = make_stress_bin_groups(
+            data=data,
+            sample=sample,
+            K=cut_selection_k,
+        )
+        info = {
+            "labels": labels,
+            "stress": stress,
+            "group_sizes": [len(g) for g in groups],
+        }
+
+    else:
+        raise ValueError(
+            f"Unknown cut_selection={cut_selection}. "
+            "Choose from 'single', 'kmeans', 'stress', 'full'."
+        )
+
+    groups = [g for g in groups if len(g) > 0]
+    info["group_sizes"] = [len(g) for g in groups]
+
+    return groups, info
 
 class BendersSolver():
     def __init__(self, gep_data, operational_data, sample, primal_net=None, dual_net=None, exact=True, exact_refinement=True, max_investment=100000, init_investment = "Zero"):
@@ -54,6 +234,9 @@ class BendersSolver():
 
         self.inv_hist = []  # list[list[float]] length = #iters
         self.investment_init_method = init_investment # Zero by Default, also option: "HalfMax"
+        self.env = gp.Env(empty=True)
+        self.env.setParam("OutputFlag", 0)
+        self.env.start()
 
 
     @property
@@ -81,11 +264,12 @@ class BendersSolver():
 
     def solve_matrix_problem(self, data, i, inv_decision=None):
 
-        env = gp.Env(empty=True)
-        env.setParam("OutputFlag",0)
-        env.start()
+        # env = gp.Env(empty=True)
+        # env.setParam("OutputFlag",0)
+        # env.start()
+
         # Create a new model
-        m = gp.Model("Matrix problem", env=env)
+        m = gp.Model("Matrix problem", env=self.env)
         m.setParam('MIPGap', 1e-16)
         # m.setParam('FeasibilityTol', 1e-9)   # For constraint feasibility
         # m.setParam('IntFeasTol', 1e-9)   
@@ -105,15 +289,24 @@ class BendersSolver():
         m.setObjective(obj @ x, GRB.MINIMIZE)
 
         # Add ineq constraints
-        A = np.array(data.ineq_cm[i])
-        b = np.array(data.ineq_rhs[i])
+
+        # A = np.array(data.ineq_cm[i])
+        # b = np.array(data.ineq_rhs[i])
+        # m.addConstr(A @ x <= b, name="ineq")
+
+        # # Add eq constraints
+        # A = np.array(data.eq_cm[i])
+        # b = np.array(data.eq_rhs[i])
+        # m.addConstr(A @ x == b, name="eq")
+
+        ineq_cm, ineq_rhs, eq_cm, eq_rhs = data.get_sample_matrices(i) # TODO: Added only for optimise dataset
+        A = np.array(ineq_cm)
+        b = np.array(ineq_rhs)
         m.addConstr(A @ x <= b, name="ineq")
 
-        # Add eq constraints
-        A = np.array(data.eq_cm[i])
-        b = np.array(data.eq_rhs[i])
+        A = np.array(eq_cm)
+        b = np.array(eq_rhs)
         m.addConstr(A @ x == b, name="eq")
-
         # For plotting
         if inv_decision is not None:
             m.addConstr(x[:data.num_g] == inv_decision)
@@ -124,7 +317,7 @@ class BendersSolver():
         # Optimize model
         m.optimize()
 
-        print(x.X)
+        # print(x.X)
         print(f"Obj: {m.ObjVal:g}")
 
         return x.X, m.ObjVal
@@ -132,12 +325,12 @@ class BendersSolver():
     def solve_matrix_problem_simple(self, obj, A_ineq, b_ineq, A_eq, b_eq, master, investment=None):
 
         # Create environment where Gurobi output is muted
-        env = gp.Env(empty=True)
-        env.setParam("OutputFlag",0)
-        env.start()
+        # env = gp.Env(empty=True)
+        # env.setParam("OutputFlag",0)
+        # env.start()
         
         # Create a new model
-        m = gp.Model("Matrix problem", env=env)
+        m = gp.Model("Matrix problem", env=self.env)
         m.setParam('OptimalityTol', 1e-9) 
 
         # Create variables
@@ -246,9 +439,14 @@ class BendersSolver():
         obj = np.concatenate((obj, np.array([1.])), axis=0) # add alpha column with coeff 1
 
         # Find constraint ineq submatrices
-        A_ineq = data.ineq_cm[sample, :data.num_g, 0:0 + data.num_g] # first g rows are 3.1k constraints
-        A_ineq = np.concatenate((A_ineq, np.zeros((data.num_g, 1))), axis=1) # add alpha column with coeff 0
-        b_ineq = data.ineq_rhs[sample, :data.num_g]
+        # A_ineq = data.ineq_cm[sample, :data.num_g, 0:0 + data.num_g] # first g rows are 3.1k constraints
+        # A_ineq = np.concatenate((A_ineq, np.zeros((data.num_g, 1))), axis=1) # add alpha column with coeff 0
+        #b_ineq = data.ineq_rhs[sample, :data.num_g]
+        ineq_cm_sample, ineq_rhs_sample, eq_cm_sample, eq_rhs_sample = data.get_sample_matrices(sample) # TODO: Added only for optimise dataset
+        A_ineq = ineq_cm_sample[:data.num_g, :data.num_g].detach().numpy()
+        A_ineq = np.concatenate((A_ineq, np.zeros((data.num_g, 1))), axis=1)
+        b_ineq = ineq_rhs_sample[:data.num_g].detach().numpy()
+
 
         # Find constraint eq submatrices
         A_eq = np.zeros((1, data.num_g + 1)) # make one zeros equality, otherwise it gives an error for multiplying empty arrays
@@ -275,68 +473,241 @@ class BendersSolver():
             b_ineq = np.concatenate((b_ineq, np.array([rhs])), axis=0)
 
         return obj, A_ineq, b_ineq, A_eq, b_eq
+    
+    def find_subproblem_cm_rhs_obj_from_mats(
+        self,
+        data,
+        compact,
+        investments,
+        time_step,
+        ineq_cm_sample,
+        ineq_rhs_sample,
+        eq_cm_sample,
+        eq_rhs_sample,
+    ):
+        '''
+        More efficient way to find the constraint matrix
+        '''
+        num_rows_per_t_ineq = 2 * (data.num_g + data.num_l + data.num_n)
+        num_rows_per_t_eq = data.num_n
+        num_columns_per_t = data.n_var_per_t
+        columns_ui = range(data.num_g)
 
+        column_index = data.num_g + time_step * num_columns_per_t
+        obj = self.operational_data.obj_coeff.detach().numpy() * self.pWeight
+
+        if compact:
+            obj = np.concatenate((np.zeros(data.num_g), obj), axis=0)
+
+        row_index_ineq = data.num_g + time_step * num_rows_per_t_ineq
+        A_ineq = ineq_cm_sample[
+            row_index_ineq:row_index_ineq + num_rows_per_t_ineq,
+            column_index:column_index + num_columns_per_t
+        ].detach().numpy()
+
+        if compact:
+            A_ineq = np.concatenate((
+                ineq_cm_sample[
+                    row_index_ineq:row_index_ineq + num_rows_per_t_ineq,
+                    columns_ui
+                ].detach().numpy(),
+                A_ineq
+            ), axis=1)
+
+        b_ineq = ineq_rhs_sample[
+            row_index_ineq:row_index_ineq + num_rows_per_t_ineq
+        ].clone().detach().numpy()
+
+        if not compact:
+            for g in range(data.num_g):
+                upper_bound_p = investments[g] * -ineq_cm_sample[row_index_ineq + data.num_g + g, g]
+                b_ineq[data.num_g + g] = upper_bound_p
+
+        row_index_eq = time_step * num_rows_per_t_eq
+        A_eq = eq_cm_sample[
+            row_index_eq:row_index_eq + num_rows_per_t_eq,
+            column_index:column_index + num_columns_per_t
+        ]
+
+        if compact:
+            A_eq = np.concatenate((
+                eq_cm_sample[row_index_eq:row_index_eq + num_rows_per_t_eq, columns_ui],
+                A_eq
+            ), axis=1)
+
+        b_eq = eq_rhs_sample[row_index_eq:row_index_eq + num_rows_per_t_eq]
+
+        if compact:
+            ui_g = np.eye(data.num_g)
+            ui_g = np.concatenate((ui_g, np.zeros((data.num_g, num_columns_per_t))), axis=1)
+            A_eq = np.concatenate((A_eq, ui_g), 0)
+            b_eq = np.concatenate((b_eq, investments), 0)
+
+        return obj, A_ineq, b_ineq, A_eq, b_eq
+    
     def solve_subproblems(self, data, compact, sample, investments, exact=True):
-        # Solves the subproblems in Benders decomposition
-        # Returns the optimal objective function value of the subproblems for all time periods added together
-        # And returns the dual values of the ui_g = investment constraints
-
-        # Calculate information about subproblem sizes
         time_range = data.time_ranges[sample]
         num_timesteps = len(time_range)
 
-        objs = []
-        A_ineqs = []
-        b_ineqs = []
-        A_eqs = []
-        b_eqs = []
+        # Load sample matrices ONCE
+        ineq_cm_sample, ineq_rhs_sample, eq_cm_sample, eq_rhs_sample = data.get_sample_matrices(sample)
 
-        for time_step in range(num_timesteps):
-            # Find constraint matrices, right hand side vectors and objective vector of subproblem
-            obj, A_ineq, b_ineq, A_eq, b_eq = self.find_subproblem_cm_rhs_obj(data,compact,sample,investments,time_step)
-
-            objs.append(obj)
-            A_ineqs.append(A_ineq)
-            b_ineqs.append(b_ineq)
-            A_eqs.append(A_eq)
-            b_eqs.append(b_eq)
-
-        obj_vals = []
-        primal_vals = []
-        dual_vals = []
-        inference_times = []
-        # Save X to investigate the distribution of the data samples generated by Benders decomposition
-        b_eqs_np = np.stack(b_eqs)
-        b_ineqs_np = np.stack(b_ineqs)
-        X = torch.tensor(np.concatenate([b_eqs_np, b_ineqs_np[:, self.operational_data.capacity_ub_indices]], axis=1))
-        self.X_all.append(X)
         if exact:
-            for obj, A_ineq, b_ineq, A_eq, b_eq in zip(objs, A_ineqs, b_ineqs, A_eqs, b_eqs):
-                obj_val, primal_val, dual_val, inference_time = self.solve_matrix_problem_simple(obj, A_ineq, b_ineq, A_eq, b_eq, False)
+            obj_vals = []
+            primal_vals = []
+            dual_vals = []
+            inference_times = []
+
+            # Still need b_ineqs / b_eqs for the batch cut at the end
+            b_ineqs = []
+            b_eqs = []
+
+            for time_step in range(num_timesteps):
+                obj, A_ineq, b_ineq, A_eq, b_eq = self.find_subproblem_cm_rhs_obj_from_mats(
+                    data=data,
+                    compact=compact,
+                    investments=investments,
+                    time_step=time_step,
+                    ineq_cm_sample=ineq_cm_sample,
+                    ineq_rhs_sample=ineq_rhs_sample,
+                    eq_cm_sample=eq_cm_sample,
+                    eq_rhs_sample=eq_rhs_sample,
+                )
+
+                obj_val, primal_val, dual_val, inference_time = self.solve_matrix_problem_simple(
+                    obj, A_ineq, b_ineq, A_eq, b_eq, False
+                )
+
                 obj_vals.append(obj_val)
                 primal_vals.append(primal_val)
                 dual_vals.append(dual_val)
                 inference_times.append(inference_time)
-            # Add objective value to the total
+                b_ineqs.append(b_ineq)
+                b_eqs.append(b_eq)
+
             primal_obj_val_total = np.sum(obj_vals)
-            inference_time_total = np.sum(inference_times)
             dual_obj_val_total = primal_obj_val_total
-            self.objs_all.append(np.array(obj_vals))
-            self.dual_solutions_all.append(np.array(dual_vals))
-            self.primal_solutions_all.append(np.array(primal_vals))
+            inference_time_total = np.sum(inference_times)
+
+            # self.objs_all.append(np.array(obj_vals))
+            # self.dual_solutions_all.append(np.array(dual_vals))
+            # self.primal_solutions_all.append(np.array(primal_vals))
+
+            b_ineqs_np = np.stack(b_ineqs)
+            b_eqs_np = np.stack(b_eqs)
+
         else:
+            # For PDL, only build what is needed for X and the cut
+            b_ineqs = []
+            b_eqs = []
+
+            num_rows_per_t_ineq = 2 * (data.num_g + data.num_l + data.num_n)
+            num_rows_per_t_eq = data.num_n
+            num_columns_per_t = data.n_var_per_t
+
+            for time_step in range(num_timesteps):
+                row_index_ineq = data.num_g + time_step * num_rows_per_t_ineq
+                row_index_eq = time_step * num_rows_per_t_eq
+
+                b_ineq = ineq_rhs_sample[
+                    row_index_ineq:row_index_ineq + num_rows_per_t_ineq
+                ].clone().detach().numpy()
+
+                for g in range(data.num_g):
+                    upper_bound_p = investments[g] * -ineq_cm_sample[row_index_ineq + data.num_g + g, g]
+                    b_ineq[data.num_g + g] = upper_bound_p
+
+                b_eq = eq_rhs_sample[
+                    row_index_eq:row_index_eq + num_rows_per_t_eq
+                ]
+
+                b_ineqs.append(b_ineq)
+                b_eqs.append(b_eq)
+
+            b_ineqs_np = np.stack(b_ineqs)
+            b_eqs_np = np.stack(b_eqs)
+
+            X = torch.tensor(
+                np.concatenate(
+                    [b_eqs_np, b_ineqs_np[:, self.operational_data.capacity_ub_indices]],
+                    axis=1
+                )
+            )
+            # self.X_all.append(X) # Save memory so we do not append X
+
             primal_obj_val_total, dual_obj_val_total, primal_vals, dual_vals, inference_time_total = self.solve_matrix_problem_PDL(X)
 
-        benders_cut_lhs, benders_cut_rhs = self.find_benders_cut_batch(data, compact, sample, np.array(dual_vals), np.array(b_ineqs), np.array(b_eqs))
-            
-        # Obtain the final Benders cut of all subproblems together
+        benders_cut_lhs, benders_cut_rhs = self.find_benders_cut_batch(
+            data, compact, sample, np.array(dual_vals), b_ineqs_np, b_eqs_np
+        )
+
         benders_cut = benders_cut_lhs, benders_cut_rhs
-        print(f"Benders cut: {benders_cut}")
+        # print(f"Benders cut: {benders_cut}")
         print(f"Inference time: {inference_time_total}")
+
         return primal_obj_val_total, dual_obj_val_total, benders_cut, inference_time_total
 
-    def find_subproblem_cm_rhs_obj(self, data,compact,sample,investments,time_step):
+    # def solve_subproblems(self, data, compact, sample, investments, exact=True):
+    #     # Solves the subproblems in Benders decomposition
+    #     # Returns the optimal objective function value of the subproblems for all time periods added together
+    #     # And returns the dual values of the ui_g = investment constraints
 
+    #     # Calculate information about subproblem sizes
+    #     time_range = data.time_ranges[sample]
+    #     num_timesteps = len(time_range)
+
+    #     objs = []
+    #     A_ineqs = []
+    #     b_ineqs = []
+    #     A_eqs = []
+    #     b_eqs = []
+
+    #     for time_step in range(num_timesteps):
+    #         # Find constraint matrices, right hand side vectors and objective vector of subproblem
+    #         obj, A_ineq, b_ineq, A_eq, b_eq = self.find_subproblem_cm_rhs_obj(data,compact,sample,investments,time_step)
+
+    #         objs.append(obj)
+    #         A_ineqs.append(A_ineq)
+    #         b_ineqs.append(b_ineq)
+    #         A_eqs.append(A_eq)
+    #         b_eqs.append(b_eq)
+
+    #     obj_vals = []
+    #     primal_vals = []
+    #     dual_vals = []
+    #     inference_times = []
+    #     # Save X to investigate the distribution of the data samples generated by Benders decomposition
+    #     b_eqs_np = np.stack(b_eqs)
+    #     b_ineqs_np = np.stack(b_ineqs)
+    #     X = torch.tensor(np.concatenate([b_eqs_np, b_ineqs_np[:, self.operational_data.capacity_ub_indices]], axis=1))
+    #     self.X_all.append(X)
+    #     if exact:
+    #         for obj, A_ineq, b_ineq, A_eq, b_eq in zip(objs, A_ineqs, b_ineqs, A_eqs, b_eqs):
+    #             obj_val, primal_val, dual_val, inference_time = self.solve_matrix_problem_simple(obj, A_ineq, b_ineq, A_eq, b_eq, False)
+    #             obj_vals.append(obj_val)
+    #             primal_vals.append(primal_val)
+    #             dual_vals.append(dual_val)
+    #             inference_times.append(inference_time)
+    #         # Add objective value to the total
+    #         primal_obj_val_total = np.sum(obj_vals)
+    #         inference_time_total = np.sum(inference_times)
+    #         dual_obj_val_total = primal_obj_val_total
+    #         self.objs_all.append(np.array(obj_vals))
+    #         self.dual_solutions_all.append(np.array(dual_vals))
+    #         self.primal_solutions_all.append(np.array(primal_vals))
+    #     else:
+    #         primal_obj_val_total, dual_obj_val_total, primal_vals, dual_vals, inference_time_total = self.solve_matrix_problem_PDL(X)
+
+    #     benders_cut_lhs, benders_cut_rhs = self.find_benders_cut_batch(data, compact, sample, np.array(dual_vals), np.array(b_ineqs), np.array(b_eqs))
+            
+    #     # Obtain the final Benders cut of all subproblems together
+    #     benders_cut = benders_cut_lhs, benders_cut_rhs
+    #     print(f"Benders cut: {benders_cut}")
+    #     print(f"Inference time: {inference_time_total}")
+    #     return primal_obj_val_total, dual_obj_val_total, benders_cut, inference_time_total
+
+    def find_subproblem_cm_rhs_obj(self, data,compact,sample,investments,time_step):
+        ineq_cm_sample, ineq_rhs_sample, eq_cm_sample, eq_rhs_sample = data.get_sample_matrices(sample) # TODO: Added only for optimise dataset
         # Calculate information about subproblem sizes
         num_rows_per_t_ineq = 2 * (data.num_g + data.num_l + data.num_n) # lower and upper bounds for p_g, f_l and md_n 
         num_rows_per_t_eq = data.num_n # energy balance equality for each node
@@ -353,25 +724,46 @@ class BendersSolver():
 
         # Find constraint ineq submatrices
         row_index = data.num_g + time_step*num_rows_per_t_ineq # first g rows are 3.1k constraints
-        A_ineq = data.ineq_cm[sample,row_index:row_index + num_rows_per_t_ineq,column_index:column_index + num_columns_per_t] #take submatrix of time_step
+        # A_ineq = data.ineq_cm[sample,row_index:row_index + num_rows_per_t_ineq,column_index:column_index + num_columns_per_t] #take submatrix of time_step
+        # if compact:
+        #     A_ineq = np.concatenate((data.ineq_cm[sample,row_index:row_index + num_rows_per_t_ineq,columns_ui],A_ineq), axis=1) # add ui_g columns
+
+        A_ineq = ineq_cm_sample[row_index:row_index + num_rows_per_t_ineq,
+                        column_index:column_index + num_columns_per_t].detach().numpy()
         if compact:
-            A_ineq = np.concatenate((data.ineq_cm[sample,row_index:row_index + num_rows_per_t_ineq,columns_ui],A_ineq), axis=1) # add ui_g columns
+            A_ineq = np.concatenate((
+                ineq_cm_sample[row_index:row_index + num_rows_per_t_ineq, columns_ui].detach().numpy(),
+                A_ineq
+            ), axis=1)
+
+        b_ineq = ineq_rhs_sample[row_index:row_index + num_rows_per_t_ineq].clone().detach().numpy() # TODO: added for optimise dataset
+
         # Find constraint ineq rhs
         #! Beware for ineq rhs, we need to clone it, otherwise it will be a view and we will modify the original data.ineq_rhs
-        b_ineq = data.ineq_rhs[sample,row_index:row_index + num_rows_per_t_ineq].clone()    
+
+        # b_ineq = data.ineq_rhs[sample,row_index:row_index + num_rows_per_t_ineq].clone()    # ORIGNAL CODE
         if not compact:
             # Replace investment variables with constants in right hand side, NOT needed in compact form
             for g in range(data.num_g):
-                upper_bound_p = investments[g]*-data.ineq_cm[sample,row_index+ data.num_g + g,g] #first g constraints are 3.1c, we want to take 3.1b coeff of ui_g
-
+                #upper_bound_p = investments[g]*-data.ineq_cm[sample,row_index+ data.num_g + g,g] #first g constraints are 3.1c, we want to take 3.1b coeff of ui_g
+                upper_bound_p = investments[g] * -ineq_cm_sample[row_index + data.num_g + g, g] # TODO: added for optimise dataset
                 b_ineq[data.num_g+g] = upper_bound_p  # second set of g constraints are 3.1b, we want to replace rhs 0 of 3.1b with upper_bound_p
                 
         # Find constraint eq submatrices
         row_index = time_step*num_rows_per_t_eq
-        A_eq = data.eq_cm[sample,row_index:row_index + num_rows_per_t_eq,column_index:column_index + num_columns_per_t] #take submatrix of time_step
+        # A_eq = data.eq_cm[sample,row_index:row_index + num_rows_per_t_eq,column_index:column_index + num_columns_per_t] #take submatrix of time_step
+        # if compact:
+        #     A_eq = np.concatenate((data.eq_cm[sample,row_index:row_index + num_rows_per_t_eq,columns_ui],A_eq), axis=1) # add ui_g columns
+        # b_eq = data.eq_rhs[sample,row_index:row_index + num_rows_per_t_eq]
+
+        A_eq = eq_cm_sample[row_index:row_index + num_rows_per_t_eq,
+                            column_index:column_index + num_columns_per_t]
         if compact:
-            A_eq = np.concatenate((data.eq_cm[sample,row_index:row_index + num_rows_per_t_eq,columns_ui],A_eq), axis=1) # add ui_g columns
-        b_eq = data.eq_rhs[sample,row_index:row_index + num_rows_per_t_eq]
+            A_eq = np.concatenate((
+                eq_cm_sample[row_index:row_index + num_rows_per_t_eq, columns_ui],
+                A_eq
+            ), axis=1)
+        b_eq = eq_rhs_sample[row_index:row_index + num_rows_per_t_eq]  # TODO: added for optimise dataset
 
         # Fix investments: add constraint ui_g = investments, ONLY in compact form
         if compact:
@@ -383,7 +775,7 @@ class BendersSolver():
         return obj, A_ineq, b_ineq, A_eq, b_eq
 
     def find_benders_cut(self, data, compact, sample, investments, old_benders_cut, time_step, b_ineq, b_eq, obj_val, dual_val):
-
+        ineq_cm_sample, ineq_rhs_sample, eq_cm_sample, eq_rhs_sample = data.get_sample_matrices(sample) # TODO: Added only for optimise dataset
         benders_cut_lhs = old_benders_cut[0]
         benders_cut_rhs = old_benders_cut[1]
 
@@ -399,7 +791,8 @@ class BendersSolver():
                 # we take this from 3.1b constraint in the original problem
                 row_index = data.num_g + time_step*num_rows_per_t_ineq + data.num_g # we want the 3.1b constraints
                 # First g constraints are lower bound, we want the upper bound, therefore offset of num_g.
-                coeff_ui = dual_val[data.num_g + g] * -data.ineq_cm[sample,row_index+g,g]
+                # coeff_ui = dual_val[data.num_g + g] * -data.ineq_cm[sample,row_index+g,g]
+                coeff_ui = dual_val[data.num_g + g] * -ineq_cm_sample[row_index + g, g] # TODO: added for optimise dataset
 
             benders_cut_lhs[0,g] = benders_cut_lhs[0,g] + coeff_ui
 
@@ -437,6 +830,7 @@ class BendersSolver():
         Vectorized Benders cut aggregation (non-compact case) over time steps.
         Returns the full cut (lhs, rhs) as a tuple.
         """
+        ineq_cm_sample, _, _, _ = data.get_sample_matrices(sample) # TODO: Added only for optimise dataset
         T = dual_vals.shape[0]
         num_rows_per_t_ineq = 2 * (data.num_g + data.num_l + data.num_n) # lower and upper bounds for production, lineflow and missed demand
 
@@ -453,7 +847,8 @@ class BendersSolver():
             ineq_row_indices = np.array([
                 data.num_g + t * num_rows_per_t_ineq + data.num_g + g for t in range(T)
             ])
-            ui_coeffs = dual_vals[:, dual_indices] * -data.ineq_cm[sample, ineq_row_indices, g].detach().numpy()  # Multiply by the dual variables of production upper bound
+            #ui_coeffs = dual_vals[:, dual_indices] * -data.ineq_cm[sample, ineq_row_indices, g].detach().numpy()  # Multiply by the dual variables of production upper bound
+            ui_coeffs = dual_vals[:, dual_indices] * -ineq_cm_sample[ineq_row_indices, g].detach().numpy() # TODO: added for optimise dataset
             benders_cut_lhs[0, g] = np.sum(ui_coeffs) # Sum over all subproblems
 
         # RHS: Add dual contributions from inequality RHS
@@ -476,6 +871,8 @@ class BendersSolver():
         benders_cut_rhs += -np.sum(eq_duals * b_eqs)
 
         return benders_cut_lhs, benders_cut_rhs
+
+
 
     def solve_with_benders(self, data, compact, sample):
 
@@ -544,20 +941,23 @@ class BendersSolver():
                 self.exact_iterations += 1
             else:
                 self.inexact_iterations += 1
-
+            print(f"Before Subproblem SOlve")
             # Solve subproblems to find new cuts
             primal_obj_val_total, dual_obj_val_total, benders_cut, inference_time_subproblems_total = self.solve_subproblems(data,compact,sample,investments_iter_k, exact=self.exact)
-            if not self.exact:
-                exact_primal_obj_val_total, exact_dual_obj_val_total, exact_benders_cut, exact_inference_time_total = self.solve_subproblems(data,compact,sample,investments_iter_k, exact=True)
+            print(f"SOlved Subproblem: inf time: {inference_time_subproblems_total}")
 
-                primal_opt_gap = (primal_obj_val_total - exact_primal_obj_val_total) / exact_primal_obj_val_total
-                dual_opt_gap = (dual_obj_val_total - exact_dual_obj_val_total) / exact_dual_obj_val_total
+            # if not self.exact:
+                # PDL solve
+                # exact_primal_obj_val_total, exact_dual_obj_val_total, _, _ = self.solve_subproblems(data,compact,sample,investments_iter_k, exact=True)
 
-                print(f"Primal opt gap: {primal_opt_gap}, Dual opt gap: {dual_opt_gap}")
-                print(f"Primal obj val: {primal_obj_val_total}, Dual obj val: {dual_obj_val_total}")
+                # primal_opt_gap = (primal_obj_val_total - exact_primal_obj_val_total) / exact_primal_obj_val_total
+                # dual_opt_gap = (dual_obj_val_total - exact_dual_obj_val_total) / exact_dual_obj_val_total
 
-                self.primal_opt_gap_all.append(primal_opt_gap)
-                self.dual_opt_gap_all.append(dual_opt_gap)
+                # print(f"Primal opt gap: {primal_opt_gap}, Dual opt gap: {dual_opt_gap}")
+                # print(f"Primal obj val: {primal_obj_val_total}, Dual obj val: {dual_obj_val_total}")
+
+                # self.primal_opt_gap_all.append(primal_opt_gap)
+                # self.dual_opt_gap_all.append(dual_opt_gap)
             
             if self.exact:
                 self.total_time_subproblem_exact += inference_time_subproblems_total
@@ -570,7 +970,7 @@ class BendersSolver():
             # Check for optimality
             lower_bound = obj_val_master[0] + obj_val_master[1]
             upper_bound = obj_val_master[0] + primal_obj_val_total
-
+            print(f"UB={upper_bound:.4f}, LB={lower_bound:.4f}, ")
             # --- LOG UB/LB PER ITERATION ---
             self.ub_hist.append(float(upper_bound))
             self.lb_hist.append(float(lower_bound))
@@ -585,11 +985,11 @@ class BendersSolver():
 
             # Check for optimality
             if self.exact:
-                print("Found upper bound:",upper_bound)
+                # print("Found upper bound:",upper_bound)
                 if upper_bound < self.best_upper_bound:
                     self.best_upper_bound = upper_bound
-                print("Upper bound:", upper_bound)
-                print("Lower bound:",lower_bound)
+                # print("Upper bound:", upper_bound)
+                # print("Lower bound:",lower_bound)
                 if upper_bound - lower_bound < epsilon:
                     optimal = True
                     print('Done! Optimal solution found')
@@ -652,7 +1052,7 @@ class BendersSolver():
                 if isinstance(cut_rhs, torch.Tensor):
                     cut_rhs = cut_rhs.item()
 
-                print(f"Benders cut {i}: {cut_lhs}, {cut_rhs}")
+                # print(f"Benders cut {i}: {cut_lhs}, {cut_rhs}")
 
                 a = cut_lhs[0]
                 b = cut_lhs[1]
@@ -765,6 +1165,7 @@ if __name__ == "__main__":
 
             gep_data_save_path = f"data/GEP_data/sample_duration:{benders_args['sample_duration']}_N:{nodes_str}_G:{gens_str}_L:{lines_str}.pkl"
             # Prep problem data:
+            # Prep problem data:
             if args_cli.solve_direct:
                 if not os.path.exists(gep_data_save_path):
                     directory = os.path.dirname(gep_data_save_path)
@@ -780,17 +1181,44 @@ if __name__ == "__main__":
                 if not os.path.exists(ed_data_save_path):
                     directory = os.path.dirname(ed_data_save_path)
                     os.makedirs(directory, exist_ok=True)
-                    create_gep_ed_dataset(args=args, problem_args=benders_args, inputs=experiment_instance, problem_type="ED", save_path=ed_data_save_path)
+                    create_gep_ed_dataset(
+                        args=args,
+                        problem_args=benders_args,
+                        inputs=experiment_instance,
+                        problem_type="ED",
+                        save_path=ed_data_save_path
+                    )
                 if not os.path.exists(gep_data_save_path):
                     directory = os.path.dirname(gep_data_save_path)
                     os.makedirs(directory, exist_ok=True)
-                    create_gep_ed_dataset(args=args, problem_args=benders_args, inputs=experiment_instance, problem_type="GEP", save_path=gep_data_save_path)
+                    create_gep_ed_dataset(
+                        args=args,
+                        problem_args=benders_args,
+                        inputs=experiment_instance,
+                        problem_type="GEP",
+                        save_path=gep_data_save_path
+                    )
 
+            # Load data:
+            if args_cli.solve_direct:
+                operational_data = None
+                with open(gep_data_save_path, 'rb') as file:
+                    gep_data = pickle.load(file)
+            else:
+                with open(ed_data_save_path, 'rb') as file:
+                    operational_data = pickle.load(file)
+                with open(gep_data_save_path, 'rb') as file:
+                    gep_data = pickle.load(file)
                 # Load data:
-            with open(ed_data_save_path, 'rb') as file:
-                operational_data = pickle.load(file)
-            with open(gep_data_save_path, 'rb') as file:
-                gep_data = pickle.load(file)
+                if args_cli.solve_direct:
+                    operational_data = None
+                    with open(gep_data_save_path, 'rb') as file:
+                        gep_data = pickle.load(file)
+                else:
+                    with open(ed_data_save_path, 'rb') as file:
+                        operational_data = pickle.load(file)
+                    with open(gep_data_save_path, 'rb') as file:
+                        gep_data = pickle.load(file)
 
             # !Load primal and dual net
             # primal_net_directory = "experiment-output/ch7/3nodes/primal_model"
@@ -907,7 +1335,7 @@ if __name__ == "__main__":
                             # compact = False
                             # Solving a subproblem
                             upper_bound, lower_bound, benders_cuts_all, investments_all, obj_val_subproblems_all, iterations = solver.solve_with_benders(gep_data, benders_args['benders_compact'], sample)
-                            
+
                             iter_df = pd.DataFrame({
                                 "sample": sample,
                                 "iter": solver.iter_hist,

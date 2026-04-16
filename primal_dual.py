@@ -152,6 +152,15 @@ class PrimalDualTrainer():
         self.total_demands_train = self.total_demands[self.train_indices]
         self.total_demands_valid = self.total_demands[self.valid_indices]
 
+        self.mu_targets_all = self.data.opt_targets["mu_operational"].to(self.DTYPE).to(self.DEVICE)
+        self.lamb_targets_all = self.data.opt_targets["lamb_operational"].to(self.DTYPE).to(self.DEVICE)
+
+        self.mu_targets_train = self.mu_targets_all[self.train_indices]
+        self.lamb_targets_train = self.lamb_targets_all[self.train_indices]
+
+        self.mu_targets_valid = self.mu_targets_all[self.valid_indices]
+        self.lamb_targets_valid = self.lamb_targets_all[self.valid_indices]
+
         if self.log == True:
             self.logger = TensorBoardLogger(args, data, self.X, self.total_demands, self.train_indices, self.valid_indices, save_dir, args["opt_targets"])
         else:
@@ -163,8 +172,21 @@ class PrimalDualTrainer():
         self.opt_target_val = self.data.opt_targets["y_operational"].to(self.DTYPE).to(self.DEVICE)[self.valid_indices]
         self.target_obj_val  = self.data.opt_targets["obj"].to(self.DTYPE).to(self.DEVICE)[self.valid_indices]
         
-        self.train_dataset = TensorDataset(self.X_train, self.total_demands_train, self.target_obj_train)
-        self.valid_dataset = TensorDataset(self.X_valid, self.total_demands_valid, self.target_obj_val)
+        self.train_dataset = TensorDataset(
+            self.X_train,
+            self.total_demands_train,
+            self.target_obj_train,
+            self.mu_targets_train,
+            self.lamb_targets_train,
+        )
+
+        self.valid_dataset = TensorDataset(
+            self.X_valid,
+            self.total_demands_valid,
+            self.target_obj_val,
+            self.mu_targets_valid,
+            self.lamb_targets_valid,
+        )
         # self.test_dataset = TensorDataset(self.data.testX.to(self.DEVICE), self.data.testX_scaled.to(self.DEVICE))
 
         self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, generator=torch.Generator(device=self.DEVICE))
@@ -191,7 +213,11 @@ class PrimalDualTrainer():
                     self.dual_net = DualNetEndToEnd(self.args, self.data).to(dtype=self.DTYPE, device=self.DEVICE)
                 else:
                     self.dual_net = DualNet(self.args, self.data).to(dtype=self.DTYPE, device=self.DEVICE)
-                self.dual_loss_fn = self.alternate_dual_loss
+                if self.args.get("oracle_supervised_dual", False):
+                    self.dual_loss_fn = self.oracle_supervised_dual_loss
+                else:
+                    self.dual_loss_fn = self.alternate_dual_loss
+                # self.dual_loss_fn = self.alternate_dual_loss
             else:
                 self.dual_net = DualNet(self.args, self.data).to(dtype=self.DTYPE, device=self.DEVICE)
                 self.dual_loss_fn = self.dual_loss
@@ -305,6 +331,45 @@ class PrimalDualTrainer():
         return frozen_net
     
 
+    def snap_lambda_to_class_indices(self, lamb_true):
+        """
+        Convert true lambda values [B, neq] to nearest class index [B, neq].
+        """
+        class_values = self.dual_net.classes.to(lamb_true.device).to(lamb_true.dtype)   # [C]
+        flat = lamb_true.reshape(-1, 1)                                                 # [B*neq, 1]
+        dists = torch.abs(flat - class_values.view(1, -1))                              # [B*neq, C]
+        idx = torch.argmin(dists, dim=1)                                                # [B*neq]
+        return idx.view_as(lamb_true).long()                                            # [B, neq]
+
+
+    def oracle_supervised_dual_loss(self, X, mu, lamb, lamb_true):
+        """
+        Supervised classification loss on lambda classes.
+
+        Uses the classification network logits directly.
+        """
+        if not isinstance(self.dual_net, DualClassificationNetEndToEnd):
+            raise TypeError("oracle_supervised_dual requires DualClassificationNetEndToEnd.")
+
+        x_in = X
+        if self.dual_net.normalize:
+            x_in = self.dual_net.scale(X)
+
+        logits = self.dual_net.feed_forward(x_in)   # [B, neq * n_classes] or separate-head equivalent output
+        logits = logits.view(-1, self.data.neq, self.dual_net.n_classes)  # [B, neq, C]
+
+        target_idx = self.snap_lambda_to_class_indices(lamb_true)         # [B, neq]
+
+        # Cross-entropy over all node-wise lambda variables
+        ce = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, self.dual_net.n_classes),
+            target_idx.reshape(-1),
+            reduction="none",
+        ).view(X.shape[0], self.data.neq).mean(dim=1)   # [B]
+
+        return ce, target_idx
+        
+
 
     def train_PDL(self, optuna_trial=None):
         print("Starting Primal-Dual Learning inside the train_PDL function")
@@ -333,7 +398,7 @@ class PrimalDualTrainer():
 
                     num_batches = 0
 
-                    for (Xtrain, total_demands, X_opt) in self.train_loader:
+                    for (Xtrain, total_demands, X_opt,  mu_true_batch, lamb_true_batch) in self.train_loader:
                         
                         compute_begin_time = time.time()
 
@@ -387,7 +452,15 @@ class PrimalDualTrainer():
                         self.primal_net.eval()
                         frozen_dual_net.eval()
                         # print(f"In eval the primal net p and d are: {self.primal_net.p_mean}, {self.primal_net.d_mean}")
-                        obj_val_mean, primal_obj_val_mean ,val_loss_mean, ineq_max, ineq_mean, eq_max, eq_mean, dual_obj_val_mean, dual_loss_mean = self.evaluate(self.valid_dataset.tensors[0], self.valid_dataset.tensors[1], self.primal_net, self.dual_net, self.valid_dataset.tensors[2])    
+                        # obj_val_mean, primal_obj_val_mean ,val_loss_mean, ineq_max, ineq_mean, eq_max, eq_mean, dual_obj_val_mean, dual_loss_mean = self.evaluate(self.valid_dataset.tensors[0], self.valid_dataset.tensors[1], self.primal_net, self.dual_net, self.valid_dataset.tensors[2])  
+                        obj_val_mean, primal_obj_val_mean ,val_loss_mean, ineq_max, ineq_mean, eq_max, eq_mean, dual_obj_val_mean, dual_loss_mean = self.evaluate(
+                            self.valid_dataset.tensors[0],
+                            self.valid_dataset.tensors[1],
+                            self.primal_net,
+                            self.dual_net,
+                            self.valid_dataset.tensors[2],
+                            lamb_true=self.valid_dataset.tensors[4],
+                        ) 
                         if k > 0:
                             self.save_if_best(obj_val_mean, ineq_max, ineq_mean, eq_max, eq_mean, dual_obj_val_mean)
                         # Normalize by rho, so that the scheduler still works correctly if rho is increased
@@ -442,7 +515,7 @@ class PrimalDualTrainer():
                     total_penalty = 0.0
 
                     num_batches = 0
-                    for (Xtrain, total_demands, X_opt) in self.train_loader:
+                    for (Xtrain, total_demands, X_opt,  mu_true_batch, lamb_true_batch) in self.train_loader:
                         compute_begin_time = time.time()
                         self.dual_optim.zero_grad()
                         if self.dual_regularization == "S3L":
@@ -462,7 +535,33 @@ class PrimalDualTrainer():
                             mu_k, lamb_k = None, None
                             y = None
 
-                        batch_loss, obj, lagrange_eq, lagrange_ineq, penalty = self.dual_loss_fn(X = Xtrain, y = y, mu = mu, lamb = lamb, mu_k = mu_k, lamb_k= lamb_k, X_opt = X_opt)
+                        if self.args.get("oracle_supervised_dual", False):
+                            batch_loss, target_idx = self.dual_loss_fn(
+                                X=Xtrain,
+                                mu=mu,
+                                lamb=lamb,
+                                lamb_true=lamb_true_batch,
+                            )
+                            obj = torch.zeros_like(batch_loss)
+                            lagrange_eq = torch.zeros_like(batch_loss)
+                            lagrange_ineq = torch.zeros_like(batch_loss)
+                            penalty = torch.zeros_like(batch_loss)
+                        else:
+                            batch_loss, obj, lagrange_eq, lagrange_ineq, penalty = self.dual_loss_fn(
+                                X=Xtrain,
+                                y=y,
+                                mu=mu,
+                                lamb=lamb,
+                                mu_k=mu_k,
+                                lamb_k=lamb_k,
+                                X_opt=X_opt,
+                                lamb_true=lamb_true_batch if self.args.get("oracle_loss_weight", False) else None,
+                            )
+
+
+                        # batch_loss, obj, lagrange_eq, lagrange_ineq, penalty = self.dual_loss_fn(X = Xtrain, y = y, mu = mu, lamb = lamb, mu_k = mu_k, 
+                        #                                                                          lamb_k= lamb_k, X_opt = X_opt,
+                        #                                                                         lamb_true=lamb_true_batch if self.args.get("oracle_loss_weight", False) else None,)
                         batch_loss, obj, lagrange_eq, lagrange_ineq, penalty = batch_loss.mean(), obj.mean(), lagrange_eq.mean(), lagrange_ineq.mean(), penalty.mean()
                         total_train_loss += batch_loss.item()
                         total_obj += obj.item()
@@ -497,8 +596,16 @@ class PrimalDualTrainer():
                     with torch.no_grad():
                         self.primal_net.eval()
                         self.dual_net.eval()
-                        obj_val_mean, primal_obj_val_mean, val_loss_mean, ineq_max, ineq_mean, eq_max, eq_mean, dual_obj_val_mean, dual_loss_mean = self.evaluate(self.valid_dataset.tensors[0], self.valid_dataset.tensors[1], self.primal_net, self.dual_net, self.valid_dataset.tensors[2])    
+                        # obj_val_mean, primal_obj_val_mean, val_loss_mean, ineq_max, ineq_mean, eq_max, eq_mean, dual_obj_val_mean, dual_loss_mean = self.evaluate(self.valid_dataset.tensors[0], self.valid_dataset.tensors[1], self.primal_net, self.dual_net, self.valid_dataset.tensors[2])    
 
+                        obj_val_mean, primal_obj_val_mean ,val_loss_mean, ineq_max, ineq_mean, eq_max, eq_mean, dual_obj_val_mean, dual_loss_mean = self.evaluate(
+                            self.valid_dataset.tensors[0],
+                            self.valid_dataset.tensors[1],
+                            self.primal_net,
+                            self.dual_net,
+                            self.valid_dataset.tensors[2],
+                            lamb_true=self.valid_dataset.tensors[4],
+                        ) 
                         # Early stopper also checks whether the dual loss is better than the best seen so far.
                         if self.dual_early_stopping.step(dual_loss_mean):
                             self.dual_net_best = self.freeze(self.dual_net)
@@ -653,7 +760,7 @@ class PrimalDualTrainer():
         #     # Update the best overall dual objective
         #     self.best_dual_obj = dual_obj_val_mean
 
-    def evaluate(self, X, total_demands, primal_net, dual_net, X_Opt, outer_iter=None, inner_iter=None):        
+    def evaluate(self, X, total_demands, primal_net, dual_net, X_Opt, lamb_true=None, outer_iter=None, inner_iter=None):    
         # Forward pass through networks
         Y = primal_net(X, total_demands)
 
@@ -665,7 +772,30 @@ class PrimalDualTrainer():
         # Convert lists to arrays for easier handling
         obj_values = self.data.obj_fn(X, Y).detach()
         primal_losses, primal_obj, lagrange_eq, lagrange_ineq, penalty = self.primal_loss_fn(X, Y, mu, lamb, X_Opt)
-        dual_losses, dual_obj, dual_lagrange_eq, dual_lagrange_ineq, dual_penalty = self.alternate_dual_loss(X, Y, mu, lamb, X_Opt)
+        # dual_losses, dual_obj, dual_lagrange_eq, dual_lagrange_ineq, dual_penalty = self.alternate_dual_loss(X, Y, mu, lamb, X_Opt)
+
+
+        # dual_losses, dual_obj, dual_lagrange_eq, dual_lagrange_ineq, dual_penalty = self.alternate_dual_loss(
+        #     X, Y, mu, lamb, X_Opt, lamb_true=lamb_true
+        # )
+
+
+        if self.args.get("oracle_supervised_dual", False):
+            dual_losses, _ = self.oracle_supervised_dual_loss(
+                X=X,
+                mu=mu,
+                lamb=lamb,
+                lamb_true=lamb_true,
+            )
+            dual_obj = self.data.dual_obj_fn(X, mu, lamb).detach()
+            dual_lagrange_eq = torch.zeros_like(dual_losses)
+            dual_lagrange_ineq = torch.zeros_like(dual_losses)
+            dual_penalty = torch.zeros_like(dual_losses)
+        else:
+            dual_losses, dual_obj, dual_lagrange_eq, dual_lagrange_ineq, dual_penalty = self.alternate_dual_loss(
+                X, Y, mu, lamb, X_Opt, lamb_true=lamb_true
+            )
+
         primal_losses = primal_losses.detach()
         dual_losses = dual_losses.detach()
         ineq_max_vals = torch.max(ineq_dist, dim=1)[0].detach() # First element is the max, second is the index
@@ -819,7 +949,7 @@ class PrimalDualTrainer():
         # print(f"Dual loss: {loss.mean().item()} Normalized {((X_opt - loss)/X_opt).mean().item()}")
         return loss, torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0)
     
-    def alternate_dual_loss(self, X, y, mu, lamb, X_opt ,mu_k=None, lamb_k=None):
+    def alternate_dual_loss(self, X, y, mu, lamb, X_opt ,mu_k=None, lamb_k=None, lamb_true = None):
         #! We maximize the dual obj func, so to use it in the loss, take the negation.
         dual_obj = self.data.dual_obj_fn(X, mu, lamb)
 
@@ -854,8 +984,45 @@ class PrimalDualTrainer():
             # print(f"In alt dual loss, dual objective: {dual_obj.mean().item()}")
             loss = (primal_obj - dual_obj) 
 
+        if self.args.get("oracle_loss_weight", False):
+            if lamb_true is None:
+                raise ValueError("oracle_loss_weight=True but lamb_true was not provided.")
+            weights = self.compute_oracle_loss_weights(lamb_true)
+            loss = loss * weights
         #! Dual constraints are never violated, so we do not include penalty and lagrangian terms.
         return loss, dual_obj, torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0)
+
+    def compute_oracle_loss_weights(self, lamb_true):
+        """
+        Positive per-sample weights.
+        Fewer lambda entries equal to scarcity value -> higher weight.
+
+        w_i = 1 + alpha * (1 - count_i / neq)
+
+        Then normalize to mean 1 so the loss scale stays stable.
+        """
+        scarcity_value = -float(self.data.pVOLL)
+        alpha = float(self.args.get("oracle_weight_alpha", 2.0))
+
+        scarcity_tensor = torch.tensor(
+            scarcity_value,
+            dtype=lamb_true.dtype,
+            device=lamb_true.device,
+        )
+
+        scarcity_count = torch.isclose(
+            lamb_true,
+            scarcity_tensor,
+            atol=1e-8,
+            rtol=0.0,
+        ).sum(dim=1).float()   # [batch]
+
+        max_count = float(lamb_true.shape[1])  # neq, here likely 3
+        weights = 1.0 + alpha * (1.0 - scarcity_count / max_count)
+
+        # normalize so mean weight is 1
+        weights = weights / (weights.mean() + 1e-12)
+        return weights
 
     def violation(self, X, Y, mu_k):
         # Calculate the equality constraint function h_x(y)

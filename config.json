@@ -30,9 +30,11 @@
         "gen_data_constraint_lb_renewable_zero": true,
         "gen_data_constraint_ub_renewable_max_inv": true,
         "_comment":"renewable max inv means for renewabels UB is set to max investment if True, if False, UB is set to min(production capacity, max investment)",
-        "gen_data_renew_availability": 100,
+        "gen_data_renew_availability": 90,
         "_GenAvailablity_comment": "if = 100, availability is the max(availablity) for the renewable, if < 100, availability is set to the specified percentile of availability in the original data",
-        "specific_name": "GenConstRenewUBTrue"
+        "specific_name": "GenConstRenewUBTrue",
+        "gen_data_node_constraint": true
+
     },
     "Benders_args": {
        "N": ["BEL", "GER", "FRA"],
@@ -42,7 +44,7 @@
         "scale_problem": false,
         "scale_input": false,
         "perturb_operating_costs": false,
-        "sample_duration": 2190,
+        "sample_duration": 120,
         "_comment_sample_duration": "Max sample duration is 8760",
         "max_investment": 100000,
         "2n_synthetic_samples": 15,
@@ -50,11 +52,11 @@
         "normalize_input": false,
         "repeats": 1,
         "device": "cpu",
-        "primal_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BaselineConst2/repeat:0", 
-        "dual_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BaselineConst2/repeat:0",
+        "primal_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BendersBaseline/repeat:0", 
+        "dual_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BendersBaseline/repeat:0",
         "exp_save_directory":"outputs/Benders/3Node",
-        "specific_name":"ConstD_1",
-        "benders_setup": "Inexact_Refine",
+        "specific_name":"Exact_2",
+        "benders_setup": "Exact",
         "_Comment_benders_setup": "Benders setup options: [Exact, Inexact, Inexact_Refine, All], All is when all three are run",
         "init_investment": "Zero",
         "_Comment_init_investment": "Options for initial investment solution for Benders: Zero, HalfMax"
@@ -99,7 +101,7 @@
     "dual_completion": true,
     "dual_classification": true,
     "normalize_by_gt": false,
-    "loss_option": "Duality_Gap",
+    "loss_option": "Original",
     "_Comments": "loss option: Original, Norm_GT (Normalize by ground truth obj), Norm_Obj (Normalize by obj), Duality_Gap, Log",
     "flow_scale_by_prod": false,
     "_Flow_scale_by_prod_Comment": "If true, scale line flow repair bounds based on production capacity at nodes. (More restrictive.)",
@@ -139,5 +141,10 @@
 
     "use_prod_surplus_input": false,
 
-    "SeperatePredicationHead": true
+    "SeperatePredicationHead": true,
+    "oracle_loss_weight": false,
+    "oracle_weight_alpha": 5.0,
+    "oracle_supervised_dual": true
+
+
 }   

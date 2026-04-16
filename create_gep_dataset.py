@@ -144,5 +144,6 @@ if __name__ == "__main__":
     gep_ed_data = input_data["experiment"]["experiments"][0] 
     ED_args = args["ED_args"]
     ED_args["gen_data_constraint"] = True
-    data_save_path = (f"data/ED_data/Constraint/TestLB.pkl")
+    print(f"ED args gen with node cosntraint: {ED_args['gen_data_node_constraint']}")
+    data_save_path = (f"data/ED_data/Constraint/3Loc/Test.pkl")
     data = create_gep_ed_dataset(args=args, problem_args=ED_args, inputs=gep_ed_data, problem_type=args["problem_type"], save_path=data_save_path)

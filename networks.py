@@ -1058,36 +1058,7 @@ class DualClassificationNetEndToEnd(nn.Module):
             else:
                 out_mu = self.complete_duals(out_lamb)
             return out_mu, out_lamb
-        
-    # def forward(self, x, mu = None):
-    #     x_raw = x
-    #     if self.normalize:
-    #         x = self.scale(x)
-    #     out_lamb_raw_probas = self.feed_forward(x) # [B, n_var*n_classes]
-    #     T = 1
-    #     out_lamb_raw_probas = out_lamb_raw_probas.view(-1, self.n_dual_vars, self.n_classes) # [B, n_var, n_classes]
-
-    #     if self.training:
-    #         out_lamb_probas = torch.softmax(out_lamb_raw_probas, dim=-1)
-
-    #         out_lamb = torch.sum(out_lamb_probas * self.classes, dim=-1)
-    #         if self.args.get("dual_regularization", "NA") == "S3L" and mu is not None:
-    #             out_mu = self.complete_duals_smooth(out_lamb, x_raw, mu_barrier=mu)
-    #         else:
-    #             out_mu = self.complete_duals(out_lamb)
-
-    #         return out_mu, out_lamb
-
-    #     else:
-    #         predicted_class = out_lamb_raw_probas.argmax(dim=-1)
-    #         out_lamb = self.classes[predicted_class]
-    #         if self.args.get("dual_regularization", "NA") == "S3L" and mu is not None:
-    #             out_mu = self.complete_duals_smooth(out_lamb, x_raw, mu_barrier=mu)
-    #         else:
-    #             out_mu = self.complete_duals(out_lamb)
-
-    #         # out_mu = self.complete_duals(out_lamb)
-    #         return out_mu, out_lamb
+    
          
 def load(args, data, save_dir):
     primal_net = PrimalNetEndToEnd(args, data=data)
