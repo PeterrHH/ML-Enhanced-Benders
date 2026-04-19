@@ -78,26 +78,31 @@ class GEPOperationalProblemSet():
         self.ydim = self.n_prod_vars + self.n_line_vars + self.n_md_vars
 
         # Generate unit investment data:
-        if args["ED_args"].get("gen_data_constraint", False):
-            # Generate with no Lower Bound
-            if args["ED_args"].get("gen_data_node_constraint", False):
-                self.pUnitInvestment = self.generate_ui_data_node_constraint(
-                    m=self.ED_args["2n_synthetic_samples"],
-                    max_inv=self.ED_args["max_investment"],
-                    renewable_ava_percentile=self.args["ED_args"].get("gen_data_renew_availability", 90),
-                )
-            else:
-                self.pUnitInvestment = self.generate_ui_data_constraint(m=self.ED_args["2n_synthetic_samples"], 
-                                                                    max_inv=self.ED_args["max_investment"],
-                                                                    lb_activated = self.args["ED_args"].get("gen_data_constraint_lb", False),
-                                                                    alpha = self.args["ED_args"].get("gen_data_constraint_lb_alpha", 0.2),
-                                                                    renewable_lb_zero = self.args["ED_args"].get("gen_data_constraint_lb_renewable_zero", True),
-                                                                    renewable_ub_max_inv = self.args["ED_args"].get("gen_data_constraint_ub_renewable_max_inv", True),
-                                                                    renewable_ava_percentile= self.args["ED_args"].get("gen_data_renew_availability", 100))
-
+        if self.ED_args.get("generate_capacity_sobol", False):
+            self.pUnitInvestment = None
         else:
-            self.pUnitInvestment = self.generate_ui_data(m=self.ED_args["2n_synthetic_samples"], max_inv=self.ED_args["max_investment"])
-        # self.pUnitInvestment = self.sparsify_batch(self.pUnitInvestment) #! This is likely not necessary, unsparsified data set already contains the data.
+            if args["ED_args"].get("gen_data_constraint", False):
+                if args["ED_args"].get("gen_data_node_constraint", False):
+                    self.pUnitInvestment = self.generate_ui_data_node_constraint(
+                        m=self.ED_args["2n_synthetic_samples"],
+                        max_inv=self.ED_args["max_investment"],
+                        renewable_ava_percentile=self.args["ED_args"].get("gen_data_renew_availability", 90),
+                    )
+                else:
+                    self.pUnitInvestment = self.generate_ui_data_constraint(
+                        m=self.ED_args["2n_synthetic_samples"],
+                        max_inv=self.ED_args["max_investment"],
+                        lb_activated=self.args["ED_args"].get("gen_data_constraint_lb", False),
+                        alpha=self.args["ED_args"].get("gen_data_constraint_lb_alpha", 0.2),
+                        renewable_lb_zero=self.args["ED_args"].get("gen_data_constraint_lb_renewable_zero", True),
+                        renewable_ub_max_inv=self.args["ED_args"].get("gen_data_constraint_ub_renewable_max_inv", True),
+                        renewable_ava_percentile=self.args["ED_args"].get("gen_data_renew_availability", 100),
+                    )
+            else:
+                self.pUnitInvestment = self.generate_ui_data(
+                    m=self.ED_args["2n_synthetic_samples"],
+                    max_inv=self.ED_args["max_investment"]
+                )
 
         # Masks for node balance
         # Initialize mask, to store which generator belong to which node
@@ -134,6 +139,8 @@ class GEPOperationalProblemSet():
         self.obj_coeff, self.cost_vec = self.build_obj_coeff()
         if self.ED_args["synthetic_demand_capacity"]:
             self.X = self.build_synthetic_X()
+        elif self.ED_args.get("generate_capacity_sobol", False):
+            self.X = self.build_X_capacity_sobol()
         else:
             self.X = self.build_X()
         
@@ -170,6 +177,94 @@ class GEPOperationalProblemSet():
     def save_data(self, save_path):
         with open(save_path, 'wb') as file:
             pickle.dump(self, file)
+
+    def build_X_capacity_sobol(self):
+        """
+        Build X using:
+        - historical demand vectors (Choice A)
+        - Sobol-sampled generator upper bounds directly
+
+        X = [D_1, ..., D_N, cap_ub_1, ..., cap_ub_G]
+        """
+        self.capacity_samples = self.generate_capacity_data_constraint(
+            m=self.ED_args["2n_synthetic_samples"],
+            beta=self.ED_args.get("gen_data_beta", 1.2),
+        )
+
+        X = []
+        for i in range(self.n_samples):
+            t = i % len(self.T) + 1
+
+            Xi = []
+            # historical nodal demand vector
+            for n in self.N:
+                Xi.append(float(self.pDemand[(n, t)]))
+
+            # sampled ED capacity upper bounds directly
+            Xi.extend(self.capacity_samples[i].tolist())
+            X.append(Xi)
+
+        X = torch.tensor(np.array(X), dtype=self.DTYPE)
+
+        perm = torch.randperm(X.shape[0])
+        X = X[perm]
+        self.capacity_samples = self.capacity_samples[perm]
+
+        return X
+
+    def generate_capacity_data_constraint(
+        self,
+        m=15,
+        beta=1.2,
+    ):
+        """
+        Generate Sobol samples directly over ED generator upper bounds (MW),
+        using the same constraint-aware node-based logic.
+
+        Returns
+        -------
+        cap_samples : torch.Tensor [n_samples, num_g]
+            Direct generator production upper bounds for ED.
+        """
+        dimensions = self.num_g
+        sobol_sampler = qmc.Sobol(d=dimensions)
+        base_points = sobol_sampler.random_base2(m=m)
+        np.random.shuffle(base_points)
+
+        dtype_np = np.float32 if self.args["device"] == "mps" else np.float64
+        points01 = torch.tensor(base_points.astype(dtype_np), dtype=self.DTYPE)
+
+        lb_g = torch.zeros(self.num_g, dtype=self.DTYPE)
+        ub_g = torch.zeros(self.num_g, dtype=self.DTYPE)
+
+        # max demand per node
+        node_max_demand = {}
+        for n in self.N:
+            node_max_demand[n] = max(float(self.pDemand[(n, t)]) for t in self.T)
+
+        # export/import capability proxy per node
+        node_export_cap = {n: 0.0 for n in self.N}
+        for (start_node, end_node) in self.L:
+            node_export_cap[start_node] += float(self.pExpCap[(start_node, end_node)])
+            node_export_cap[end_node] += float(self.pImpCap[(start_node, end_node)])
+
+        for g_idx, g in enumerate(self.G):
+            n, _ = g
+            pmax = float(self.pUnitCap[g])
+
+            # same constraint-aware logic, now directly in MW cap-space
+            cap_target = (float(node_max_demand[n]) + float(node_export_cap[n])) * beta
+
+            # hard cap from max investment times unit size
+            hard_cap = float(self.ED_args["max_investment"]) * pmax
+
+            lb_g[g_idx] = 0.0
+            ub_g[g_idx] = min(cap_target, hard_cap)
+
+        cap_samples = lb_g.unsqueeze(0) + points01 * (ub_g - lb_g).unsqueeze(0)
+        cap_samples = torch.clamp(cap_samples, min=lb_g.unsqueeze(0), max=ub_g.unsqueeze(0))
+
+        return cap_samples
 
     def generate_ui_data_node_constraint(
         self,

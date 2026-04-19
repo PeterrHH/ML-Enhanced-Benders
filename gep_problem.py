@@ -124,8 +124,8 @@ class GEPProblemSet():
         ineq_rhss = []
 
         for time_range in self.time_ranges:
-            _, ineq_rhs = self.build_ineq_cm_rhs_sample(time_range)
-            _, eq_rhs = self.build_eq_cm_rhs_sample(time_range)
+            ineq_rhs = self.build_ineq_rhs_sample(time_range)
+            eq_rhs = self.build_eq_rhs_sample(time_range)
             eq_rhss.append(eq_rhs)
             ineq_rhss.append(ineq_rhs)
 
@@ -392,6 +392,36 @@ class GEPProblemSet():
             ineq_rhs += [self.pDemand[(n, t)] for n in self.N]
             
         return ineq_cm, torch.tensor(ineq_rhs)
+        
+    def build_ineq_rhs_sample(self, time_range):
+        ineq_rhs = []
+
+        # ui_g lower bound
+        ineq_rhs += [0.0 for _ in range(self.num_g)]
+
+        for t in time_range:
+            # production lower bound
+            ineq_rhs += [0.0 for _ in range(self.num_g)]
+            # production upper bound
+            ineq_rhs += [0.0 for _ in range(self.num_g)]
+            # lineflow lower bound
+            ineq_rhs += [self.pImpCap[l] for l in self.L]
+            # lineflow upper bound
+            ineq_rhs += [self.pExpCap[l] for l in self.L]
+            # missed demand lower bound
+            ineq_rhs += [0.0 for _ in range(self.num_n)]
+            # missed demand upper bound
+            ineq_rhs += [self.pDemand[(n, t)] for n in self.N]
+
+        return torch.tensor(ineq_rhs, dtype=self.DTYPE, device=self.DEVICE)
+
+
+    def build_eq_rhs_sample(self, time_range):
+        eq_rhs = []
+        for t in time_range:
+            eq_rhs += [self.pDemand[(n, t)] for n in self.N]
+
+        return torch.tensor(eq_rhs, dtype=self.DTYPE, device=self.DEVICE)
 
     def build_eq_cm_rhs_sample(self, time_range):
         """Build the constraint matrix for the equality constraints
