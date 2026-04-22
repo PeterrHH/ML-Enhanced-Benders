@@ -2,6 +2,7 @@ import os
 import pickle
 import numpy as np
 import pandas as pd
+import math
 
 # =========================
 # Paths
@@ -311,16 +312,278 @@ print_nice_summary(summary_df)
 summary_df.to_csv("ed_dataset_diversity_summary.csv", index=False)
 print("\nSaved full summary to ed_dataset_diversity_summary.csv")
 
+import os
+import pickle
+import numpy as np
+import matplotlib.pyplot as plt
 
+
+def get_node_gen_indices(data):
+    """
+    Returns a dict:
+        node -> list of generator indices connected to that node
+    """
+    node_to_gidx = {n: [] for n in data.N}
+    for g_idx, g in enumerate(data.G):
+        node_to_gidx[g[0]].append(g_idx)
+    return node_to_gidx
+
+
+def compute_total_demand_and_node_stress(data):
+    """
+    Returns:
+        total_demand: [n_samples]
+        stress_per_node: dict[node] -> [n_samples]
+
+    stress_n = demand_n / (sum effective capacity of generators at node n + eps)
+    """
+    D, A, U, E = reconstruct_arrays(data)
+
+    total_demand = D.sum(axis=1)
+
+    node_to_gidx = get_node_gen_indices(data)
+    eps = 1e-9
+
+    stress_per_node = {}
+    for node_idx, node in enumerate(data.N):
+        local_gen_idx = node_to_gidx[node]
+        local_eff_cap = E[:, local_gen_idx].sum(axis=1) if len(local_gen_idx) > 0 else np.zeros(E.shape[0])
+        stress_per_node[node] = D[:, node_idx] / (local_eff_cap + eps)
+
+    return total_demand, stress_per_node
+
+def plot_total_demand_histograms(
+    datasets,
+    bins=60,
+    density=True,
+    alpha=0.55,
+    figsize=(8, 5),
+    save_path=None,
+):
+    """
+    Overlay histogram of total demand for all datasets.
+    """
+    plt.figure(figsize=figsize)
+
+    for name, path in datasets.items():
+        if not os.path.exists(path):
+            print(f"[WARN] Missing file for {name}: {path}")
+            continue
+
+        data = load_dataset(path)
+        total_demand, _ = compute_total_demand_and_node_stress(data)
+
+        plt.hist(
+            total_demand,
+            bins=bins,
+            density=density,
+            alpha=alpha,
+            label=name,
+        )
+
+    plt.xlabel("Total demand")
+    plt.ylabel("Density" if density else "Count")
+    plt.title("Distribution of total demand")
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.legend(frameon=False)
+    plt.tight_layout()
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        print(f"Saved plot to {save_path}")
+
+    plt.show()
+
+
+def plot_node_demand_density_grid(
+    datasets,
+    bins=80,
+    density=True,
+    alpha=0.75,
+    figsize_per_subplot=(5, 4),
+    save_dir=None,
+):
+    """
+    For each dataset, create a subplot grid with one histogram per node,
+    showing the distribution of nodal demand.
+
+    Parameters
+    ----------
+    datasets : dict
+        {"dataset_name": "path/to/file.pkl", ...}
+    bins : int
+        Number of histogram bins.
+    density : bool
+        If True, plot density; otherwise plot counts.
+    alpha : float
+        Histogram transparency.
+    figsize_per_subplot : tuple
+        Approximate size per subplot (width, height).
+    save_dir : str or None
+        Optional folder to save figures.
+    """
+    for name, path in datasets.items():
+        if not os.path.exists(path):
+            print(f"[WARN] Missing file for {name}: {path}")
+            continue
+
+        data = load_dataset(path)
+        D, A, U, E = reconstruct_arrays(data)
+
+        num_nodes = data.num_n
+
+        # Make layout automatic
+        ncols = min(3, num_nodes)
+        nrows = math.ceil(num_nodes / ncols)
+
+        figsize = (figsize_per_subplot[0] * ncols, figsize_per_subplot[1] * nrows)
+        fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
+
+        # Make axes always iterable
+        if num_nodes == 1:
+            axes = np.array([axes])
+        axes = np.array(axes).reshape(-1)
+
+        for n_idx, node in enumerate(data.N):
+            ax = axes[n_idx]
+
+            vals = D[:, n_idx]
+            vmin = float(np.min(vals))
+            vmax = float(np.max(vals))
+
+            if np.isclose(vmin, vmax):
+                vmin = max(0.0, vmin - 1.0)
+                vmax = vmax + 1.0
+
+            bin_edges = np.linspace(vmin, vmax, bins + 1)
+
+            ax.hist(
+                vals,
+                bins=bin_edges,
+                density=density,
+                alpha=alpha,
+            )
+
+            ax.set_title(str(node))
+            ax.set_xlabel("Demand")
+            ax.set_ylabel("Density" if density else "Count")
+            ax.grid(True, linestyle="--", alpha=0.4)
+
+        # Hide unused axes
+        for j in range(num_nodes, len(axes)):
+            axes[j].axis("off")
+
+        fig.suptitle(f"{name}: per-node demand distributions", fontsize=16)
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+        if save_dir is not None:
+            os.makedirs(save_dir, exist_ok=True)
+            out_path = os.path.join(save_dir, f"{name}_node_demand_density_grid.png")
+            plt.savefig(out_path, dpi=300, bbox_inches="tight")
+            print(f"Saved plot to {out_path}")
+
+        plt.show()
+
+def plot_node_log_stress_histograms(
+    datasets,
+    bins=60,
+    density=True,
+    alpha=0.55,
+    figsize=(15, 4),
+    save_path=None,
+):
+    """
+    Overlay histogram of log(1 + stress) across datasets.
+    """
+    first_data = None
+    for _, path in datasets.items():
+        if os.path.exists(path):
+            first_data = load_dataset(path)
+            break
+
+    if first_data is None:
+        raise FileNotFoundError("No dataset files found.")
+
+    num_nodes = first_data.num_n
+    fig, axes = plt.subplots(1, num_nodes, figsize=figsize, sharey=False)
+
+    if num_nodes == 1:
+        axes = [axes]
+
+    for node_idx, node in enumerate(first_data.N):
+        ax = axes[node_idx]
+
+        for name, path in datasets.items():
+            if not os.path.exists(path):
+                continue
+
+            data = load_dataset(path)
+            _, stress_per_node = compute_total_demand_and_node_stress(data)
+            vals = np.asarray(stress_per_node[node], dtype=float)
+
+            vals_log = np.log1p(vals)
+
+            ax.hist(
+                vals_log,
+                bins=bins,
+                density=density,
+                alpha=alpha,
+                label=name,
+            )
+
+        ax.set_title(f"{node}")
+        ax.set_xlabel(r"$\log(1+\mathrm{stress})$")
+        if node_idx == 0:
+            ax.set_ylabel("Density" if density else "Count")
+        ax.grid(True, linestyle="--", alpha=0.4)
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=len(datasets), frameon=False, bbox_to_anchor=(0.5, 1.02))
+    fig.suptitle(r"Per-location $\log(1+\mathrm{stress})$ distributions", fontsize=14, y=1.08)
+    plt.tight_layout()
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        print(f"Saved plot to {save_path}")
+
+    plt.show()
 
 # =========================
 # Plot 2x3 grid per dataset
 # =========================
-plot_generator_effective_capacity_grid(
+# plot_generator_effective_capacity_grid(
+#     DATASETS,
+#     bins=80,
+#     density=True,
+#     alpha=0.75,
+#     figsize=(15, 8),
+#     save_dir="figures/generator_effcap_grid_plots",
+# )
+
+# plot_total_demand_histograms(
+#     DATASETS,
+#     bins=60,
+#     density=True,
+#     alpha=0.5,
+#     figsize=(8, 5),
+#     save_path="figures/dataset_demand_and_stress/total_demand_hist.png",
+# )
+
+plot_node_demand_density_grid(
     DATASETS,
     bins=80,
     density=True,
     alpha=0.75,
-    figsize=(15, 8),
-    save_dir="figures/generator_effcap_grid_plots",
+    save_dir="figures/node_demand_density_plots",
+)
+
+plot_node_log_stress_histograms(
+    DATASETS,
+    bins=60,
+    density=True,
+    alpha=0.5,
+    figsize=(15, 4),
+    save_path="figures/dataset_demand_and_stress/node_stress_overlayed.png",
 )

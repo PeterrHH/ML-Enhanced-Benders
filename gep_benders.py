@@ -220,6 +220,16 @@ class BendersSolver():
         self.cut_groups = None
         self.cut_group_info = None
 
+        self.master_model = None
+        self.master_u = None          # MVar of investment vars
+        self.master_alpha = None      # MVar of alpha vars
+        self.master_num_alpha = None
+        self._num_cuts_in_master = 0  # how many cuts already added
+
+        self.wall_iter_hist = []
+        self.wall_master_hist = []
+        self.wall_sub_hist = []
+
         self.X_all = []
         self.objs_all = []
         self.dual_solutions_all = []
@@ -433,83 +443,145 @@ class BendersSolver():
         dual_sol = torch.concat([-mu, -lamb], dim=1).squeeze()
 
         return primal_obj_val, dual_obj_val, primal_sol.detach().numpy(), dual_sol.detach().numpy(), inference_time
-
-    def solve_master_problem(self, data,compact,sample,investments,obj_val,benders_cuts, investment=None):
-        # Solves the master problem in Benders decomposition
-        # Returns the optimal objective function value in two parts: investment costs and value of alpha
-        # And returns the optimal investment solution
-
-        obj, A_ineq, b_ineq, A_eq, b_eq = self.find_master_problem_cm_rhs_obj(data,compact,sample,investments,obj_val,benders_cuts)
-
-        obj_val, primal_val, dual_val, inference_time = self.solve_matrix_problem_simple(obj, A_ineq, b_ineq, A_eq, b_eq, True, investment)
-
-        obj_val_master = [obj_val-primal_val[-1], primal_val[-1]] # primal_val[-1] is the value of alpha
-
-        # The new investments are the primal variables of the master problem, except for alpha
-        new_investments = primal_val[:-1]
-
-        return obj_val_master, new_investments, inference_time
     
+    def _ensure_master_model(self, data, sample):
+        """Build the master Gurobi model once. Cheap to call repeatedly."""
+        if self.master_model is not None:
+            return
 
-    def solve_master_problem(
-        self,
-        data,
-        compact,
-        sample,
-        investments,
-        obj_val,
-        benders_cuts,
-        investment=None,
-    ):
-        """
-        Solve the Benders master problem.
-
-        Works for:
-            single cut: one alpha
-            grouped cuts: multiple alpha_k
-        """
-
-        obj, A_ineq, b_ineq, A_eq, b_eq = self.find_master_problem_cm_rhs_obj(
-            data,
-            compact,
-            sample,
-            investments,
-            obj_val,
-            benders_cuts,
-        )
-
+        # Determine number of alphas
         if self.cut_selection == "single":
             num_alpha = 1
         else:
             if self.cut_groups is None:
                 self.cut_groups, self.cut_group_info = make_cut_groups(
-                    data=data,
-                    sample=sample,
+                    data=data, sample=sample,
                     cut_selection=self.cut_selection,
                     cut_selection_k=self.cut_selection_k,
                 )
+                print(f"Cut selection: {self.cut_selection}, groups={len(self.cut_groups)}")
+                print("Group sizes:", self.cut_group_info["group_sizes"])
             num_alpha = len(self.cut_groups)
 
-        obj_val, primal_val, dual_val, inference_time = self.solve_matrix_problem_simple(
-            obj,
-            A_ineq,
-            b_ineq,
-            A_eq,
-            b_eq,
-            True,
-            investment,
-            num_alpha=num_alpha,
+        self.master_num_alpha = num_alpha
+
+        m = gp.Model("Benders Master Persistent", env=self.env)
+        m.setParam("MIPGap", 1e-8)
+        m.setParam("OutputFlag", 0)
+
+        # Variables
+        u = m.addMVar(shape=data.num_g, lb=0.0, ub=100000.0,
+                    vtype=GRB.INTEGER, name="u")
+        alpha = m.addMVar(shape=num_alpha, lb=-1e6,
+                        vtype=GRB.CONTINUOUS, name="alpha")
+
+        # Objective: c_u^T u + sum_k alpha_k
+        obj_u = data.obj_coeff[:data.num_g].detach().cpu().numpy()
+        m.setObjective(obj_u @ u + alpha.sum(), GRB.MINIMIZE)
+
+        # Original investment-side inequality block (e.g. -u <= 0 style rows)
+        ineq_cm_sample, ineq_rhs_sample, _, _ = data.get_sample_matrices(sample)
+        A_base = ineq_cm_sample[:data.num_g, :data.num_g].detach().cpu().numpy()
+        b_base = ineq_rhs_sample[:data.num_g].detach().cpu().numpy()
+        m.addConstr(A_base @ u <= b_base, name="inv_base")
+
+        self.master_model = m
+        self.master_u = u
+        self.master_alpha = alpha
+        self._num_cuts_in_master = 0
+
+
+    def _add_new_cuts_to_master(self, all_cuts):
+        """Only push cuts that aren't already in the model."""
+        new_cuts = all_cuts[self._num_cuts_in_master:]
+        if not new_cuts:
+            return
+
+        u = self.master_u
+        alpha = self.master_alpha
+        num_g = u.shape[0]
+
+        for cut_lhs, cut_rhs in new_cuts:
+            row = np.asarray(cut_lhs).reshape(-1)
+            u_coeffs = row[:num_g]
+            alpha_coeffs = row[num_g:]
+            self.master_model.addConstr(
+                u_coeffs @ u + alpha_coeffs @ alpha <= float(cut_rhs)
+            )
+
+        # Gurobi batches lazily; optimize() triggers the update.
+        self._num_cuts_in_master = len(all_cuts)
+
+    @staticmethod
+    def get_crossover_metrics(iter_df):
+        cross_rows = iter_df[
+            (iter_df["exact_mode"] == True) &
+            (iter_df["exact_mode"].shift(1) == False)
+        ]
+
+        if len(cross_rows) == 0:
+            return {
+                "has_crossover": False,
+                "cross_iter": None,
+                "ub_cross": None,
+                "lb_cross": None,
+                "gap_cross_pct": None,
+                "lb_cross_ratio_pct": None,
+            }
+
+        cross_idx = cross_rows.index[0]
+
+        ub_cross = float(iter_df.loc[cross_idx, "UB"])
+        lb_cross = float(iter_df.loc[cross_idx, "LB"])
+        lb_final = float(iter_df["LB"].iloc[-1])
+        gap_cross_pct = float(iter_df.loc[cross_idx, "gap_rel"]) * 100.0
+
+        lb_cross_ratio_pct = (
+            100.0 * lb_cross / lb_final
+            if abs(lb_final) > 1e-12 else None
         )
 
-        new_investments = primal_val[:data.num_g]
-        alpha_vals = primal_val[data.num_g:data.num_g + num_alpha]
+        return {
+            "has_crossover": True,
+            "cross_iter": int(iter_df.loc[cross_idx, "iter"]),
+            "ub_cross": ub_cross,
+            "lb_cross": lb_cross,
+            "gap_cross_pct": gap_cross_pct,
+            "lb_cross_ratio_pct": lb_cross_ratio_pct,
+        }
 
-        investment_cost = float(obj[:data.num_g] @ new_investments)
-        alpha_total = float(np.sum(alpha_vals))
+    def solve_master_problem(self, data, compact, sample, investments,
+                         obj_val, benders_cuts, investment=None):
+        self._ensure_master_model(data, sample)
+        self._add_new_cuts_to_master(benders_cuts)
 
-        obj_val_master = [investment_cost, alpha_total]
+        u = self.master_u
+        alpha = self.master_alpha
 
-        return obj_val_master, new_investments, inference_time
+        # Final-evaluation call: fix u = investment via temporary bounds.
+        if investment is not None:
+            inv_arr = np.asarray(investment, dtype=float)
+            old_lb = u.LB.copy()
+            old_ub = u.UB.copy()
+            u.LB = inv_arr
+            u.UB = inv_arr
+
+        start = time.time()
+        self.master_model.optimize()
+        inference_time = time.time() - start
+
+        new_investments = np.array(u.X, dtype=float)
+        alpha_vals = np.array(alpha.X, dtype=float)
+
+        obj_u = data.obj_coeff[:data.num_g].detach().cpu().numpy()
+        investment_cost = float(obj_u @ new_investments)
+        alpha_total = float(alpha_vals.sum())
+
+        if investment is not None:
+            u.LB = old_lb
+            u.UB = old_ub
+
+        return [investment_cost, alpha_total], new_investments, inference_time
 
     def find_master_problem_cm_rhs_obj(
         self,
@@ -1155,6 +1227,7 @@ class BendersSolver():
         optimal = False
         i = 0
         while not optimal and i < 1000:
+            t_iter_start = time.time()
             print("-"*50)
             print("Iteration", i, "Exact:", self.exact)
 
@@ -1295,10 +1368,16 @@ class BendersSolver():
                     # Add Benders cut of current iteration to list
                     benders_cut_all.extend(benders_cuts)
                     print(f"Subproblems solved. Added {len(benders_cuts)} Benders cuts.")
-
+            self.wall_master_hist.append(
+                            float(inference_time_master) if i > 0 else 0.0
+                        )
+            self.wall_sub_hist.append(float(inference_time_subproblems_total))
+            self.wall_iter_hist.append(time.time() - t_iter_start)
             i += 1
+
             
         return upper_bound, lower_bound, benders_cut_all, investments_all, obj_val_subproblems_all, i
+    
 
     def plot_benders_cuts(self, min_investment, max_investment, steps, index, benders_cuts_all, investments_all, obj_val_subproblems_all, upper_bound):
         """
@@ -1646,7 +1725,9 @@ if __name__ == "__main__":
                                 "exact_mode": solver.exact_flag_hist,
                                 "t_master": solver.master_time_hist,
                                 "t_sub": solver.sub_time_hist,
+                                "t_iter_wall":    solver.wall_iter_hist,     # wall-clock per iter
                             })
+                            crossover_metrics = BendersSolver.get_crossover_metrics(iter_df)
                             iter_df["investment"] = [json.dumps(v) for v in solver.inv_hist]
                             specific_name = args["Benders_args"].get("specific_name", "")
                             benders_setup_str = args["Benders_args"].get("benders_setup", "")
@@ -1671,7 +1752,7 @@ if __name__ == "__main__":
                             print(f"Total time master: {solver.total_time_master}, Total time subproblem_exact: {solver.total_time_subproblem_exact}, Total time subproblem_pdl: {solver.total_time_subproblem_pdl}")
                             print(f"Total time: {solver.total_time_master + solver.total_time_subproblem_exact + solver.total_time_subproblem_pdl}")
 
-                            obj_val_master, investments_iter_k, inference_time_master = solver.solve_master_problem(gep_data,False,sample,investments_all,None,benders_cuts_all, investment=y[:gep_data.num_g])
+                            #obj_val_master, investments_iter_k, inference_time_master = solver.solve_master_problem(gep_data,False,sample,investments_all,None,benders_cuts_all, investment=y[:gep_data.num_g])
 
                             # Store results in a dict for this run
                             result = {
@@ -1687,9 +1768,13 @@ if __name__ == "__main__":
                                 "total_time_master": solver.total_time_master,
                                 "total_time_subproblem_exact": solver.total_time_subproblem_exact,
                                 "total_time_subproblem_pdl": solver.total_time_subproblem_pdl,
-                                # Optionally, add investments or other details:
-                                # "investments": y[:gep_data.num_g].tolist()
+                                
                                 "investments": investments_all[-1].tolist() if len(investments_all) > 0 else None,
+
+                                "has_crossover": crossover_metrics["has_crossover"],
+                                "lb_cross": crossover_metrics["lb_cross"],
+                                "gap_cross_pct": crossover_metrics["gap_cross_pct"],
+                                "lb_cross_ratio_pct": crossover_metrics["lb_cross_ratio_pct"],
                             }
                             all_results.append(result)
                             # break

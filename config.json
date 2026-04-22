@@ -33,8 +33,8 @@
         "gen_data_renew_availability": 100,
         "_GenAvailablity_comment": "if = 100, availability is the max(availablity) for the renewable, if < 100, availability is set to the specified percentile of availability in the original data",
         "specific_name": "GenConstRenewUBTrue",
-        "gen_data_node_constraint": true,
-        "generate_capacity_sobol": true
+        "gen_data_node_constraint": false,
+        "generate_capacity_sobol": false
 
     },
     "Benders_args": {
@@ -45,7 +45,7 @@
         "scale_problem": false,
         "scale_input": false,
         "perturb_operating_costs": false,
-        "sample_duration": 438,
+        "sample_duration": 2190,
         "_comment_sample_duration": "Max sample duration is 8760",
         "max_investment": 100000,
         "2n_synthetic_samples": 15,
@@ -53,16 +53,16 @@
         "normalize_input": false,
         "repeats": 1,
         "device": "cpu",
-        "primal_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/Capacity-Based/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-Cap-Classifier/repeat:0", 
-        "dual_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/Capacity-Based/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-Cap-Classifier/repeat:0",
+        "primal_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BaselineConst2/repeat:0", 
+        "dual_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BaselineConst2/repeat:0",
         "exp_save_directory":"outputs/Benders/3Node",
-        "specific_name":"Capacity-Bound-Class-FullCut",
+        "specific_name":"ConstD_1_kmeans10",
         "benders_setup": "Inexact_Refine",
         "_Comment_benders_setup": "Benders setup options: [Exact, Inexact, Inexact_Refine, All], All is when all three are run",
         "init_investment": "Zero",
         "_Comment_init_investment": "Options for initial investment solution for Benders: Zero, HalfMax",
-        "cut_selection": "full",
-        "cut_selection_k": 4,
+        "cut_selection": "kmeans",
+        "cut_selection_k": 10,
         "_cut_selection_comment":"Options are: single, kmeans, stress, full"
     },
     "Optuna_args": {

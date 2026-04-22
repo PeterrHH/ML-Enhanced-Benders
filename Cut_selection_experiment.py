@@ -759,13 +759,13 @@ def main():
 
 
 
-    k_values = [4, 6, 8, 10]
+    k_values = [4, 8, 10, 20]
 
     strategies = [("single", None)]
 
     for k in k_values:
         strategies.append(("kmeans", k))
-        strategies.append(("stress", k))
+        # strategies.append(("stress", k))
 
     if not args.skip_full:
         strategies.append(("full", None))

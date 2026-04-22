@@ -56,3 +56,11 @@ In the `data\ED_data` folder: there are a few dataset:
 python gep_benders -c config.json
 ```
 Add -s flag when solving directly with Gurobi without Benders
+
+# Key Model Trained
+
+1. $D_{uniform}: `learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BendersBaseline`
+2. $D_{CAB}: `Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BaselineConst2`
+3. $D_{CAB-NR50}: `Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-Const10000Perc50`
+4. $D_{CAB-NR90}:`Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-Const10000Perc90`
+5. Sample the Capacity: `Capacity-Based/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-CapacityData-Baseline`
