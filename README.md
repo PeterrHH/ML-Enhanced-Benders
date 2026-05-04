@@ -57,10 +57,24 @@ python gep_benders -c config.json
 ```
 Add -s flag when solving directly with Gurobi without Benders
 
+# Key Data
+### Baseline
+data/ED_data/ED_NB-G-F_GB2-G2-F2_L3_c0_s0_p0_smp15.pkl
+### D_CAB
+"data/ED_data/Constraint/3Loc/ED_NB-G-F_GB2-G2-F2_L3_c0_s0_p0_ui_constraint1000_smp15_GenConst_lbFalse_renewMaxInvTrue.pkl"
+### Sobol Sample the Effective Capacity (beta = 1.0)
+data/ED_data/Constraint/3Loc/ED_NB-G-F_GB2-G2-F2_L3_c0_s0_p0_CapSobol_GenConst_ui_constraint1000_smp15_renewMaxInvTrue.pkl
+
 # Key Model Trained
 
 1. $D_{uniform}: `learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BendersBaseline`
 2. $D_{CAB}: `Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BaselineConst2`
+2.1 $D_{CAB}: `Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-D_CAB_Classify`
 3. $D_{CAB-NR50}: `Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-Const10000Perc50`
 4. $D_{CAB-NR90}:`Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-Const10000Perc90`
 5. Sample the Capacity: `Capacity-Based/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-CapacityData-Baseline`
+6. Sample the Capacity Sephead: `Capacity-Based/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-Capacity-SepHead`
+
+7. Capacity Beta 1.0: `Capacity-Based/beta_1.0/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-Cap-Baseline`
+
+
