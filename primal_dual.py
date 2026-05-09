@@ -10,7 +10,9 @@ from mtadam import MTAdam
 from networks import DualClassificationNetEndToEnd, DualNet, DualNetEndToEnd, PrimalNet, PrimalNetEndToEnd
 import optuna
 import matplotlib.pyplot as plt
-torch.autograd.set_detect_anomaly(True)
+torch.autograd.set_detect_anomaly(False)
+torch.set_num_threads(4)
+torch.set_num_interop_threads(1)
 
 class EarlyStopping():
     def __init__(self, patience=1000):
@@ -83,6 +85,12 @@ class PrimalDualTrainer():
         self.rho_ineq = None
         self.rho_eq = None
 
+        ### Difficulty-based sample weighting
+        self.use_difficulty_weighting = args.get("use_difficulty_weighting", False)
+        self.difficulty_weight_scale = float(args.get("difficulty_weight_scale", 1.0))
+        self.difficulty_weight_clamp_min = float(args.get("difficulty_weight_clamp_min", 0.3))
+        self.difficulty_weight_clamp_max = float(args.get("difficulty_weight_clamp_max", 3.0))
+
         self.prev_v_ineq = None
         self.prev_v_eq = None
         if args["penalty"] == "Single":
@@ -107,6 +115,32 @@ class PrimalDualTrainer():
         self.max_violation_save_thresholds = args["max_violation_save_thresholds"]  
         self.early_stopping_patience = args["early_stopping_patience"]
         self.X = data.X.to(self.DTYPE).to(self.DEVICE)
+
+        if self.args.get("use_topology_features", False):
+            topo_features = self.build_topology_features(self.X)
+            self.X = torch.cat([self.X, topo_features], dim=1) #  [BS, N+G+2*N]
+            self.data.xdim += topo_features.shape[1]           #   X dim = N+G+2*N = 3N+G 
+            print(f"Added topology features: {topo_features.shape[1]}")
+            print(f"Topo features sample 0: {topo_features[10]}")
+
+            topo_min = topo_features.min(dim=0).values
+            topo_max = topo_features.max(dim=0).values
+            topo_mean = topo_features.mean(dim=0)
+            topo_std = topo_features.std(dim=0)
+
+            print("\n=== Topology feature statistics ===")
+            for i in range(topo_features.shape[1]):
+                print(
+                    f"topo_feature_{i:02d}: "
+                    f"min={topo_min[i].item():.6f}, "
+                    f"max={topo_max[i].item():.6f}, "
+                    f"mean={topo_mean[i].item():.6f}, "
+                    f"std={topo_std[i].item():.6f}"
+                )
+            print(f"New X dim: {self.data.xdim}")
+
+
+
         self.loss_option = args.get("loss_option", "Original")
        
         self.dual_regularization = args.get("dual_regularization", "NA")
@@ -202,8 +236,6 @@ class PrimalDualTrainer():
         elif self.problem_type == "ED":
             self.primal_loss_fn = self.primal_loss
             #! PrimalNetEndToEnd takes into account whether repairs are used or not.
-            # print(f"Data xdim: {data.xdim}, layer: {args['n_layers']} hidden size factro : {args['hidden_size_factor']} hid size: {[int(args['hidden_size_factor']*data.xdim)] * args['n_layers']}")
-            # print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
             self.primal_net = PrimalNetEndToEnd(self.args, self.data).to(dtype=self.DTYPE, device=self.DEVICE)
             
             if self.args["dual_alternate_loss"]:
@@ -227,6 +259,10 @@ class PrimalDualTrainer():
         elif self.problem_type == "GEP":
             # TODO: Implement GEP networks
             pass
+
+        print(f"DUal Net Architecture ===== ")
+        print(self.dual_net)
+
         self.primal_net.to(self.DTYPE).to(self.DEVICE)
         self.primal_optim = torch.optim.Adam(self.primal_net.parameters(), lr=self.primal_lr)
         self.dual_optim = torch.optim.Adam(self.dual_net.parameters(), lr=self.dual_lr)
@@ -281,13 +317,19 @@ class PrimalDualTrainer():
         # Fit the scalers:
         if args.get("normalize") == "z_score":
             with torch.no_grad():
-                Xtr = self.X_train  # [B, N+G]
+                Xtr = self.X_train
 
-            d = Xtr[:, :self.data.num_n]
-            p = Xtr[:, self.data.num_n:self.data.num_n + self.data.num_g]
+            n = self.data.num_n
+            g = self.data.num_g
+
+            d = Xtr[:, :n]
+            p = Xtr[:, n:n + g]
+            cover = Xtr[:, n + g:n + g + n]
+            export = Xtr[:, n + g + n:n + g + 2 * n]
 
             d_mean = d.mean(dim=0)
             d_std  = d.std(dim=0).clamp_min(1e-8)
+
             p_mean = p.mean(dim=0)
             p_std  = p.std(dim=0).clamp_min(1e-8)
 
@@ -295,15 +337,95 @@ class PrimalDualTrainer():
             self.primal_net.d_std.copy_(d_std)
             self.primal_net.p_mean.copy_(p_mean)
             self.primal_net.p_std.copy_(p_std)
-        
+
             self.dual_net.d_mean.copy_(d_mean)
             self.dual_net.d_std.copy_(d_std)
             self.dual_net.p_mean.copy_(p_mean)
             self.dual_net.p_std.copy_(p_std)
 
-            print(f"Computed and set normalization stats in trainer.")
+            if cover.shape[1] == n:
+                cover_mean = cover.mean(dim=0)
+                cover_std  = cover.std(dim=0).clamp_min(1e-8)
+
+                if hasattr(self.dual_net, "cover_mean"):
+                    self.dual_net.cover_mean.copy_(cover_mean)
+                    self.dual_net.cover_std.copy_(cover_std)
+
+            if export.shape[1] == n:
+                export_mean = export.mean(dim=0)
+                export_std  = export.std(dim=0).clamp_min(1e-8)
+
+                if hasattr(self.dual_net, "export_mean"):
+                    self.dual_net.export_mean.copy_(export_mean)
+                    self.dual_net.export_std.copy_(export_std)
+
+            print("Computed and set normalization stats.")
             print(f"D mean: {d_mean}, D std: {d_std}")
             print(f"P mean: {p_mean}, P std: {p_std}")
+            if cover.shape[1] == n:
+                print(f"Cover mean: {cover_mean}, Cover std: {cover_std}")
+            if export.shape[1] == n:
+                print(f"Export mean: {export_mean}, Export std: {export_std}")
+
+    def build_topology_features(self, X):
+        """
+        local surplus = local capacity - demand 
+        Add two topology-aware features per node:
+        1. cover ratio:
+        (local capacity + import capacity) / demand
+
+        2. bounded export pressure:
+        local surplus / (local surplus + export capacity)
+
+        Returns:
+            topo_features: [B, 2 * num_n]
+        """
+        D = X[:, :self.data.num_n]  # [B, N]
+        Pmax = X[:, self.data.num_n:self.data.num_n + self.data.num_g]  # [B, G]
+
+        node_to_gen = self.data.node_to_gen_mask.to(X.device).to(X.dtype)  # [N, G]
+        line_mask = self.data.lineflow_mask.to(X.device).to(X.dtype)       # [N, L]
+
+        # Local generation capacity at each node
+        local_capacity = Pmax @ node_to_gen.T  # [B, N]
+
+        # Directed transmission masks
+        import_mask = (line_mask == 1).to(X.dtype)    # [N, L]
+        export_mask = (line_mask == -1).to(X.dtype)   # [N, L]
+
+        F_imp = torch.tensor(
+            [self.data.pImpCap[l] for l in self.data.L],
+            dtype=X.dtype,
+            device=X.device,
+        )
+
+        F_exp = torch.tensor(
+            [self.data.pExpCap[l] for l in self.data.L],
+            dtype=X.dtype,
+            device=X.device,
+        )
+
+        import_capacity = (import_mask @ F_imp).unsqueeze(0)  # [1, N]
+        export_capacity = (export_mask @ F_exp).unsqueeze(0)  # [1, N]
+
+        eps = float(self.args.get("topology_feature_eps", 1e-8))
+
+        # Feature 1: theoretical local + import supply coverage
+        cover_ratio = (local_capacity + import_capacity) / (D + eps)
+
+        # Feature 2: bounded export pressure, avoids explosion when export_capacity = 0
+        surplus = torch.relu(local_capacity - D)
+        export_ratio = surplus / (surplus + export_capacity + eps)
+
+        topo_features = torch.cat(
+            [
+                cover_ratio,
+                export_ratio,
+            ],
+            dim=1,
+        )  # [B, 2N]
+
+        return topo_features
 
     def freeze(self, network):
         """
@@ -330,6 +452,41 @@ class PrimalDualTrainer():
         
         return frozen_net
     
+    def compute_input_difficulty(self, X):
+        """
+        Heuristic per-sample difficulty score from input alone.
+        Higher score = harder sample = larger expected dual gap.
+        
+        Uses max local imbalance max of (Demand - local supper / Demand)
+  
+        """
+   
+        D_n = X[:, :self.data.num_n]                              # [B, N]
+        p_g_max = X[:, self.data.num_n:self.data.num_n + self.data.num_g]   # [B, G]
+        
+        total_demand = D_n.sum(dim=1)                         # [B]
+        total_capacity = p_g_max.sum(dim=1)                   # [B]
+        
+        return total_capacity / (total_demand + 1e-8)
+    
+    # def compute_input_difficulty(self, X):
+
+    #     X = X
+    #     D_n = X[:, :self.data.num_n]
+    #     p_g_max = X[:, self.data.num_n:self.data.num_n + self.data.num_g]
+        
+    #     # Identify renewable generator indices from data.G
+    #     renewable_techs = {"WindOff", "WindOn", "SunPV"}
+    #     renewable_idx = [
+    #         i for i, (_, tech) in enumerate(self.data.G)
+    #         if tech in renewable_techs
+    #     ]
+        
+    #     total_demand = D_n.sum(dim=1)
+    #     renewable_capacity = p_g_max[:, renewable_idx].sum(dim=1)
+        
+    #     return renewable_capacity / (total_demand + 1e-8)
+        
 
     def snap_lambda_to_class_indices(self, lamb_true):
         """
@@ -452,7 +609,7 @@ class PrimalDualTrainer():
                         self.primal_net.eval()
                         frozen_dual_net.eval()
                         # print(f"In eval the primal net p and d are: {self.primal_net.p_mean}, {self.primal_net.d_mean}")
-                        # obj_val_mean, primal_obj_val_mean ,val_loss_mean, ineq_max, ineq_mean, eq_max, eq_mean, dual_obj_val_mean, dual_loss_mean = self.evaluate(self.valid_dataset.tensors[0], self.valid_dataset.tensors[1], self.primal_net, self.dual_net, self.valid_dataset.tensors[2])  
+                        
                         obj_val_mean, primal_obj_val_mean ,val_loss_mean, ineq_max, ineq_mean, eq_max, eq_mean, dual_obj_val_mean, dual_loss_mean = self.evaluate(
                             self.valid_dataset.tensors[0],
                             self.valid_dataset.tensors[1],
@@ -460,6 +617,7 @@ class PrimalDualTrainer():
                             self.dual_net,
                             self.valid_dataset.tensors[2],
                             lamb_true=self.valid_dataset.tensors[4],
+                            print_diff_weighting= False,
                         ) 
                         if k > 0:
                             self.save_if_best(obj_val_mean, ineq_max, ineq_mean, eq_max, eq_mean, dual_obj_val_mean)
@@ -523,6 +681,9 @@ class PrimalDualTrainer():
                         else:
                             mu, lamb = self.dual_net(Xtrain)
                         # print(lamb.mean(), lamb.max(), lamb.min())
+                        unique_vals = torch.unique(lamb)
+                        # print("[DEBUG] Unique lambda values:", unique_vals)
+                        # print("[DEBUG] Expected classes:    ", self.dual_net.classes)
                         if self.args["learn_primal"]:
                             with torch.no_grad():
                                 if self.dual_regularization == "S3L":
@@ -542,11 +703,12 @@ class PrimalDualTrainer():
                                 lamb=lamb,
                                 lamb_true=lamb_true_batch,
                             )
-                            obj = torch.zeros_like(batch_loss)
+                            obj = self.data.dual_obj_fn(Xtrain, mu, lamb).detach()
                             lagrange_eq = torch.zeros_like(batch_loss)
                             lagrange_ineq = torch.zeros_like(batch_loss)
                             penalty = torch.zeros_like(batch_loss)
                         else:
+            
                             batch_loss, obj, lagrange_eq, lagrange_ineq, penalty = self.dual_loss_fn(
                                 X=Xtrain,
                                 y=y,
@@ -569,34 +731,55 @@ class PrimalDualTrainer():
                         total_lagrange_ineq += lagrange_ineq.item()
                         total_penalty += penalty.item()
 
+          
+
                         batch_loss.backward()
+                        # output_layer = self.dual_net.feed_forward.net[-1]  # last Linear
+                        #print("[DEBUG] Output layer grad norm:", output_layer.weight.grad.norm().item())
 
                         self.dual_optim.step()
                         compute_end_time = time.time()
                         self.train_time += compute_end_time - compute_begin_time
 
-                        total_train_loss += batch_loss.item()
                         num_batches += 1
                     
-                    if self.logger and self.log_frequency > 0 and self.step % self.log_frequency == 0:
-                        with torch.no_grad():
-                            # Logg training loss:
-                            # Compute average loss for the epoch
-                            avg_train_loss = total_train_loss / num_batches
-                            avg_obj = total_obj / num_batches
-                            avg_lagrange_eq = total_lagrange_eq / num_batches
-                            avg_lagrange_ineq = total_lagrange_ineq / num_batches
-                            avg_penalty = total_penalty / num_batches
+                if self.logger and self.log_frequency > 0 and self.step % self.log_frequency == 0:
+                    with torch.no_grad():
+                        # Logg training loss:
+                        # Compute average loss for the epoch
+                        avg_train_loss = total_train_loss / num_batches
+                        avg_obj = total_obj / num_batches
+                        avg_lagrange_eq = total_lagrange_eq / num_batches
+                        avg_lagrange_ineq = total_lagrange_ineq / num_batches
+                        avg_penalty = total_penalty / num_batches
 
+                        if self.args.get("entropy_in_loss", False):
+                            print(
+                                f"[Dual entropy train] "
+                                f"outer={k}, inner={l}, step={self.step} | "
+                                f"total_loss={avg_train_loss:.6f} | "
+                                f"dual_obj={avg_obj:.6f} | "
+                                f"raw_dual_loss={avg_lagrange_eq:.6f} | "
+                                f"entropy={avg_lagrange_ineq:.6f} | "
+                                f"entropy_term={avg_penalty:.6f}"
+                            )
 
-                            self.logger.log_dual_loss(avg_train_loss, self.step, avg_obj, avg_lagrange_eq, avg_lagrange_ineq, avg_penalty)
-                            self.logger.log_train(self.data, primal_net=self.primal_net, dual_net=self.dual_net, rho=self.rho, step=self.step)
+                        else:
+                            print(
+                                f"[Dual train] "
+                                f"outer={k}, inner={l}, step={self.step} | "
+                                f"total_loss={avg_train_loss:.6f} | "
+                                f"dual_obj={avg_obj:.6f}"
+                            )
+
+                        self.logger.log_dual_loss(avg_train_loss, self.step, avg_obj, avg_lagrange_eq, avg_lagrange_ineq, avg_penalty)
+                        self.logger.log_train(self.data, primal_net=self.primal_net, dual_net=self.dual_net, rho=self.rho, step=self.step)
                     
                     # Evaluate validation loss every epoch, and update learning rate
                     with torch.no_grad():
                         self.primal_net.eval()
                         self.dual_net.eval()
-                        # obj_val_mean, primal_obj_val_mean, val_loss_mean, ineq_max, ineq_mean, eq_max, eq_mean, dual_obj_val_mean, dual_loss_mean = self.evaluate(self.valid_dataset.tensors[0], self.valid_dataset.tensors[1], self.primal_net, self.dual_net, self.valid_dataset.tensors[2])    
+                        
 
                         obj_val_mean, primal_obj_val_mean ,val_loss_mean, ineq_max, ineq_mean, eq_max, eq_mean, dual_obj_val_mean, dual_loss_mean = self.evaluate(
                             self.valid_dataset.tensors[0],
@@ -605,6 +788,7 @@ class PrimalDualTrainer():
                             self.dual_net,
                             self.valid_dataset.tensors[2],
                             lamb_true=self.valid_dataset.tensors[4],
+                            print_diff_weighting= True,
                         ) 
                         # Early stopper also checks whether the dual loss is better than the best seen so far.
                         if self.dual_early_stopping.step(dual_loss_mean):
@@ -676,14 +860,23 @@ class PrimalDualTrainer():
             else:
                 print(f"Epoch {k} done. Time taken: {end_time - begin_time}. Primal LR: {self.primal_optim.param_groups[0]['lr']}, Dual LR: {self.dual_optim.param_groups[0]['lr']}")
             print("-----------------------------------------")
-            print(f"[S3L] mu_barrier Has eolved to: {self.old_mu:.6f} -> {self.mu_barrier:.6f}")
 
             if self.args.get("dual_gumbel", False) and hasattr(self.dual_net, 'tau'):
                 old_tau = self.dual_net.tau
-                self.dual_net.tau = max(0.1, self.dual_net.tau * 0.95)  # anneal toward 0.1
+                self.dual_net.tau = max(
+                    self.gumbel_tau_min,
+                    self.dual_net.tau * self.gumbel_tau_decay,
+                )
                 print(f"[Gumbel] tau: {old_tau:.3f} -> {self.dual_net.tau:.3f}")
 
-            self.old_mu = self.mu_barrier
+
+            if self.dual_regularization == "S3L":
+                print(
+                    f"[S3L] mu_barrier: {self.old_mu:.6g} -> {self.mu_barrier:.6g} "
+                    f"| decay={self.mu_barrier_decay} | min={self.mu_barrier_min}"
+                )
+
+                self.old_mu = self.mu_barrier
 
             if self.args["learn_primal"]:
                 # Update rho from the second iteration onward.
@@ -760,11 +953,14 @@ class PrimalDualTrainer():
         #     # Update the best overall dual objective
         #     self.best_dual_obj = dual_obj_val_mean
 
-    def evaluate(self, X, total_demands, primal_net, dual_net, X_Opt, lamb_true=None, outer_iter=None, inner_iter=None):    
+    def evaluate(self, X, total_demands, primal_net, dual_net, X_Opt, lamb_true=None, outer_iter=None, inner_iter=None, print_diff_weighting = False):    
         # Forward pass through networks
         Y = primal_net(X, total_demands)
 
-        mu, lamb = dual_net(X)
+        if self.dual_regularization == "S3L":
+            mu, lamb = dual_net(X, mu=self.mu_barrier)
+        else:
+            mu, lamb = dual_net(X)
 
         ineq_dist = self.data.ineq_dist(X, Y)
         eq_resid = self.data.eq_resid(X, Y)
@@ -772,50 +968,51 @@ class PrimalDualTrainer():
         # Convert lists to arrays for easier handling
         obj_values = self.data.obj_fn(X, Y).detach()
         primal_losses, primal_obj, lagrange_eq, lagrange_ineq, penalty = self.primal_loss_fn(X, Y, mu, lamb, X_Opt)
-        # dual_losses, dual_obj, dual_lagrange_eq, dual_lagrange_ineq, dual_penalty = self.alternate_dual_loss(X, Y, mu, lamb, X_Opt)
-
-
-        # dual_losses, dual_obj, dual_lagrange_eq, dual_lagrange_ineq, dual_penalty = self.alternate_dual_loss(
-        #     X, Y, mu, lamb, X_Opt, lamb_true=lamb_true
-        # )
-
 
         if self.args.get("oracle_supervised_dual", False):
-            dual_losses, _ = self.oracle_supervised_dual_loss(
+            dual_losses, target_idx = self.oracle_supervised_dual_loss(
                 X=X,
                 mu=mu,
                 lamb=lamb,
                 lamb_true=lamb_true,
             )
             dual_obj = self.data.dual_obj_fn(X, mu, lamb).detach()
-            dual_lagrange_eq = torch.zeros_like(dual_losses)
-            dual_lagrange_ineq = torch.zeros_like(dual_losses)
-            dual_penalty = torch.zeros_like(dual_losses)
         else:
-            dual_losses, dual_obj, dual_lagrange_eq, dual_lagrange_ineq, dual_penalty = self.alternate_dual_loss(
+            dual_losses, dual_obj, raw_dual_loss, entropy, entropy_term = self.alternate_dual_loss(
                 X, Y, mu, lamb, X_Opt, lamb_true=lamb_true
             )
 
         primal_losses = primal_losses.detach()
         dual_losses = dual_losses.detach()
-        ineq_max_vals = torch.max(ineq_dist, dim=1)[0].detach() # First element is the max, second is the index
+        ineq_max_vals = torch.max(ineq_dist, dim=1)[0].detach()
         ineq_mean_vals = torch.mean(ineq_dist, dim=1).detach()
-        eq_max_vals = torch.max(torch.abs(eq_resid), dim=1)[0].detach() # First element is the max, second is the index
+        eq_max_vals = torch.max(torch.abs(eq_resid), dim=1)[0].detach()
         eq_mean_vals = torch.mean(torch.abs(eq_resid), dim=1).detach()
 
-        # eval_df = pd.DataFrame({
-        #     "outer_iter": outer_iter,
-        #     "inner_iter": inner_iter,
-        #     "objective": obj_values.cpu().numpy(),
-        #     "primal_loss": primal_losses.cpu().numpy(),
-        #     "dual_loss": dual_losses.cpu().numpy(),
-        #     "ineq_mean": ineq_mean_vals.cpu().numpy(),
-        #     "eq_mean": eq_mean_vals.cpu().numpy(),
-        # })
-
-        # csv_path = os.path.join(self.save_dir, "eval_metrics.csv")
-        # write_header = not os.path.exists(csv_path)
-        # eval_df.to_csv(csv_path, mode="a", index=False, header=write_header)
+        # === Difficulty-stratified dual gap diagnostic ===
+        if self.use_difficulty_weighting and print_diff_weighting:
+            with torch.no_grad():
+                # Compute target dual obj for per-sample gap calculation
+                # X here is validation X. The valid_indices align with valid_dataset.
+                # Need target mu/lamb — pull from opt_targets using current indices.
+                # If X is the full valid set, this works:
+                if X.shape[0] == len(self.valid_indices):
+                    target_mu = self.data.opt_targets["mu_operational"].to(self.DTYPE).to(self.DEVICE)[self.valid_indices]
+                    target_lamb = self.data.opt_targets["lamb_operational"].to(self.DTYPE).to(self.DEVICE)[self.valid_indices]
+                    dual_obj_target = self.data.dual_obj_fn(X, target_mu, target_lamb).detach()
+                    
+                    dual_gap_per_sample = (dual_obj_target - dual_obj).abs() / (dual_obj_target.abs() + 1e-8) * 100
+                    
+                    difficulty = self.compute_input_difficulty(X)
+                    top_mask = difficulty > difficulty.quantile(0.9)
+                    bot_mask = difficulty < difficulty.quantile(0.1)
+                    
+                    print(f"[Diff-stratified] Dual gap | "
+                        f"top-10% diff: {dual_gap_per_sample[top_mask].mean():.2f}% "
+                        f"({top_mask.sum().item()} samples, "
+                        f"diff range: [{difficulty[top_mask].min():.2f}, {difficulty[top_mask].max():.2f}]) | "
+                        f"bot-10% diff: {dual_gap_per_sample[bot_mask].mean():.2f}% "
+                        f"({bot_mask.sum().item()} samples)")
 
         return torch.mean(obj_values), torch.mean(primal_obj), torch.mean(primal_losses), torch.mean(ineq_max_vals), torch.mean(ineq_mean_vals), torch.mean(eq_max_vals), torch.mean(eq_mean_vals), torch.mean(dual_obj), torch.mean(dual_losses)
 
@@ -949,11 +1146,48 @@ class PrimalDualTrainer():
         # print(f"Dual loss: {loss.mean().item()} Normalized {((X_opt - loss)/X_opt).mean().item()}")
         return loss, torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0)
     
+    def lambda_entropy_loss(self, X):
+        """
+        Entropy regularization for lambda classification.
+
+        Returns:
+            entropy_per_sample: Tensor of shape [batch_size]
+
+        Low entropy means sharp / confident class assignment.
+        High entropy means uncertain soft mixture.
+        """
+        if not isinstance(self.dual_net, DualClassificationNetEndToEnd):
+            return torch.zeros(X.shape[0], dtype=X.dtype, device=X.device)
+
+        probs = self.dual_net.get_lambda_probs(X)  # [B, neq, C]
+
+        eps = 1e-12
+        entropy_per_node = -(probs * torch.log(probs + eps)).sum(dim=-1)  # [B, neq]
+
+        # Average across lambda variables/nodes, giving one entropy value per sample
+        entropy_per_sample = entropy_per_node.mean(dim=1)  # [B]
+
+        return entropy_per_sample
+    
     def alternate_dual_loss(self, X, y, mu, lamb, X_opt ,mu_k=None, lamb_k=None, lamb_true = None):
         #! We maximize the dual obj func, so to use it in the loss, take the negation.
         dual_obj = self.data.dual_obj_fn(X, mu, lamb)
 
         loss = -dual_obj
+
+        if self.use_difficulty_weighting:
+            with torch.no_grad():
+                difficulty = self.compute_input_difficulty(X)
+                # Normalize to mean 1, scale, then clamp
+                weights = difficulty / (difficulty.mean() + 1e-8)
+                weights = 1.0 + self.difficulty_weight_scale * (weights - 1.0)
+                weights = weights.clamp(
+                    min=self.difficulty_weight_clamp_min,
+                    max=self.difficulty_weight_clamp_max,
+                )
+            loss = loss * weights
+
+
         barrier_term = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
         if self.dual_regularization == "S3L" and self.mu_barrier > 0:
             
@@ -968,7 +1202,8 @@ class PrimalDualTrainer():
             # subtracting the barrier = adding it to the objective).
             barrier_term = -self.mu_barrier * log_barrier_mu  # [batch]
             loss = loss + barrier_term
- 
+        
+
 
         if self.loss_option == "Norm_GT":
             loss = loss / X_opt
@@ -990,6 +1225,15 @@ class PrimalDualTrainer():
             weights = self.compute_oracle_loss_weights(lamb_true)
             loss = loss * weights
         #! Dual constraints are never violated, so we do not include penalty and lagrangian terms.
+
+        if self.args.get("entropy_in_loss", False):
+            # Add entropy to regularize and pushes model to pick one of the discrete classes, instead of a mixture.
+            raw_dual_loss = loss
+            entropy = self.lambda_entropy_loss(X)  # [B]
+            entropy_weight = float(self.args.get("entropy_weight", 0.01))
+            entropy_term = entropy_weight * entropy
+            loss = loss + entropy_term
+            return loss, dual_obj, raw_dual_loss, entropy, entropy_term
         return loss, dual_obj, torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0)
 
     def compute_oracle_loss_weights(self, lamb_true):
@@ -1062,7 +1306,10 @@ class PrimalDualTrainer():
         # Forward pass through networks
         Y = primal_net(X, total_demands)
 
-        mu, lamb = dual_net(X)
+        if self.dual_regularization == "S3L":
+            mu, lamb = dual_net(X, mu=self.mu_barrier)
+        else:
+            mu, lamb = dual_net(X)
 
         ineq_dist = self.data.ineq_dist(X, Y)
         eq_resid = self.data.eq_resid(X, Y)

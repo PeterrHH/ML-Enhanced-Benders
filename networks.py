@@ -95,6 +95,16 @@ class DualNet(nn.Module):
             self.register_buffer("p_mean", torch.zeros(G, dtype=self.DTYPE))
             self.register_buffer("p_std",  torch.ones(G, dtype=self.DTYPE))
 
+            topo_dim = max(0, data.xdim - data.num_n - data.num_g)
+
+        if topo_dim >= data.num_n:
+            self.register_buffer("cover_mean", torch.zeros(data.num_n, dtype=self.DTYPE))
+            self.register_buffer("cover_std",  torch.ones(data.num_n, dtype=self.DTYPE))
+
+        if topo_dim >= 2 * data.num_n:
+            self.register_buffer("export_mean", torch.zeros(data.num_n, dtype=self.DTYPE))
+            self.register_buffer("export_std",  torch.ones(data.num_n, dtype=self.DTYPE))
+
     
     def forward(self, x, *args):
         # print(f"DualNet input x shape: {x.shape} 0: {x[0,:]}")
@@ -447,14 +457,33 @@ class PrimalNetEndToEnd(nn.Module):
 
     def scale(self, x):
         if self.normalize == "z_score":
-            d = x[:, :self.data.num_n]
-            p = x[:, self.data.num_n:self.data.num_n + self.data.num_g]
+            n = self.data.num_n
+            g = self.data.num_g
+
+            d = x[:, :n]
+            p = x[:, n:n + g]
+
+            # topology features, if present
+            cover = x[:, n + g:n + g + n]
+            export = x[:, n + g + n:n + g + 2 * n]
 
             d = (d - self.d_mean) / self.d_std
             p = (p - self.p_mean) / self.p_std
-            x_scale = torch.cat([d, p], dim=1)
+
+            parts = [d, p]
+
+            if cover.shape[1] > 0:
+                cover = (cover - self.cover_mean) / self.cover_std
+                parts.append(cover)
+
+            if export.shape[1] > 0:
+                export = (export - self.export_mean) / self.export_std
+                parts.append(export)
+
+            x_scale = torch.cat(parts, dim=1)
         else:
             x_scale = x
+
         return x_scale
     
     def inverse_scale(self, p, f):
@@ -693,6 +722,7 @@ class DualNetEndToEnd(nn.Module):
             self.register_buffer("p_mean", torch.zeros(G, dtype=self.DTYPE))
             self.register_buffer("p_std",  torch.ones(G, dtype=self.DTYPE))
 
+        self.classes = -1 * torch.concat([self.data.cost_vec.unique(), torch.tensor([self.data.pVOLL])])
 
         #! Only predict lambda, we infer mu from it.
         self.feed_forward = FeedForwardNet(args, data.xdim, self.hidden_sizes, output_dim=self.out_dim, layernorm=True).to(self.DTYPE).to(self.DEVICE)
@@ -704,18 +734,68 @@ class DualNetEndToEnd(nn.Module):
             [data.pExpCap[l] for l in data.L], dtype=self.DTYPE
         ))
 
-    
+
+        topo_dim = max(0, data.xdim - data.num_n - data.num_g)
+
+        if topo_dim >= data.num_n:
+            self.register_buffer("cover_mean", torch.zeros(data.num_n, dtype=self.DTYPE))
+            self.register_buffer("cover_std",  torch.ones(data.num_n, dtype=self.DTYPE))
+
+        if topo_dim >= 2 * data.num_n:
+            self.register_buffer("export_mean", torch.zeros(data.num_n, dtype=self.DTYPE))
+            self.register_buffer("export_std",  torch.ones(data.num_n, dtype=self.DTYPE))
+            
+    def snap_lambda_to_nearest_class(self, lamb):
+        """
+        Snap continuous lambda values to nearest valid lambdaclass.
+
+        Args:
+            lamb: Tensor [B, neq]
+
+        Returns:
+            snapped_lamb: Tensor [B, neq]
+            class_idx: Tensor [B, neq]
+        """
+        classes = self.classes.to(device=lamb.device, dtype=lamb.dtype)  # [C]
+
+        dists = torch.abs(
+            lamb.unsqueeze(-1) - classes.view(1, 1, -1)
+        )  # [B, neq, C]
+
+        class_idx = torch.argmin(dists, dim=-1)  # [B, neq]
+        snapped_lamb = classes[class_idx]        # [B, neq]
+
+        return snapped_lamb, class_idx
     
     def scale(self, x):
         if self.normalize == "z_score":
-            d = x[:, :self.data.n_md_vars]
-            p = x[:, self.data.n_md_vars:]
+            n = self.data.num_n
+            g = self.data.num_g
+
+            d = x[:, :n]
+            p = x[:, n:n + g]
+
+            # topology features, if present
+            cover = x[:, n + g:n + g + n]
+            export = x[:, n + g + n:n + g + 2 * n]
 
             d = (d - self.d_mean) / self.d_std
             p = (p - self.p_mean) / self.p_std
-            x_scale = torch.cat([d, p], dim=1)
+
+            parts = [d, p]
+
+            if cover.shape[1] > 0:
+                cover = (cover - self.cover_mean) / self.cover_std
+                parts.append(cover)
+
+            if export.shape[1] > 0:
+                export = (export - self.export_mean) / self.export_std
+                parts.append(export)
+
+            x_scale = torch.cat(parts, dim=1)
         else:
             x_scale = x
+
         return x_scale
     
     def complete_duals(self, lamb):
@@ -818,26 +898,53 @@ class DualNetEndToEnd(nn.Module):
         return out_mu
     
         
-    def forward(self, x, mu = None):
+    # def forward(self, x, mu = None):
+    #     x_raw = x
+    #     if self.normalize:
+    #         x = self.scale(x)
+
+        
+    #     out_lamb = self.feed_forward(x)
+
+    #     if self.args.get("clamp_lambda", False):
+    #         lambda_min = -float(self.data.pVOLL)                    # -10.0
+    #         lambda_max = -float(self.data.cost_vec.min().item())    # -0.0001
+    #         out_lamb = lambda_min + (lambda_max - lambda_min) * torch.sigmoid(out_lamb)
+
+    #     if self.args.get("dual_regularization", "NA") == "S3L" and mu is not None:
+    #         out_mu = self.complete_duals_smooth(out_lamb, x_raw, mu_barrier=mu)
+    #     else:
+    #         out_mu = self.complete_duals(out_lamb)
+    #     # print(out_lamb)
+    #     return out_mu, out_lamb
+    
+    def forward(self, x, mu=None):
         x_raw = x
+
         if self.normalize:
             x = self.scale(x)
 
-        
+        # Continuous lambda prediction
         out_lamb = self.feed_forward(x)
 
-        if self.args.get("clamp_lambda", False):
-            lambda_min = -float(self.data.pVOLL)                    # -10.0
-            lambda_max = -float(self.data.cost_vec.min().item())    # -0.0001
+        # Optional: keep lambda inside valid economic range [-VOLL, -min_cost]
+        if self.args.get("snap_lambda_dual_completion", False):
+            lambda_min = -float(self.data.pVOLL)                    # e.g. -10.0
+            lambda_max = -float(self.data.cost_vec.min().item())    # e.g. -0.0001
             out_lamb = lambda_min + (lambda_max - lambda_min) * torch.sigmoid(out_lamb)
 
-        if self.args.get("dual_regularization", "NA") == "S3L" and mu is not None:
+        # Training: keep continuous lambda.
+        # Eval/inference: optionally snap to nearest valid lambda class.
+        if self.args.get("snap_lambda_dual_completion", False) and not self.training:
+            out_lamb, _ = self.snap_lambda_to_nearest_class(out_lamb)
+
+        # Complete mu from lambda
+        if self.args.get("dual_regularization", "NA") in ("S3L", "S3L-complete-only") and mu is not None:
             out_mu = self.complete_duals_smooth(out_lamb, x_raw, mu_barrier=mu)
         else:
             out_mu = self.complete_duals(out_lamb)
-        # print(out_lamb)
+
         return out_mu, out_lamb
-    
 
 
 
@@ -876,6 +983,16 @@ class DualClassificationNetEndToEnd(nn.Module):
             self.register_buffer("p_mean", torch.zeros(G, dtype=self.DTYPE))
             self.register_buffer("p_std",  torch.ones(G, dtype=self.DTYPE))
 
+            topo_dim = max(0, data.xdim - data.num_n - data.num_g)
+
+            if topo_dim >= data.num_n:
+                self.register_buffer("cover_mean", torch.zeros(data.num_n, dtype=self.DTYPE))
+                self.register_buffer("cover_std",  torch.ones(data.num_n, dtype=self.DTYPE))
+
+            if topo_dim >= 2 * data.num_n:
+                self.register_buffer("export_mean", torch.zeros(data.num_n, dtype=self.DTYPE))
+                self.register_buffer("export_std",  torch.ones(data.num_n, dtype=self.DTYPE))
+
         #! Only predict lambda, we infer mu from it.
         #! Softmax requires layer norm.
         if args.get("SeperatePredicationHead", False):
@@ -898,18 +1015,37 @@ class DualClassificationNetEndToEnd(nn.Module):
             [data.pExpCap[l] for l in data.L], dtype=self.DTYPE
         ))
 
-        self.tau = 1.0
+        self.tau = float(args.get("gumbel_tau_init", 1.0))
             
     def scale(self, x):
         if self.normalize == "z_score":
-            d = x[:, :self.data.num_n]
-            p = x[:, self.data.num_n:]
+            n = self.data.num_n
+            g = self.data.num_g
+
+            d = x[:, :n]
+            p = x[:, n:n + g]
+
+            # topology features, if present
+            cover = x[:, n + g:n + g + n]
+            export = x[:, n + g + n:n + g + 2 * n]
 
             d = (d - self.d_mean) / self.d_std
             p = (p - self.p_mean) / self.p_std
-            x_scale = torch.cat([d, p], dim=1)
+
+            parts = [d, p]
+
+            if cover.shape[1] > 0:
+                cover = (cover - self.cover_mean) / self.cover_std
+                parts.append(cover)
+
+            if export.shape[1] > 0:
+                export = (export - self.export_mean) / self.export_std
+                parts.append(export)
+
+            x_scale = torch.cat(parts, dim=1)
         else:
             x_scale = x
+
         return x_scale
     
     def complete_duals(self, lamb):
@@ -1010,50 +1146,70 @@ class DualClassificationNetEndToEnd(nn.Module):
 
         return out_mu
     
-    def forward(self, x, mu=None):
-        x_raw = x
+    def get_lambda_logits(self, x):
+        """
+        Return raw logits for lambda class prediction.
+
+        Shape:
+            [batch_size, n_dual_vars, n_classes]
+        """
         if self.normalize:
             x = self.scale(x)
-        out_lamb_raw_probas = self.feed_forward(x)
-        out_lamb_raw_probas = out_lamb_raw_probas.view(-1, self.n_dual_vars, self.n_classes)
+
+        logits = self.feed_forward(x)
+        logits = logits.view(-1, self.n_dual_vars, self.n_classes)
+        return logits
+
+
+    def get_lambda_probs(self, x):
+        """
+        Return softmax probabilities over lambda classes.
+
+        Shape:
+            [batch_size, n_dual_vars, n_classes]
+        """
+        logits = self.get_lambda_logits(x)
+        probs = torch.softmax(logits, dim=-1)
+        return probs
+    
+    def forward(self, x, mu=None):
+        # x_raw = x
+        # if self.normalize:
+        #     x = self.scale(x)
+        # out_lamb_raw_probas = self.feed_forward(x)
+        # out_lamb_raw_probas = out_lamb_raw_probas.view(-1, self.n_dual_vars, self.n_classes)
+
+        x_raw = x
+        out_lamb_logits = self.get_lambda_logits(x)
 
         if self.training:
+
             if self.args.get("dual_gumbel", False):
-                # tau = getattr(self, 'tau', 1.0)
-                # y_hard = F.gumbel_softmax(
-                #     out_lamb_raw_probas,
-                #     tau=tau,
-                #     hard=True,
-                #     dim=-1
-                # )
-                # out_lamb = (y_hard * self.classes).sum(dim=-1)
-                gumbel_noise = -torch.log(-torch.log(torch.rand_like(out_lamb_raw_probas) + 1e-20) + 1e-20)
-                noisy_logits = (out_lamb_raw_probas + gumbel_noise) / self.tau
-
-                # Soft probabilities (differentiable)
-                probs = torch.softmax(noisy_logits, dim=-1)
-
-                # Straight-through for hard selection
-                hard_idx = probs.argmax(dim=-1, keepdim=True)
-                y_hard = torch.zeros_like(probs).scatter_(-1, hard_idx, 1.0)
-                st = y_hard - probs.detach() + probs
-
-                out_lamb = (st * self.classes).sum(dim=-1)
-
+                p_soft = F.softmax(out_lamb_logits / self.tau, dim=-1)
+                idx = p_soft.argmax(dim=-1, keepdim=True)
+                p_hard = torch.zeros_like(p_soft).scatter_(-1, idx, 1.0)
+                out_lamb_probas = p_hard + p_soft - p_soft.detach()
+                # Gumbel-softmax sampling for differentiable hard class selection during training
+                # out_lamb_probas = F.gumbel_softmax(out_lamb_logits, tau=self.tau, hard=True, dim=-1)
             else:
-                out_lamb_probas = torch.softmax(out_lamb_raw_probas, dim=-1)
-                out_lamb = torch.sum(out_lamb_probas * self.classes, dim=-1)
+                out_lamb_probas = torch.softmax(out_lamb_logits, dim=-1)
+            out_lamb = torch.sum(
+                out_lamb_probas * self.classes.view(1, 1, -1),
+                dim=-1
+            )
 
-            if self.args.get("dual_regularization", "NA") == "S3L" and mu is not None:
+            if self.args.get("dual_regularization", "NA") in ("S3L", "S3L-complete-only") and mu is not None:
                 out_mu = self.complete_duals_smooth(out_lamb, x_raw, mu_barrier=mu)
             else:
                 out_mu = self.complete_duals(out_lamb)
             return out_mu, out_lamb
 
         else:
-            predicted_class = out_lamb_raw_probas.argmax(dim=-1)
+            predicted_class = out_lamb_logits.argmax(dim=-1)
+
+            # Hard lambda during inference
             out_lamb = self.classes[predicted_class]
-            if self.args.get("dual_regularization", "NA") == "S3L" and mu is not None:
+            if self.args.get("dual_regularization", "NA") in ("S3L", "S3L-complete-only") and mu is not None:
                 out_mu = self.complete_duals_smooth(out_lamb, x_raw, mu_barrier=mu)
             else:
                 out_mu = self.complete_duals(out_lamb)

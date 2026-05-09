@@ -13,7 +13,7 @@ from scipy.stats import qmc
 
 class GEPOperationalProblemSet():
 
-    def __init__(self, args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap):
+    def __init__(self, args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, pUnitInvestment_Input = None):
         
         if args["device"] == "mps":
             self.DTYPE = torch.float32
@@ -78,31 +78,35 @@ class GEPOperationalProblemSet():
         self.ydim = self.n_prod_vars + self.n_line_vars + self.n_md_vars
 
         # Generate unit investment data:
-        if self.ED_args.get("generate_capacity_sobol", False):
-            self.pUnitInvestment = None
+        if pUnitInvestment_Input is not None:
+            print("Using provided unit investment data with shape:", pUnitInvestment_Input.shape)
+            self.pUnitInvestment = pUnitInvestment_Input
         else:
-            if args["ED_args"].get("gen_data_constraint", False):
-                if args["ED_args"].get("gen_data_node_constraint", False):
-                    self.pUnitInvestment = self.generate_ui_data_node_constraint(
-                        m=self.ED_args["2n_synthetic_samples"],
-                        max_inv=self.ED_args["max_investment"],
-                        renewable_ava_percentile=self.args["ED_args"].get("gen_data_renew_availability", 90),
-                    )
-                else:
-                    self.pUnitInvestment = self.generate_ui_data_constraint(
-                        m=self.ED_args["2n_synthetic_samples"],
-                        max_inv=self.ED_args["max_investment"],
-                        lb_activated=self.args["ED_args"].get("gen_data_constraint_lb", False),
-                        alpha=self.args["ED_args"].get("gen_data_constraint_lb_alpha", 0.2),
-                        renewable_lb_zero=self.args["ED_args"].get("gen_data_constraint_lb_renewable_zero", True),
-                        renewable_ub_max_inv=self.args["ED_args"].get("gen_data_constraint_ub_renewable_max_inv", True),
-                        renewable_ava_percentile=self.args["ED_args"].get("gen_data_renew_availability", 100),
-                    )
+            if self.ED_args.get("generate_capacity_sobol", False):
+                self.pUnitInvestment = None
             else:
-                self.pUnitInvestment = self.generate_ui_data(
-                    m=self.ED_args["2n_synthetic_samples"],
-                    max_inv=self.ED_args["max_investment"]
-                )
+                if args["ED_args"].get("gen_data_constraint", False):
+                    if args["ED_args"].get("gen_data_node_constraint", False):
+                        self.pUnitInvestment = self.generate_ui_data_node_constraint(
+                            m=self.ED_args["2n_synthetic_samples"],
+                            max_inv=self.ED_args["max_investment"],
+                            renewable_ava_percentile=self.args["ED_args"].get("gen_data_renew_availability", 90),
+                        )
+                    else:
+                        self.pUnitInvestment = self.generate_ui_data_constraint(
+                            m=self.ED_args["2n_synthetic_samples"],
+                            max_inv=self.ED_args["max_investment"],
+                            lb_activated=self.args["ED_args"].get("gen_data_constraint_lb", False),
+                            alpha=self.args["ED_args"].get("gen_data_constraint_lb_alpha", 0.2),
+                            renewable_lb_zero=self.args["ED_args"].get("gen_data_constraint_lb_renewable_zero", True),
+                            renewable_ub_max_inv=self.args["ED_args"].get("gen_data_constraint_ub_renewable_max_inv", True),
+                            renewable_ava_percentile=self.args["ED_args"].get("gen_data_renew_availability", 100),
+                        )
+                else:
+                    self.pUnitInvestment = self.generate_ui_data(
+                        m=self.ED_args["2n_synthetic_samples"],
+                        max_inv=self.ED_args["max_investment"]
+                    )
 
         # Masks for node balance
         # Initialize mask, to store which generator belong to which node
@@ -188,7 +192,7 @@ class GEPOperationalProblemSet():
         """
         self.capacity_samples = self.generate_capacity_data_constraint(
             m=self.ED_args["2n_synthetic_samples"],
-            beta=self.ED_args.get("gen_data_beta", 1.2),
+            beta=self.ED_args.get("gen_data_beta", 1.0),
         )
 
         X = []
@@ -259,7 +263,10 @@ class GEPOperationalProblemSet():
             hard_cap = float(self.ED_args["max_investment"]) * pmax
 
             lb_g[g_idx] = 0.0
-            ub_g[g_idx] = min(cap_target, hard_cap)
+            if self.ED_args.get("capacity_sobol_use_hard_cap", False):
+                ub_g[g_idx] = min(cap_target, hard_cap)
+            else:
+                ub_g[g_idx] = cap_target
 
         cap_samples = lb_g.unsqueeze(0) + points01 * (ub_g - lb_g).unsqueeze(0)
         cap_samples = torch.clamp(cap_samples, min=lb_g.unsqueeze(0), max=ub_g.unsqueeze(0))
@@ -787,10 +794,18 @@ class GEPOperationalProblemSet():
         return obj_coeff, cost_vec
 
     def split_X(self, X):
-        # demand:
-        eq_rhs = X[:, :self.neq]
-        capacity_ub = X[:, self.neq:]
+        
+        #print(f"NEQ IS {self.neq}, N is {len(self.N)} G is {len(self.G)}")
+        ''' 
+        eq_rhs = X[:,:len(self.N)]
+        capacity_ub = X[:, len(self.N):len(self.N)+len(self.G)]
+        '''
+        # eq_rhs = X[:, :self.neq]
+        # capacity_ub = X[:, self.neq:]
+        eq_rhs = X[:,:len(self.N)]
+        capacity_ub = X[:, len(self.N):len(self.N)+len(self.G)]
         ineq_rhs = self.ineq_rhs.clone().repeat(X.size(0), 1)
+        #print(f"Capacity UB Index: {self.capacity_ub_indices}, Missed Demand UB Index: {self.missed_demand_ub_indices}")
         #! Second |G| constraints are capacity upper bounds.
         ineq_rhs[:, self.capacity_ub_indices] = capacity_ub
         #! Last |N| constraints are demand upper bounds.

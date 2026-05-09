@@ -26,7 +26,7 @@ def scale_dict(data_dict, scale_factor):
     return {key: value * scale_factor for key, value in data_dict.items()}
 
 
-def create_gep_ed_dataset(args, problem_args, inputs, problem_type, save_path):
+def create_gep_ed_dataset(args, problem_args, inputs, problem_type, save_path, pUnitInvestment_Input = None):
     print("Wrangling the input data")
 
     # Extract sets
@@ -123,7 +123,7 @@ def create_gep_ed_dataset(args, problem_args, inputs, problem_type, save_path):
 
     print("Creating problem instance")
     if problem_type == "ED":
-        data = GEPOperationalProblemSet(args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap)
+        data = GEPOperationalProblemSet(args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, pUnitInvestment_Input = pUnitInvestment_Input)
     elif problem_type == "GEP":
         data = GEPProblemSet(problem_args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap)
     
@@ -146,4 +146,4 @@ if __name__ == "__main__":
     ED_args["gen_data_constraint"] = True
     print(f"ED args gen with node cosntraint: {ED_args['gen_data_node_constraint']}")
     data_save_path = (f"data/ED_data/Constraint/3Loc/Test.pkl")
-    data = create_gep_ed_dataset(args=args, problem_args=ED_args, inputs=gep_ed_data, problem_type=args["problem_type"], save_path=data_save_path)
+    data = create_gep_ed_dataset(args=args, problem_args=ED_args, inputs=gep_ed_data, problem_type=args["problem_type"], save_path=data_save_path, pUnitInvestment_Input = None)

@@ -7,15 +7,30 @@ import math
 # =========================
 # Paths
 # =========================
+
+
+import matplotlib.pyplot as plt
+
 DATASETS = {
-    # "D_uniform": "data/ED_data/ED_NB-G-F_GB2-G2-F2_L3_c0_s0_p0_smp15.pkl",
-    "D_CABCap": "data/ED_data/Constraint/3Loc/ED_NB-G-F_GB2-G2-F2_L3_c0_s0_p0_CapSobol_GenConst_ui_constraint1000_smp15_renewMaxInvTrue_NodeConst.pkl",
-    "D_CAB": "data/ED_data/Constraint/3Loc/ED_NB-G-F_GB2-G2-F2_L3_c0_s0_p0_ui_constraint1000_smp15_GenConst_lbFalse_renewMaxInvTrue.pkl",
+    #"D_uniform ": "data/ED_data/ED_NB-G-F_GB2-G2-F2_L3_c0_s0_p0_smp15.pkl",
+    "D_CapacityCAB": "data/ED_data/Constraint/3Loc/ED_NB-G-F_GB2-G2-F2_L3_c0_s0_p0_CapSobol_GenConst_ui_constraint1000_smp15_renewMaxInvTrue.pkl",
+    "D_CapacityCABNoHardCap": "data/ED_data/Constraint/3Loc/ED_NB-G-F_GB2-G2-F2_L3_c0_s0_p0_CapSobolNoHardCap_GenConst_ui_constraint1000_smp15_renewMaxInvTrue.pkl"
+    #"D_CAB": "data/ED_data/Constraint/3Loc/ED_NB-G-F_GB2-G2-F2_L3_c0_s0_p0_ui_constraint1000_smp15_GenConst_lbFalse_renewMaxInvTrue.pkl",
+    
     # "D_CAB-R50": "data/ED_data/Constraint/3Loc/ED_NB-G-F_GB2-G2-F2_L3_c0_s0_p0_ui_constraint10000_smp15_GenConst_lbFalse_renewPerc50.pkl",
     # "D_CAB-R90": "data/ED_data/Constraint/3Loc/ED_NB-G-F_GB2-G2-F2_L3_c0_s0_p0_ui_constraint10000_smp15_GenConst_lbFalse_renewPerc90.pkl",
 }
 
-import matplotlib.pyplot as plt
+def pretty_tech_name(tech):
+    mapping = {
+        "SunPV": "Solar",
+        "WindOff": "WindOff",
+        "WindOn": "WindOn",
+        "Gas": "Gas",
+        "Oil": "Oil",
+        "Nuclear": "Nuclear",
+    }
+    return mapping.get(str(tech), str(tech))
 
 def plot_generator_effective_capacity_grid(
     datasets,
@@ -44,7 +59,7 @@ def plot_generator_effective_capacity_grid(
 
         for g_idx, g in enumerate(data.G):
             ax = axes[g_idx]
-            label = f"{g[0]}-{g[1]}"
+            label = f"{g[0]}-{pretty_tech_name(g[1])}"
             is_ren = is_renewable(g)
 
             vals = E[:, g_idx]
@@ -550,40 +565,43 @@ def plot_node_log_stress_histograms(
 
     plt.show()
 
-# =========================
-# Plot 2x3 grid per dataset
-# =========================
-# plot_generator_effective_capacity_grid(
-#     DATASETS,
-#     bins=80,
-#     density=True,
-#     alpha=0.75,
-#     figsize=(15, 8),
-#     save_dir="figures/generator_effcap_grid_plots",
-# )
 
-# plot_total_demand_histograms(
-#     DATASETS,
-#     bins=60,
-#     density=True,
-#     alpha=0.5,
-#     figsize=(8, 5),
-#     save_path="figures/dataset_demand_and_stress/total_demand_hist.png",
-# )
+if __name__ == "__main__":
 
-plot_node_demand_density_grid(
-    DATASETS,
-    bins=80,
-    density=True,
-    alpha=0.75,
-    save_dir="figures/node_demand_density_plots",
-)
+    # =========================
+    # Plot 2x3 grid per dataset
+    # =========================
+    plot_generator_effective_capacity_grid(
+        DATASETS,
+        bins=80,
+        density=True,
+        alpha=0.75,
+        figsize=(15, 8),
+        save_dir="figures/generator_effcap_grid_plots",
+    )
 
-plot_node_log_stress_histograms(
-    DATASETS,
-    bins=60,
-    density=True,
-    alpha=0.5,
-    figsize=(15, 4),
-    save_path="figures/dataset_demand_and_stress/node_stress_overlayed.png",
-)
+    # plot_total_demand_histograms(
+    #     DATASETS,
+    #     bins=60,
+    #     density=True,
+    #     alpha=0.5,
+    #     figsize=(8, 5),
+    #     save_path="figures/dataset_demand_and_stress/total_demand_hist.png",
+    # )
+
+    # plot_node_demand_density_grid(
+    #     DATASETS,
+    #     bins=80,
+    #     density=True,
+    #     alpha=0.75,
+    #     save_dir="figures/node_demand_density_plots",
+    # )
+
+    # plot_node_log_stress_histograms(
+    #     DATASETS,
+    #     bins=60,
+    #     density=True,
+    #     alpha=0.5,
+    #     figsize=(15, 4),
+    #     save_path="figures/dataset_demand_and_stress/node_stress_overlayed.png",
+    # )

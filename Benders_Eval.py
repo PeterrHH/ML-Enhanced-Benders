@@ -84,10 +84,10 @@ def load_logs(folder: Path) -> Dict[int, pd.DataFrame]:
         else:
             df["t_sub"] = 0.0
 
-        # if "t_iter_wall" in df.columns:
-        #     df["t_iter_wall"] = pd.to_numeric(df["t_iter_wall"], errors="coerce").fillna(df["t_master"] + df["t_sub"])
-        # else:
-        df["t_iter_wall"] = df["t_master"] + df["t_sub"]
+        if "t_iter_wall" in df.columns:
+            df["t_iter_wall"] = pd.to_numeric(df["t_iter_wall"], errors="coerce").fillna(df["t_master"] + df["t_sub"])
+        else:
+            df["t_iter_wall"] = df["t_master"] + df["t_sub"]
 
         df["cum_wall_time"] = df["t_iter_wall"].cumsum()
         df["investment_tuple"] = df["investment"].apply(investment_to_tuple)
@@ -102,161 +102,6 @@ def load_logs(folder: Path) -> Dict[int, pd.DataFrame]:
     return logs
 
 
-def common_prefix_length(a: List[Any], b: List[Any]) -> int:
-    n = min(len(a), len(b))
-    k = 0
-    for i in range(n):
-        if a[i] == b[i]:
-            k += 1
-        else:
-            break
-    return k
-
-
-def first_divergence(a: List[Any], b: List[Any]) -> Optional[int]:
-    n = min(len(a), len(b))
-    for i in range(n):
-        if a[i] != b[i]:
-            return i
-    if len(a) != len(b):
-        return n
-    return None
-
-
-def first_index_of(seq: List[Any], value: Any) -> Optional[int]:
-    for i, x in enumerate(seq):
-        if x == value:
-            return i
-    return None
-
-
-def get_refinement_start(df: pd.DataFrame) -> Tuple[Optional[int], Optional[Tuple[float, ...]]]:
-    flags = df["exact_mode"].astype(bool).tolist()
-    invs = df["investment_tuple"].tolist()
-
-    seen_false = False
-    for i, flag in enumerate(flags):
-        if not flag:
-            seen_false = True
-        elif flag and seen_false:
-            return int(df.iloc[i]["iter"]), invs[i]
-
-    return None, None
-
-
-def area_under_curve(y: np.ndarray, x: Optional[np.ndarray] = None) -> float:
-    if len(y) == 0:
-        return np.nan
-    if len(y) == 1:
-        return float(y[0])
-    if x is None:
-        x = np.arange(len(y))
-    return float(np.trapz(y, x))
-
-
-def first_hit_threshold(df: pd.DataFrame, col: str, thresholds: List[float]) -> Dict[str, Any]:
-    out = {}
-    for thr in thresholds:
-        sub = df[df[col] <= thr]
-        out[f"{col}_first_le_{thr}_iter"] = None if sub.empty else int(sub.iloc[0]["iter"])
-        out[f"{col}_first_le_{thr}_time"] = None if sub.empty else float(sub.iloc[0]["cum_wall_time"])
-    return out
-
-
-def summarize_run(df: pd.DataFrame, prefix: str) -> Dict[str, Any]:
-    last = df.iloc[-1]
-
-    res = {
-        f"{prefix}_total_iterations": int(last["iter"]) + 1,
-        f"{prefix}_final_iter": int(last["iter"]),
-        f"{prefix}_final_UB": float(last["UB"]),
-        f"{prefix}_final_LB": float(last["LB"]),
-        f"{prefix}_final_gap_abs": float(last["gap_abs"]),
-        f"{prefix}_final_gap_rel": float(last["gap_rel"]),
-        f"{prefix}_final_investment": list(last["investment_tuple"]) if last["investment_tuple"] is not None else None,
-        f"{prefix}_total_t_master": float(df["t_master"].sum()),
-        f"{prefix}_total_t_sub": float(df["t_sub"].sum()),
-        f"{prefix}_total_t_wall": float(df["t_iter_wall"].sum()),
-        f"{prefix}_gap_abs_auc_iter": area_under_curve(df["gap_abs"].to_numpy(), df["iter"].to_numpy()),
-        f"{prefix}_gap_rel_auc_iter": area_under_curve(df["gap_rel"].to_numpy(), df["iter"].to_numpy()),
-        f"{prefix}_LB_auc_iter": area_under_curve(df["LB"].to_numpy(), df["iter"].to_numpy()),
-        f"{prefix}_gap_abs_auc_time": area_under_curve(df["gap_abs"].to_numpy(), df["cum_wall_time"].to_numpy()),
-        f"{prefix}_gap_rel_auc_time": area_under_curve(df["gap_rel"].to_numpy(), df["cum_wall_time"].to_numpy()),
-        f"{prefix}_LB_auc_time": area_under_curve(df["LB"].to_numpy(), df["cum_wall_time"].to_numpy()),
-    }
-
-    thresholds = [0.5, 0.2, 0.1, 0.05, 0.01]
-    prefixed_hits = first_hit_threshold(df, "gap_rel", thresholds)
-    prefixed_hits = {f"{prefix}_{k}": v for k, v in prefixed_hits.items()}
-    res.update(prefixed_hits)
-
-    best_ub_idx = df["UB"].idxmin()
-    res[f"{prefix}_best_UB"] = float(df.loc[best_ub_idx, "UB"])
-    res[f"{prefix}_best_UB_iter"] = int(df.loc[best_ub_idx, "iter"])
-    res[f"{prefix}_best_UB_time"] = float(df.loc[best_ub_idx, "cum_wall_time"])
-
-    return res
-
-
-def classify_sample(row: pd.Series, other_name: str) -> str:
-    same_final = bool(row["same_final_investment"])
-    diverged = row["first_divergence_iter"] is not None
-    exact_iters = row["exact_total_iterations"]
-    other_iters = row[f"{other_name}_total_iterations"]
-
-    if same_final and diverged and other_iters < exact_iters:
-        return f"different_path_{other_name.lower()}_faster_same_final"
-    if same_final and diverged and other_iters > exact_iters:
-        return "different_path_exact_faster_same_final"
-    if same_final and not diverged:
-        if other_iters < exact_iters:
-            return f"same_path_{other_name.lower()}_faster"
-        if other_iters > exact_iters:
-            return "same_path_exact_faster"
-        return "same_path_same_speed"
-    if (not same_final) and other_iters < exact_iters:
-        return f"different_final_{other_name.lower()}_faster"
-    if (not same_final) and other_iters > exact_iters:
-        return "different_final_exact_faster"
-    return "other"
-
-
-def compare_sample(sample_id: int, exact_df: pd.DataFrame, other_df: pd.DataFrame, other_name: str) -> Dict[str, Any]:
-    row = {"sample": sample_id}
-    row.update(summarize_run(exact_df, "exact"))
-    row.update(summarize_run(other_df, other_name))
-
-    exact_inv = exact_df["investment_tuple"].tolist()
-    other_inv = other_df["investment_tuple"].tolist()
-
-    row["common_prefix_len"] = common_prefix_length(exact_inv, other_inv)
-    row["first_divergence_iter"] = first_divergence(exact_inv, other_inv)
-    row["same_final_investment"] = exact_inv[-1] == other_inv[-1]
-
-    refine_iter, refine_inv = get_refinement_start(other_df)
-    row[f"{other_name}_refine_start_iter"] = refine_iter
-    row[f"{other_name}_refine_start_investment"] = list(refine_inv) if refine_inv is not None else None
-
-    if refine_inv is not None:
-        exact_hit = first_index_of(exact_inv, refine_inv)
-        row["exact_hits_other_refine_investment"] = exact_hit is not None
-        row["exact_hits_other_refine_investment_iter"] = exact_hit
-    else:
-        row["exact_hits_other_refine_investment"] = None
-        row["exact_hits_other_refine_investment_iter"] = None
-
-    other_flags = other_df["exact_mode"].astype(bool)
-    row[f"{other_name}_exact_iterations_logged"] = int(other_flags.sum())
-    row[f"{other_name}_inexact_iterations_logged"] = int((~other_flags).sum())
-
-    row[f"delta_iterations_{other_name}_minus_exact"] = row[f"{other_name}_total_iterations"] - row["exact_total_iterations"]
-    row[f"delta_time_{other_name}_minus_exact"] = row[f"{other_name}_total_t_wall"] - row["exact_total_t_wall"]
-    row[f"delta_gap_rel_{other_name}_minus_exact"] = row[f"{other_name}_final_gap_rel"] - row["exact_final_gap_rel"]
-    row["sample_class"] = classify_sample(pd.Series(row), other_name)
-
-    return row
-
-
 def resample_curve(x: np.ndarray, y: np.ndarray, grid: np.ndarray) -> np.ndarray:
     if len(x) == 0:
         return np.full_like(grid, np.nan, dtype=float)
@@ -265,56 +110,48 @@ def resample_curve(x: np.ndarray, y: np.ndarray, grid: np.ndarray) -> np.ndarray
     return np.interp(grid, x, y)
 
 
-def build_shared_grid(exact_logs: Dict[int, pd.DataFrame],
-                      other_logs: Dict[int, pd.DataFrame],
-                      x_mode: str,
-                      grid_size: int = 300) -> np.ndarray:
-    if x_mode == "iter_raw":
-        max_iter_exact = max(int(df["iter"].max()) for df in exact_logs.values())
-        max_iter_other = max(int(df["iter"].max()) for df in other_logs.values())
-        max_iter = max(max_iter_exact, max_iter_other)
-        return np.arange(max_iter + 1, dtype=float)
+def _ensure_fair_time_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
 
-    if x_mode == "iter_norm":
-        return np.linspace(0.0, 1.0, grid_size)
+    if "t_master" not in df.columns:
+        df["t_master"] = 0.0
+    if "t_sub" not in df.columns:
+        df["t_sub"] = 0.0
 
-    if x_mode == "time_norm":
-        return np.linspace(0.0, 1.0, grid_size)
+    df["t_master"] = pd.to_numeric(df["t_master"], errors="coerce").fillna(0.0)
+    df["t_sub"] = pd.to_numeric(df["t_sub"], errors="coerce").fillna(0.0)
 
-    if x_mode == "time_raw":
-        max_time_exact = max(float(df["cum_wall_time"].iloc[-1]) for df in exact_logs.values())
-        max_time_other = max(float(df["cum_wall_time"].iloc[-1]) for df in other_logs.values())
-        max_time = max(max_time_exact, max_time_other)
-        return np.linspace(0.0, max_time, grid_size)
-
-    raise ValueError(f"Unknown x_mode: {x_mode}")
+    df["t_iter_fair"] = df["t_master"] + df["t_sub"]
+    df["cum_fair_time"] = df["t_iter_fair"].cumsum()
+    return df
 
 
-def aggregate_curves(logs: Dict[int, pd.DataFrame],
-                     x_mode: str,
-                     y_col: str,
-                     grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def _compute_mean_median_curve_on_time_grid(
+    logs: Dict[int, pd.DataFrame],
+    grid: np.ndarray,
+    time_col: str = "cum_fair_time",
+    y_col: str = "gap_rel",
+) -> Tuple[np.ndarray, np.ndarray]:
     curves = []
 
-    for df in logs.values():
-        if x_mode == "iter_raw":
-            x = df["iter"].to_numpy(dtype=float)
+    for _, df0 in logs.items():
+        df = _ensure_fair_time_columns(df0)
 
-        elif x_mode == "iter_norm":
-            x = df["iter_norm"].to_numpy(dtype=float)
-
-        elif x_mode == "time_norm":
-            x = df["cum_wall_time"].to_numpy(dtype=float)
-            xmax = x[-1] if len(x) > 0 else 0.0
-            x = np.zeros_like(x) if xmax <= 0 else x / xmax
-
-        elif x_mode == "time_raw":
-            x = df["cum_wall_time"].to_numpy(dtype=float)
-        else:
-            raise ValueError(f"Unknown x_mode: {x_mode}")
-
+        x = df[time_col].to_numpy(dtype=float)
         y = df[y_col].to_numpy(dtype=float)
-        curves.append(resample_curve(x, y, grid))
+        y = np.maximum(y, 1e-16)
+
+        if len(x) == 0:
+            continue
+        elif len(x) == 1:
+            y_interp = np.full_like(grid, y[0], dtype=float)
+        else:
+            y_interp = np.interp(grid, x, y)
+
+        curves.append(y_interp)
+
+    if not curves:
+        raise ValueError("No valid curves found for plotting.")
 
     arr = np.vstack(curves)
     mean_curve = np.nanmean(arr, axis=0)
@@ -322,17 +159,18 @@ def aggregate_curves(logs: Dict[int, pd.DataFrame],
     return mean_curve, median_curve
 
 
-def find_useful_xmax(grid: np.ndarray,
-                     curves: List[np.ndarray],
-                     threshold: float,
-                     buffer_frac: float = 0.05,
-                     min_x: float = 0.1) -> float:
+def _find_xmax_from_y_threshold(
+    grid: np.ndarray,
+    curves: List[np.ndarray],
+    y_threshold: float = 1e-6,
+    buffer_frac: float = 0.03,
+) -> float:
     arr = np.vstack(curves)
-    below = np.all(arr <= threshold, axis=0)
+    mask = np.all(arr <= y_threshold, axis=0)
 
     idx = None
-    for i, flag in enumerate(below):
-        if flag:
+    for i, ok in enumerate(mask):
+        if ok:
             idx = i
             break
 
@@ -340,204 +178,55 @@ def find_useful_xmax(grid: np.ndarray,
         return float(grid[-1])
 
     xmax = float(grid[idx])
-    full_span = float(grid[-1] - grid[0])
-    xmax += buffer_frac * full_span
-    xmax = min(float(grid[-1]), xmax)
-    xmax = max(min_x, xmax)
+    span = float(grid[-1] - grid[0])
+    xmax = min(float(grid[-1]), xmax + buffer_frac * span)
     return xmax
 
 
-def plot_aggregated(exact_logs: Dict[int, pd.DataFrame],
-                    other_logs: Dict[int, pd.DataFrame],
-                    other_name: str,
-                    figures_dir: Path):
-    configs = [
-        ("gap_rel", "iter_raw", "Relative duality gap", "gap_rel_vs_iter.png"),
-        ("gap_abs", "iter_raw", "Absolute duality gap", "gap_abs_vs_iter.png"),
-        ("LB", "iter_raw", "Lower bound", "lb_vs_iter.png"),
-
-        ("gap_rel", "iter_norm", "Relative duality gap", "gap_rel_vs_iter_norm.png"),
-        ("gap_abs", "iter_norm", "Absolute duality gap", "gap_abs_vs_iter_norm.png"),
-        ("LB", "iter_norm", "Lower bound", "lb_vs_iter_norm.png"),
-
-        ("gap_rel", "time_norm", "Relative duality gap", "gap_rel_vs_time_norm.png"),
-        ("gap_abs", "time_norm", "Absolute duality gap", "gap_abs_vs_time_norm.png"),
-        ("LB", "time_norm", "Lower bound", "lb_vs_time_norm.png"),
-
-        ("gap_rel", "time_raw", "Relative duality gap", "gap_rel_vs_time_raw.png"),
-    ]
-
-    for y_col, x_mode, ylabel, filename in configs:
-        grid = build_shared_grid(exact_logs, other_logs, x_mode, grid_size=200)
-        ex_mean, ex_median = aggregate_curves(exact_logs, x_mode, y_col, grid)
-        ot_mean, ot_median = aggregate_curves(other_logs, x_mode, y_col, grid)
-
-        # full plot
-        plt.figure(figsize=(8, 5))
-        plt.plot(grid, ex_mean, label="Exact mean", linewidth=2)
-        plt.plot(grid, ex_median, label="Exact median", linewidth=2, linestyle="--")
-        plt.plot(grid, ot_mean, label=f"{other_name} mean", linewidth=2)
-        plt.plot(grid, ot_median, label=f"{other_name} median", linewidth=2, linestyle="--")
-
-        if x_mode == "iter_raw":
-            plt.xlabel("Iteration")
-        elif x_mode == "iter_norm":
-            plt.xlabel("Normalized iteration")
-        else:
-            plt.xlabel("Normalized cumulative time")
-
-        plt.ylabel(ylabel)
-        plt.title(f"{ylabel} evolution")
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(figures_dir / filename, dpi=200, bbox_inches="tight")
-        plt.close()
-
-        # cropped plots for gap
-        if y_col in {"gap_abs", "gap_rel"}:
-            plt.figure(figsize=(8, 5))
-            plt.plot(grid, ex_mean, label="Exact mean", linewidth=2)
-            plt.plot(grid, ex_median, label="Exact median", linewidth=2, linestyle="--")
-            plt.plot(grid, ot_mean, label=f"{other_name} mean", linewidth=2)
-            plt.plot(grid, ot_median, label=f"{other_name} median", linewidth=2, linestyle="--")
-
-            if y_col == "gap_rel":
-                plt.yscale("log")
-
-            if x_mode == "iter_raw":
-                plt.xlabel("Iteration")
-            elif x_mode == "iter_norm":
-                plt.xlabel("Normalized iteration")
-            elif x_mode == "time_norm":
-                plt.xlabel("Normalized cumulative time")
-            else:
-                plt.xlabel("Normalized cumulative time")
-
-            plt.ylabel(ylabel)
-            plt.title(f"{ylabel} evolution (cropped)")
-            plt.grid(True, alpha=0.3)
-            plt.legend()
-
-            if y_col == "gap_abs":
-                xmax = find_useful_xmax(
-                    grid,
-                    [ex_mean, ex_median, ot_mean, ot_median],
-                    threshold=1e6,
-                    buffer_frac=0.05,
-                    min_x=0.1,
-                )
-            else:
-                xmax = find_useful_xmax(
-                    grid,
-                    [ex_mean, ex_median, ot_mean, ot_median],
-                    threshold=0.01,
-                    buffer_frac=0.05,
-                    min_x=0.1,
-                )
-
-            plt.xlim(grid[0], xmax)
-            plt.tight_layout()
-            cropped_name = filename.replace(".png", "_cropped.png")
-            plt.savefig(figures_dir / cropped_name, dpi=200, bbox_inches="tight")
-            plt.close()
-
-
-def plot_per_sample_overlays(exact_logs: Dict[int, pd.DataFrame],
-                             other_logs: Dict[int, pd.DataFrame],
-                             other_name: str,
-                             figures_dir: Path,
-                             max_samples: int = 10):
-    overlay_dir = figures_dir / "sample_overlays"
-    ensure_dir(overlay_dir)
-
-    samples = sorted(set(exact_logs.keys()) & set(other_logs.keys()))[:max_samples]
-
-    for s in samples:
-        edf = exact_logs[s]
-        odf = other_logs[s]
-
-        plt.figure(figsize=(9, 5))
-        plt.plot(edf["iter"], edf["gap_rel"], marker="o", label="Exact")
-        plt.plot(odf["iter"], odf["gap_rel"], marker="o", label=other_name)
-        plt.xlabel("Iteration")
-        plt.ylabel("Relative gap")
-        plt.title(f"Sample {s}: relative gap")
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(overlay_dir / f"sample_{s}_gap_rel.png", dpi=200, bbox_inches="tight")
-        plt.close()
-
-        plt.figure(figsize=(9, 5))
-        plt.plot(edf["iter"], edf["LB"], marker="o", label="Exact")
-        plt.plot(odf["iter"], odf["LB"], marker="o", label=other_name)
-        plt.xlabel("Iteration")
-        plt.ylabel("Lower bound")
-        plt.title(f"Sample {s}: LB progression")
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(overlay_dir / f"sample_{s}_lb.png", dpi=200, bbox_inches="tight")
-        plt.close()
-
-        plt.figure(figsize=(9, 5))
-        plt.plot(edf["cum_wall_time"], edf["gap_rel"], marker="o", label="Exact")
-        plt.plot(odf["cum_wall_time"], odf["gap_rel"], marker="o", label=other_name)
-        plt.xlabel("Cumulative time (s)")
-        plt.ylabel("Relative gap")
-        plt.title(f"Sample {s}: relative gap vs time")
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(overlay_dir / f"sample_{s}_gap_rel_vs_time.png", dpi=200, bbox_inches="tight")
-        plt.close()
-
-def get_mean_crossover_point(
+def _get_crossover_points(
     logs: Dict[int, pd.DataFrame],
+    time_col: str = "cum_fair_time",
     y_col: str = "gap_rel",
-) -> Optional[Tuple[float, float]]:
+) -> Tuple[Optional[Tuple[float, float]], Optional[Tuple[float, float]]]:
     """
-    Return the mean crossover point across samples.
+    Return:
+      mean_point   = (mean crossover time, mean crossover y)
+      median_point = (median crossover time, median crossover y)
 
-    Crossover = first iteration where exact_mode switches from False to True.
-    Runs that start already in exact mode have no crossover.
+    Crossover is defined as the first row where exact_mode switches False -> True.
     """
-    cross_times = []
-    cross_vals = []
+    times = []
+    ys = []
 
-    for df in logs.values():
-        if len(df) < 2:
+    for _, df0 in logs.items():
+        df = _ensure_fair_time_columns(df0)
+
+        if "exact_mode" not in df.columns or len(df) < 2:
             continue
 
-        exact_flags = df["exact_mode"].astype(bool).to_numpy()
-
-        # If the run starts in exact mode, there is no crossover
-        if exact_flags[0]:
-            continue
-
-        # Find first False -> True transition
-        cross_idx = None
-        for i in range(1, len(exact_flags)):
-            if (not exact_flags[i - 1]) and exact_flags[i]:
-                cross_idx = i
+        flags = df["exact_mode"].astype(bool).to_numpy()
+        switch_idx = None
+        for i in range(1, len(flags)):
+            if (not flags[i - 1]) and flags[i]:
+                switch_idx = i
                 break
 
-        if cross_idx is None:
+        if switch_idx is None:
             continue
 
-        row = df.iloc[cross_idx]
-        t_cross = float(row["cum_wall_time"])
-        y_cross = float(row[y_col])
+        t = float(df.iloc[switch_idx][time_col])
+        y = float(df.iloc[switch_idx][y_col])
+        y = max(y, 1e-16)
 
-        if np.isfinite(t_cross) and np.isfinite(y_cross) and y_cross > 0:
-            cross_times.append(t_cross)
-            cross_vals.append(y_cross)
+        times.append(t)
+        ys.append(y)
 
-    if not cross_times:
-        return None
+    if not times:
+        return None, None
 
-    return float(np.mean(cross_times)), float(np.mean(cross_vals))
+    mean_point = (float(np.mean(times)), float(np.mean(ys)))
+    median_point = (float(np.median(times)), float(np.median(ys)))
+    return mean_point, median_point
 
 
 def plot_mean_gap_vs_time(
@@ -546,283 +235,144 @@ def plot_mean_gap_vs_time(
     filename: str = "mean_relative_duality_gap_vs_time.png",
     grid_size: int = 400,
     title: str = "Mean relative duality gap vs time (averaged across all samples)",
-    add_crossover_dot: bool = True,
+    y_stop_threshold: float = 1e-6,
+    annotate_crossover: bool = True,
+    show_median: bool = True,
+    log_y: bool = True,
 ):
     """
-    method_logs:
-        {
-            "Exact Benders": exact_logs,
-            "D_CAB": dCAB_logs,
-            "D_Uniform": dUniform_logs,
-            ...
-        }
+    Parameters
+    ----------
+    show_median : bool
+        If True (default), plot both mean and median curves per method.
+        If False, plot only the mean curves.
 
-    Style:
-      - same method = same color
-      - mean = solid
-      - median = dashed
-      - crossover = large dot on the mean curve
+    log_y : bool
+        If True (default), plot the y-axis on log scale (gap spans many
+        orders of magnitude). If False, use a linear y-axis.
     """
     ensure_dir(figures_dir)
 
-    # global time horizon
+    time_col = "cum_wall_time"   # match LB plot
+    time_col = "cum_fair_time"   # switch to fair time for all methods (t_master + t_sub)
+
+    # make sure cum_wall_time exists
+    processed_method_logs = {}
+    for method_name, logs in method_logs.items():
+        processed_method_logs[method_name] = {}
+        for sid, df in logs.items():
+            df2 = _ensure_fair_time_columns(df)
+
+            if "cum_wall_time" not in df2.columns:
+                if "t_iter_wall" in df2.columns:
+                    df2["t_iter_wall"] = pd.to_numeric(
+                        df2["t_iter_wall"], errors="coerce"
+                    ).fillna(df2["t_master"] + df2["t_sub"])
+                else:
+                    df2["t_iter_wall"] = df2["t_master"] + df2["t_sub"]
+
+                df2["cum_wall_time"] = df2["t_iter_wall"].cumsum()
+
+            processed_method_logs[method_name][sid] = df2
+
     max_time = 0.0
-    for logs in method_logs.values():
+    for logs in processed_method_logs.values():
         for df in logs.values():
             if len(df) > 0:
-                max_time = max(max_time, float(df["cum_wall_time"].iloc[-1]))
+                max_time = max(max_time, float(df[time_col].iloc[-1]))
 
     grid = np.linspace(0.0, max_time, grid_size)
 
+    cmap = plt.get_cmap("tab10")
     plt.figure(figsize=(10, 6))
 
-    # use deterministic colors from matplotlib default cycle
-    color_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    all_curves = []
 
-    for idx, (method_name, logs) in enumerate(method_logs.items()):
-        color = color_cycle[idx % len(color_cycle)]
+    for i, (method_name, logs) in enumerate(processed_method_logs.items()):
+        color = cmap(i)
 
-        mean_curve, median_curve = aggregate_curves(
+        mean_curve, median_curve = _compute_mean_median_curve_on_time_grid(
             logs=logs,
-            x_mode="time_raw",
-            y_col="gap_rel",
             grid=grid,
+            time_col=time_col,
+            y_col="gap_rel",
         )
 
-        # same method, same color
+        all_curves.append(mean_curve)
+
+        # mean curve label depends on whether median is also shown
+        mean_label = f"{method_name} (mean)" if show_median else method_name
+
         plt.plot(
             grid,
             mean_curve,
             color=color,
-            linewidth=2.6,
+            linewidth=2.8,
             linestyle="-",
-            label=f"{method_name} (mean)",
-        )
-        plt.plot(
-            grid,
-            median_curve,
-            color=color,
-            linewidth=2.2,
-            linestyle="--",
-            alpha=0.95,
-            label=f"{method_name} (median)",
+            label=mean_label,
         )
 
-        # crossover dot on mean curve
-        if add_crossover_dot:
-            cross_pt = get_mean_crossover_point(logs, y_col="gap_rel")
-            if cross_pt is not None:
-                cross_time, _ = cross_pt
+        if show_median:
+            all_curves.append(median_curve)
+            plt.plot(
+                grid,
+                median_curve,
+                color=color,
+                linewidth=2.8,
+                linestyle="--",
+                alpha=0.95,
+                label=f"{method_name} (median)",
+            )
 
-                # put dot on the plotted mean curve value at that time
-                y_dot = np.interp(cross_time, grid, mean_curve)
+        # annotate crossover only for inexact-refine methods
+        if annotate_crossover and ("exact" not in method_name.lower()):
+            mean_point, median_point = _get_crossover_points(
+                logs=logs,
+                time_col=time_col,
+                y_col="gap_rel",
+            )
 
-                if np.isfinite(y_dot) and y_dot > 0:
-                    plt.scatter(
-                        [cross_time],
-                        [y_dot],
-                        s=140,
-                        color=color,
-                        edgecolors="black",
-                        linewidths=1.2,
-                        zorder=10,
-                    )
+            if mean_point is not None:
+                # vertical line at the mean crossover time, with the gap
+                # value at crossover (as a real percentage) reported in the legend
+                plt.axvline(
+                    x=mean_point[0],
+                    color=color,
+                    linestyle=":",
+                    linewidth=1.8,
+                    alpha=0.8,
+                    zorder=4,
+                    label=f"{method_name} crossover ({mean_point[1] * 100:.2f}%)",
+                )
 
-                    # optional small annotation
-                    plt.annotate(
-                        f"{method_name}\n{cross_time:.2f}s",
-                        xy=(cross_time, y_dot),
-                        xytext=(6, 6),
-                        textcoords="offset points",
-                        fontsize=9,
-                        color=color,
-                    )
+    xmax = _find_xmax_from_y_threshold(
+        grid=grid,
+        curves=all_curves,
+        y_threshold=y_stop_threshold,
+        buffer_frac=0.03,
+    )
 
-    plt.yscale("log")
+    ymax = max(curve[0] for curve in all_curves) * 1.15
+
+    plt.xlim(0.0, xmax)
+    if log_y:
+        plt.ylim(y_stop_threshold, ymax)
+        plt.yscale("log")
+    else:
+        plt.ylim(0.0, ymax)
+
     plt.xlabel("Cumulative time (s)")
-    plt.ylabel(r"$\log((|UB-LB|)/|UB|)$")
+    plt.ylabel(r"Duality gap $(|UB-LB|)/|UB|$")
     plt.title(title)
-    plt.grid(True, alpha=0.3)
+    plt.grid(True, alpha=0.3, which="both" if log_y else "major")
     plt.legend()
     plt.tight_layout()
     plt.savefig(figures_dir / filename, dpi=200, bbox_inches="tight")
     plt.show()
 
-def make_aggregate_stats(summary_df: pd.DataFrame, other_name: str) -> pd.DataFrame:
-    cols = [
-        "exact_total_iterations",
-        f"{other_name}_total_iterations",
-        f"{other_name}_exact_iterations_logged",
-        f"{other_name}_inexact_iterations_logged",
-        "exact_total_t_wall",
-        f"{other_name}_total_t_wall",
-        "exact_final_gap_rel",
-        f"{other_name}_final_gap_rel",
-        "common_prefix_len",
-    ]
-
-    rows = []
-    for c in cols:
-        vals = pd.to_numeric(summary_df[c], errors="coerce")
-        rows.append(
-            {
-                "metric": c,
-                "mean": vals.mean(),
-                "median": vals.median(),
-                "std": vals.std(),
-                "min": vals.min(),
-                "max": vals.max(),
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-def main(default_exact_dir="outputs/Benders/3Node/Sample_120/iter_logs_exact_0",
-         default_other_dir="outputs/Benders/3Node/Sample_120/iter_logs_inexact_refine_ConstD_1",
-         default_other_name="D_CAB",
-         default_out_dir="comparison_exact_vs_d1"):
-    default_figures_dir = None
-    default_max_overlay_samples = 10
-
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("--exact_dir", type=str, default=default_exact_dir,
-                        help="Folder with exact iterlog csvs")
-    parser.add_argument("--other_dir", type=str, default=default_other_dir,
-                        help="Folder with other iterlog csvs")
-    parser.add_argument("--other_name", type=str, default=default_other_name,
-                        help="Name of the second method")
-    parser.add_argument("--out_dir", type=str, default=default_out_dir,
-                        help="Directory to save csv analysis")
-    parser.add_argument("--figures_dir", type=str, default=default_figures_dir,
-                        help="Directory to save figures; default = out_dir/figures")
-    parser.add_argument("--max_overlay_samples", type=int, default=default_max_overlay_samples,
-                        help="Number of sample overlays to save")
-
-    args = parser.parse_args()
-
-    exact_dir = Path(args.exact_dir)
-    other_dir = Path(args.other_dir)
-    out_dir = Path(args.out_dir)
-    figures_dir = Path(args.figures_dir) if args.figures_dir else out_dir / "figures"
-
-    ensure_dir(out_dir)
-    ensure_dir(figures_dir)
-
-    exact_logs = load_logs(exact_dir)
-    other_logs = load_logs(other_dir)
-
-    common_samples = sorted(set(exact_logs.keys()) & set(other_logs.keys()))
-    if not common_samples:
-        raise ValueError(
-            f"No common sample IDs found between folders:\n"
-            f"  exact_dir = {exact_dir}\n"
-            f"  other_dir = {other_dir}"
-        )
-
-    rows = []
-    for sid in common_samples:
-        rows.append(compare_sample(sid, exact_logs[sid], other_logs[sid], args.other_name))
-
-    summary_df = pd.DataFrame(rows).sort_values("sample").reset_index(drop=True)
-    summary_df.to_csv(out_dir / "per_sample_summary.csv", index=False)
-
-    agg_df = make_aggregate_stats(summary_df, args.other_name)
-    agg_df.to_csv(out_dir / "aggregate_summary_stats.csv", index=False)
-
-    class_counts = (
-        summary_df["sample_class"]
-        .value_counts(dropna=False)
-        .rename_axis("sample_class")
-        .reset_index(name="count")
-    )
-    class_counts.to_csv(out_dir / "sample_class_counts.csv", index=False)
-
-    wins_df = pd.DataFrame(
-        [
-            {
-                "n_samples": len(summary_df),
-                "other_fewer_iterations_count": int(
-                    (summary_df[f"{args.other_name}_total_iterations"] < summary_df["exact_total_iterations"]).sum()
-                ),
-                "exact_fewer_iterations_count": int(
-                    (summary_df[f"{args.other_name}_total_iterations"] > summary_df["exact_total_iterations"]).sum()
-                ),
-                "same_iterations_count": int(
-                    (summary_df[f"{args.other_name}_total_iterations"] == summary_df["exact_total_iterations"]).sum()
-                ),
-                "other_faster_wall_time_count": int(
-                    (summary_df[f"{args.other_name}_total_t_wall"] < summary_df["exact_total_t_wall"]).sum()
-                ),
-                "exact_faster_wall_time_count": int(
-                    (summary_df[f"{args.other_name}_total_t_wall"] > summary_df["exact_total_t_wall"]).sum()
-                ),
-                "same_final_investment_count": int(summary_df["same_final_investment"].fillna(False).sum()),
-                "exact_hits_other_refine_investment_count": int(
-                    summary_df["exact_hits_other_refine_investment"].fillna(False).sum()
-                ),
-            }
-        ]
-    )
-    wins_df.to_csv(out_dir / "win_loss_summary.csv", index=False)
-
-    stacked = []
-    for sid in common_samples:
-        e = exact_logs[sid].copy()
-        e["method"] = "Exact"
-        o = other_logs[sid].copy()
-        o["method"] = args.other_name
-        stacked.append(e)
-        stacked.append(o)
-
-    pd.concat(stacked, ignore_index=True).to_csv(out_dir / "stacked_iteration_logs.csv", index=False)
-
-    plot_aggregated(exact_logs, other_logs, args.other_name, figures_dir)
-    # plot_per_sample_overlays(
-    #     exact_logs,
-    #     other_logs,
-    #     args.other_name,
-    #     figures_dir,
-    #     max_samples=args.max_overlay_samples,
-    # )
-
-    meta = {
-        "exact_dir": str(exact_dir),
-        "other_dir": str(other_dir),
-        "other_name": args.other_name,
-        "n_exact_logs": len(exact_logs),
-        "n_other_logs": len(other_logs),
-        "n_common_samples": len(common_samples),
-    }
-    with open(out_dir / "comparison_meta.json", "w") as f:
-        json.dump(meta, f, indent=2)
-
-    print(f"Saved per-sample summary to: {out_dir / 'per_sample_summary.csv'}")
-    print(f"Saved aggregate stats to:    {out_dir / 'aggregate_summary_stats.csv'}")
-    print(f"Saved class counts to:       {out_dir / 'sample_class_counts.csv'}")
-    print(f"Saved win/loss summary to:   {out_dir / 'win_loss_summary.csv'}")
-    print(f"Saved figures to:            {figures_dir}")
-def get_first_crossover_point(df: pd.DataFrame):
-    """
-    Return the first point where exact_mode switches from False to True.
-
-    Returns
-    -------
-    cross_time : float | None
-    cross_lb   : float | None
-    """
-    flags = df["exact_mode"].astype(bool).to_numpy()
-
-    for i in range(1, len(flags)):
-        if (flags[i - 1] == False) and (flags[i] == True):
-            return float(df.iloc[i]["cum_wall_time"]), float(df.iloc[i]["LB"])
-
-    return None, None
 
 def get_lb_star_map(exact_logs: Dict[int, pd.DataFrame]) -> Dict[int, float]:
-    """
-    Use the final LB from Exact Benders as LB* for each sample.
-    """
+    """Use the final LB from Exact Benders as LB* for each sample."""
     lb_star = {}
     for sid, df in exact_logs.items():
         if len(df) == 0:
@@ -832,12 +382,10 @@ def get_lb_star_map(exact_logs: Dict[int, pd.DataFrame]) -> Dict[int, float]:
 
 
 def get_first_crossover_index(df: pd.DataFrame) -> Optional[int]:
-    """
-    First index where exact_mode switches from False to True.
-    """
+    """First index where exact_mode switches from False to True."""
     flags = df["exact_mode"].astype(bool).to_numpy()
     for i in range(1, len(flags)):
-        if (flags[i - 1] == False) and (flags[i] == True):
+        if (not flags[i - 1]) and flags[i]:
             return i
     return None
 
@@ -847,9 +395,17 @@ def aggregate_lb_percent_curves(
     lb_star_map: Dict[int, float],
     grid: np.ndarray,
     x_mode: str = "time_raw",
+    as_optimality_gap: bool = False,
+    time_col: str = "cum_fair_time",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Aggregate curves of 100 * LB / LB* across samples.
+    Aggregate per-sample curves across a shared grid.
+
+    Parameters
+    ----------
+    as_optimality_gap : bool
+        If False (default): y = 100 * LB / LB*  (LB progress as % of optimum).
+        If True:            y = 100 * (LB* - LB) / LB*  (optimality gap %, -> 0).
     """
     curves = []
 
@@ -859,18 +415,25 @@ def aggregate_lb_percent_curves(
 
         lb_star = lb_star_map[sid]
 
-        # avoid division by zero or near-zero
         if lb_star is None or abs(lb_star) < 1e-12:
             continue
 
+        # if x_mode == "time_raw":
+        #     x = df["cum_wall_time"].to_numpy(dtype=float)
         if x_mode == "time_raw":
-            x = df["cum_wall_time"].to_numpy(dtype=float)
+            df = _ensure_fair_time_columns(df)
+            x = df[time_col].to_numpy(dtype=float)
         elif x_mode == "iter_raw":
             x = df["iter"].to_numpy(dtype=float)
         else:
             raise ValueError(f"Unsupported x_mode: {x_mode}")
 
-        y = 100.0 * df["LB"].to_numpy(dtype=float) / lb_star
+        lb_arr = df["LB"].to_numpy(dtype=float)
+        if as_optimality_gap:
+            y = 100.0 * (lb_star - lb_arr) / lb_star
+        else:
+            y = 100.0 * lb_arr / lb_star
+
         curves.append(resample_curve(x, y, grid))
 
     if len(curves) == 0:
@@ -885,10 +448,15 @@ def aggregate_lb_percent_curves(
 def aggregate_crossover_lb_percent(
     logs: Dict[int, pd.DataFrame],
     lb_star_map: Dict[int, float],
+    as_optimality_gap: bool = False,
+    time_col: str = "cum_fair_time",
 ) -> Dict[str, Optional[float]]:
     """
-    Compute mean/median crossover point in normalized LB percentage terms.
-    Only for methods that actually switch from inexact to exact.
+    Mean/median crossover point in normalized terms.
+
+    If as_optimality_gap is True, the crossover y-value is reported as
+    100 * (LB* - LB) / LB* (i.e. the optimality gap at the moment of switch).
+    Otherwise it is reported as 100 * LB / LB*.
     """
     cross_times = []
     cross_vals = []
@@ -905,12 +473,18 @@ def aggregate_crossover_lb_percent(
         if idx is None:
             continue
 
-        t_cross = float(df.iloc[idx]["cum_wall_time"])
+        # t_cross = float(df.iloc[idx]["cum_wall_time"])
+        df = _ensure_fair_time_columns(df)
+        t_cross = float(df.iloc[idx][time_col])
         lb_cross = float(df.iloc[idx]["LB"])
-        lb_cross_pct = 100.0 * lb_cross / lb_star
+
+        if as_optimality_gap:
+            val_cross = 100.0 * (lb_star - lb_cross) / lb_star
+        else:
+            val_cross = 100.0 * lb_cross / lb_star
 
         cross_times.append(t_cross)
-        cross_vals.append(lb_cross_pct)
+        cross_vals.append(val_cross)
 
     if len(cross_times) == 0:
         return {
@@ -927,46 +501,6 @@ def aggregate_crossover_lb_percent(
         "median_val": float(np.median(cross_vals)),
     }
 
-def aggregate_lb_curves(logs: Dict[int, pd.DataFrame], grid: np.ndarray):
-    """
-    Aggregate LB curves across samples on a shared time grid.
-    """
-    mean_curve, median_curve = aggregate_curves(
-        logs=logs,
-        x_mode="time_raw",
-        y_col="LB",
-        grid=grid,
-    )
-    return mean_curve, median_curve
-
-
-def aggregate_crossover_points(logs: Dict[int, pd.DataFrame]):
-    """
-    Collect crossover times/LBs for all samples that have a crossover.
-    """
-    cross_times = []
-    cross_lbs = []
-
-    for df in logs.values():
-        t, lb = get_first_crossover_point(df)
-        if t is not None and lb is not None:
-            cross_times.append(t)
-            cross_lbs.append(lb)
-
-    if len(cross_times) == 0:
-        return {
-            "mean_time": None,
-            "median_time": None,
-            "mean_lb": None,
-            "median_lb": None,
-        }
-
-    return {
-        "mean_time": float(np.mean(cross_times)),
-        "median_time": float(np.median(cross_times)),
-        "mean_lb": float(np.mean(cross_lbs)),
-        "median_lb": float(np.median(cross_lbs)),
-    }
 
 def plot_mean_lb_percent_vs_time(
     method_logs: Dict[str, Dict[int, pd.DataFrame]],
@@ -974,43 +508,61 @@ def plot_mean_lb_percent_vs_time(
     figures_dir: Path,
     filename: str = "mean_lb_percent_vs_time.png",
     grid_size: int = 400,
-    title: str = r"Lower bound progress vs time as percentage of $LB^*$",
+    title: Optional[str] = None,
     use_median_crossover: bool = False,
+    show_median: bool = True,
+    plot_optimality_gap: bool = True,
+    log_y: bool = True,
+    y_stop_threshold: float = 1e-4,
+    trim_x_at_threshold: bool = True,
 ):
     """
-    Plot 100 * LB / LB* vs cumulative wall time.
+    Plot lower-bound progress or optimality gap vs cumulative fair time.
+
+    Fair time is defined as cumulative sum of:
+        t_master + t_sub
 
     Parameters
     ----------
-    method_logs : dict
-        Example:
-        {
-            "Exact Benders": exact_logs,
-            "D_CAB": dCAB_logs,
-            "D_Uniform": dUniform_logs,
-            "Exact Benders (Kmeans)": exact_Kmeans_logs,
-            "D_CAB (Kmeans)": dCAB_Kmeans_logs,
-        }
+    show_median : bool
+        If True, plot both mean and median curves per method.
+        If False, plot only mean curves.
 
-    exact_logs : dict
-        Exact Benders logs used to define LB* per sample.
+    plot_optimality_gap : bool
+        If True:
+            y = 100 * (LB* - LB) / LB*
+        If False:
+            y = 100 * LB / LB*
+
+    log_y : bool
+        If True, use log-scale y-axis.
+
+    y_stop_threshold : float
+        Threshold used to trim the x-axis when plot_optimality_gap=True.
+        For example, 1e-4 means the plot stops once all mean curves are below 1e-4.
+
+    trim_x_at_threshold : bool
+        If True, trims x-axis when all mean curves reach y_stop_threshold.
     """
     ensure_dir(figures_dir)
 
+    time_col = "cum_fair_time"
     lb_star_map = get_lb_star_map(exact_logs)
 
-    # shared time grid
+    # Shared fair-time grid
     max_time = 0.0
     for logs in method_logs.values():
         for sid, df in logs.items():
             if sid in lb_star_map and len(df) > 0:
-                max_time = max(max_time, float(df["cum_wall_time"].iloc[-1]))
+                df = _ensure_fair_time_columns(df)
+                max_time = max(max_time, float(df[time_col].iloc[-1]))
 
     grid = np.linspace(0.0, max_time, grid_size)
 
     plt.figure(figsize=(10, 6))
-
     color_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+    all_mean_curves = []
 
     for idx, (method_name, logs) in enumerate(method_logs.items()):
         color = color_cycle[idx % len(color_cycle)]
@@ -1020,31 +572,47 @@ def plot_mean_lb_percent_vs_time(
             lb_star_map=lb_star_map,
             grid=grid,
             x_mode="time_raw",
+            as_optimality_gap=plot_optimality_gap,
+            time_col=time_col,
         )
 
-        # same method -> same color
+        # Clip for log-scale stability
+        if log_y:
+            mean_curve = np.maximum(mean_curve, 1e-6)
+            median_curve = np.maximum(median_curve, 1e-6)
+
+        all_mean_curves.append(mean_curve)
+
+        mean_label = f"{method_name} (mean)" if show_median else method_name
+
         plt.plot(
             grid,
             mean_curve,
             linewidth=2.5,
             linestyle="-",
             color=color,
-            label=f"{method_name} (mean)",
-        )
-        plt.plot(
-            grid,
-            median_curve,
-            linewidth=2.2,
-            linestyle="--",
-            color=color,
-            alpha=0.9,
-            label=f"{method_name} (median)",
+            label=mean_label,
         )
 
-        # Exact Benders has no crossover marker
+        if show_median:
+            plt.plot(
+                grid,
+                median_curve,
+                linewidth=2.2,
+                linestyle="--",
+                color=color,
+                alpha=0.9,
+                label=f"{method_name} (median)",
+            )
+
+        # Crossover line: skip pure Exact Benders
         if "Exact Benders" not in method_name or "(Kmeans)" in method_name:
-            # still only add a crossover if the method truly has one
-            cross_stats = aggregate_crossover_lb_percent(logs, lb_star_map)
+            cross_stats = aggregate_crossover_lb_percent(
+                logs=logs,
+                lb_star_map=lb_star_map,
+                as_optimality_gap=plot_optimality_gap,
+                time_col=time_col,
+            )
 
             if use_median_crossover:
                 x_cross = cross_stats["median_time"]
@@ -1054,21 +622,43 @@ def plot_mean_lb_percent_vs_time(
                 y_cross = cross_stats["mean_val"]
 
             if x_cross is not None and y_cross is not None:
-                plt.scatter(
-                    x_cross,
-                    y_cross,
-                    s=140,
+                plt.axvline(
+                    x=x_cross,
                     color=color,
-                    edgecolor="black",
-                    linewidth=1.0,
-                    zorder=5,
-                    label=f"{method_name} crossover",
+                    linestyle=":",
+                    linewidth=1.8,
+                    alpha=0.8,
+                    zorder=4,
+                    label=f"{method_name} crossover ({y_cross:.2f}%)",
                 )
 
-    plt.xlabel("Cumulative time (s)")
-    plt.ylabel(r"$100 \cdot LB / LB^*$ (%)")
-    plt.title(title)
-    plt.grid(True, alpha=0.3)
+    if trim_x_at_threshold and plot_optimality_gap and all_mean_curves:
+        xmax = _find_xmax_from_y_threshold(
+            grid=grid,
+            curves=all_mean_curves,
+            y_threshold=y_stop_threshold,
+            buffer_frac=0.03,
+        )
+        plt.xlim(0.0, xmax)
+    else:
+        plt.xlim(0.0, max_time)
+
+    plt.xlabel("Cumulative solver time (s)")
+
+    if plot_optimality_gap:
+        default_title = r"Optimality gap vs time:  $100 \cdot (LB^* - LB)/LB^*$ (%)"
+        plt.ylabel(r"Optimality gap $100 \cdot (LB^* - LB)/LB^*$ (%)")
+    else:
+        default_title = r"Lower bound progress vs time as percentage of $LB^*$"
+        plt.ylabel(r"$100 \cdot LB / LB^*$ (%)")
+
+    if log_y:
+        plt.yscale("log")
+        if plot_optimality_gap:
+            plt.ylim(y_stop_threshold, None)
+
+    plt.title(title if title is not None else default_title)
+    plt.grid(True, alpha=0.3, which="both" if log_y else "major")
     plt.legend()
     plt.tight_layout()
     plt.savefig(figures_dir / filename, dpi=200, bbox_inches="tight")
@@ -1077,46 +667,85 @@ def plot_mean_lb_percent_vs_time(
 if __name__ == "__main__":
     BASE = "outputs/Benders/3Node/Sample_120"
     exact_logs = load_logs(Path(f"{BASE}/iter_logs_Exact_Exact"))
-    #exact_kmeans_logs = load_logs(Path(f"{BASE}/iter_logs_Exact_Exact_Kmeans8"))
     dCAB_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_D_CAB_single"))
-    # dCAB_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_ConstD_1"))
-    # dCAB_kmeans_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_ConstD_1_kmeans10"))
-    dUniform_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_D_uniform_single"))
-    # cap_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_Capacity-Bound-Class-FullCut"))
+    dCAB_class_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_D_CAB_Classify_single"))
+    dUniform_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_D_CAB_single"))
 
     dCAB_NR50 = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_D_CAB-NR50_single"))
     dCAB_NR90 = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_D_CAB-NR90_single"))
-    
 
-    # dCAB_Kmeans_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_D_CAB_kmeans"))
-    # exact_Kmeans_logs = load_logs(Path(f"{BASE}/iter_logs_Exact_Exact_kmeans"))
+    dCAB_Kmeans_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_D_CAB_kmeans"))
+    exact_Kmeans_logs = load_logs(Path(f"{BASE}/iter_logs_Exact_Exact_kmeans"))
+
+    dCABCap_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_Capacity_1_0_Base_single"))
 
 
-
+    exact_full_logs = load_logs(Path(f"{BASE}/iter_logs_Exact_Exact_full"))
+    dCAB_full_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_D_CAB_full"))
+    dUniform_full_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_D_uniform_full"))
+    dCABCap_full_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_Capacity_1_0_Base_full"))
+    # ---- Duality gap plot: now configurable to hide median ----
     plot_mean_gap_vs_time(
         method_logs={
             "Exact Benders": exact_logs,
-            # "Exact Kmeans8": exact_kmeans_logs,
-            "D_CAB": dCAB_logs,
-            "D_Uniform": dUniform_logs,
-            # "D_CAB_NR50": dCAB_NR50,
-            # "D_CAB_NR90": dCAB_NR90,
-            # "Cap_Class": cap_logs,
-            # "Exact Benders (Kmeans)": exact_Kmeans_logs,
-            # "D_CAB (Kmeans)": dCAB_kmeans_logs,
+            "D_CAB Self-Supervised": dCAB_logs,
+            # "D_Uniform": dUniform_logs,
+            "D_CAB Supervised": dCAB_class_logs,
+            # "D_CABCap": dCABCap_logs,
+            # "Exact Full": exact_full_logs,
+            # "D_CAB Full": dCAB_full_logs,
+            # "D_Uniform Full": dUniform_full_logs,
+            # "D_CABCap Full": dCABCap_full_logs,
         },
         figures_dir=Path("comparison_gap_time_figures"),
-        title="Mean relative duality gap vs time (averaged across all samples), Kmeans",
+        title="Mean relative duality gap vs time (averaged across all samples), Single Cut",
+        y_stop_threshold=1e-4,
+        annotate_crossover=True,
+        show_median=False,   # set True to also plot the median curves
+        log_y=True,         # log scale is recommended for the gap plot because it spans many orders of magnitude
     )
 
+    # ---- LB plot, now showing OPTIMALITY GAP (LB*-LB)/LB* on log scale ----
     plot_mean_lb_percent_vs_time(
         method_logs={
             "Exact Benders": exact_logs,
-            "D_CAB": dCAB_logs,
-            "D_Uniform": dUniform_logs,
+            "D_CAB Self-Supervised": dCAB_logs,
+            # "D_Uniform": dUniform_logs,
+            "D_CAB Supervised": dCAB_class_logs,
+            # "D_CABCap": dCABCap_logs,
+            # "Exact Full": exact_full_logs,
+            # "D_CAB Full": dCAB_full_logs,
+            # "D_Uniform Full": dUniform_full_logs,       
+            # "D_CABCap Full": dCABCap_full_logs,
         },
         exact_logs=exact_logs,
         figures_dir=Path("comparison_lb_time_figures"),
-        filename="mean_lb_vs_time_with_crossover.png",
-        title="Mean lower bound vs time (with crossover point)",
+        filename="mean_optimality_gap_vs_time_with_crossover.png",
+        title="Mean optimality gap vs time (averaged across all samples), Single Cut",
+        show_median=False,           # set True to also plot the median curves
+        plot_optimality_gap=True,    # set False to recover the old 100*LB/LB* plot,
+        log_y=True,                 # log scale is recommended for the optimality gap plot
+        y_stop_threshold=1e-2,
+        trim_x_at_threshold=True,
     )
+
+    for method_name, logs in {"D_CAB": dCAB_logs, "D_Uniform": dUniform_logs}.items():
+        switch_iters = []
+        n_inexact_logged = []
+        n_exact_logged = []
+
+        for sid, df in logs.items():
+            flags = df["exact_mode"].astype(bool).to_numpy()
+
+            idx = get_first_crossover_index(df)
+            if idx is not None:
+                switch_iters.append(idx)
+
+            n_inexact_logged.append(int((~flags).sum()))
+            n_exact_logged.append(int(flags.sum()))
+
+        print(f"\n{method_name}")
+        print("mean switch idx:", np.mean(switch_iters))
+        print("median switch idx:", np.median(switch_iters))
+        print("mean inexact logged:", np.mean(n_inexact_logged))
+        print("mean exact logged:", np.mean(n_exact_logged))

@@ -468,10 +468,10 @@ class BendersSolverCutSelection(BendersSolver):
                 compact=compact,
                 investments=investments,
                 time_step=t,
-                ineq_cm_sample=ineq_cm_sample,
-                ineq_rhs_sample=ineq_rhs_sample,
-                eq_cm_sample=eq_cm_sample,
-                eq_rhs_sample=eq_rhs_sample,
+                ineq_cm_sample=ineq_cm_sample.detach().cpu().numpy(),
+                ineq_rhs_sample=ineq_rhs_sample.detach().cpu().numpy(),
+                eq_cm_sample=eq_cm_sample.detach().cpu().numpy(),
+                eq_rhs_sample=eq_rhs_sample.detach().cpu().numpy(),
             )
 
             obj_val, primal_val, dual_val, inference_time = self.solve_matrix_problem_simple(
@@ -740,7 +740,7 @@ def run_cut_selection_experiment(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gep-data-path", type=str, default="data/GEP_data/sample_duration:120_N:B-G-F_G:B2-G2-F2_L:L3.pkl")
+    parser.add_argument("--gep-data-path", type=str, default="data/GEP_data/sample_duration:438_N:B-G-F_G:B2-G2-F2_L:L3.pkl")
     parser.add_argument("--ed-data-path", type=str, default="data/ED_data/ED_NB-G-F_GB2-G2-F2_L3_c0_s0_p0_smp15.pkl")
     parser.add_argument("--sample", type=int, default=0)
     parser.add_argument("--investment", type=float, default=1.0, help="Reference investment for static clustering.")

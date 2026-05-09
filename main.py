@@ -36,6 +36,11 @@ def build_ed_data_save_path(ED_args, nodes_count, nodes_str, gens_str, lines_str
         node_constraint = ED_args.get("gen_data_node_constraint", False)
         node_tag = "_NodeConst" if node_constraint else ""
         gen_data_renew_availability = ED_args.get("gen_data_renew_availability", 100)
+        print(f"Cap Use Hard Cap setting is {ED_args.get('capacity_sobol_use_hard_cap', False)}")
+        if ED_args.get("capacity_sobol_use_hard_cap", False):
+            cap_sobel_tag = "_CapSobol_GenConst"
+        else:
+            cap_sobel_tag = "_CapSobolNoHardCap_GenConst"
 
         if gen_data_renew_availability == 100:
             data_save_path = (
@@ -44,7 +49,7 @@ def build_ed_data_save_path(ED_args, nodes_count, nodes_str, gens_str, lines_str
                 f"_c{int(ED_args['benders_compact'])}"
                 f"_s{int(ED_args['scale_problem'])}"
                 f"_p{int(ED_args['perturb_operating_costs'])}"
-                f"_CapSobol_GenConst"
+                f"{cap_sobel_tag}"
                 f"_ui_constraint{ED_args['max_investment']}"
                 f"_smp{ED_args['2n_synthetic_samples']}"
                 f"_renewMaxInv{ED_args.get('gen_data_constraint_ub_renewable_max_inv', True)}"
@@ -57,7 +62,7 @@ def build_ed_data_save_path(ED_args, nodes_count, nodes_str, gens_str, lines_str
                 f"_c{int(ED_args['benders_compact'])}"
                 f"_s{int(ED_args['scale_problem'])}"
                 f"_p{int(ED_args['perturb_operating_costs'])}"
-                f"_CapSobol_GenConst"
+                f"{cap_sobel_tag}"
                 f"_ui_constraint{ED_args['max_investment']}"
                 f"_smp{ED_args['2n_synthetic_samples']}"
                 f"_renewPerc{gen_data_renew_availability}"

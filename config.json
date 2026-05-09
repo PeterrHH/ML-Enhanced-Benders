@@ -34,9 +34,10 @@
         "_GenAvailablity_comment": "if = 100, availability is the max(availablity) for the renewable, if < 100, availability is set to the specified percentile of availability in the original data",
         "specific_name": "GenConstRenewUBTrue",
         "gen_data_node_constraint": false,
-        "generate_capacity_sobol": false
-
+        "generate_capacity_sobol": false,
+        "capacity_sobol_use_hard_cap": false
     },
+
     "Benders_args": {
        "N": ["BEL", "GER", "FRA"],
         "G": [["BEL", "WindOff"], ["BEL", "Gas"], ["GER", "Gas"], ["GER", "SunPV"], ["FRA", "Nuclear"], ["FRA", "SunPV"]],
@@ -53,17 +54,19 @@
         "normalize_input": false,
         "repeats": 1,
         "device": "cpu",
-        "primal_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BaselineConst2/repeat:0", 
-        "dual_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BaselineConst2/repeat:0",
+        "primal_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BendersBaseline/repeat:0", 
+        "dual_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BendersBaseline/repeat:0",
         "exp_save_directory":"outputs/Benders/3Node",
-        "specific_name":"ConstD_1_kmeans10",
+        "specific_name":"D_uniform_single",
         "benders_setup": "Inexact_Refine",
         "_Comment_benders_setup": "Benders setup options: [Exact, Inexact, Inexact_Refine, All], All is when all three are run",
         "init_investment": "Zero",
         "_Comment_init_investment": "Options for initial investment solution for Benders: Zero, HalfMax",
-        "cut_selection": "kmeans",
+        "cut_selection": "single",
         "cut_selection_k": 10,
-        "_cut_selection_comment":"Options are: single, kmeans, stress, full"
+        "_cut_selection_comment":"Options are: single, kmeans, stress, full",
+        "parallel_subproblems": false,
+        "n_workers": null
     },
     "Optuna_args": {
         "optuna": false,
@@ -103,6 +106,8 @@
     "learn_dual": true,
     "dual_alternate_loss": true,
     "dual_completion": true,
+    "snap_lambda_dual_completion": false,
+
     "dual_classification": true,
     "normalize_by_gt": false,
     "loss_option": "Original",
@@ -131,24 +136,33 @@
     "early_stopping_patience": 0,
 
     "dual_regularization": "NA",
-    "_comment_dual_reg": "Option: [NA, S3L]",
+    "_comment_dual_reg": "Option: [NA, S3L, S3L-complete-only]",
     "mu_barrier_init": 1.0,
-    "mu_barrier_decay": 0.90,
-    "mu_barrier_min": 1e-6,
+    "mu_barrier_decay": 0.75,
+    "mu_barrier_min": 0.0001,
 
     "clamp_lambda": false,
 
     "dual_gumbel": false,
-    "gumbel_tau_init": 1.0,
-    "gumbel_tau_decay": 0.95,
-    "gumbel_tau_min": 0.1,
+    "gumbel_tau_init": 0.8,
+    "gumbel_tau_decay": 0.9,
+    "gumbel_tau_min": 0.3,
 
     "use_prod_surplus_input": false,
 
     "SeperatePredicationHead": true,
     "oracle_loss_weight": false,
     "oracle_weight_alpha": 5.0,
-    "oracle_supervised_dual": true
+    "oracle_supervised_dual": true,
 
+    "entropy_in_loss": false,
+    "entropy_weight": 10.0,
+
+    "use_difficulty_weighting": false,
+    "difficulty_weight_scale": 1.0,
+    "difficulty_weight_clamp_min": 0.3,
+    "difficulty_weight_clamp_max": 3.0,
+
+    "use_topology_features": true
 
 }   
