@@ -154,6 +154,30 @@ class GEPOperationalProblemSet():
         else:
             self.total_demands = torch.ones((self.X.shape[0], 1))
 
+
+        if self.ED_args.get("precompute_heuristic_lambda_labels", False):
+            print("Precomputing heuristic lambda soft labels...")
+
+            (
+                self.heuristic_lambda_soft_labels,
+                self.heuristic_lambda_confidence,
+                self.heuristic_lambda_tier,
+                self.heuristic_lambda_classes,
+            ) = self.compute_heuristic_lambda_soft_labels(
+                X=self.X,
+                local_main_mass=self.ED_args.get("heuristic_lambda_local_main_mass", 0.80),
+                local_unmet_mass=self.ED_args.get("heuristic_lambda_local_unmet_mass", 0.03),
+                unmet_main_mass=self.ED_args.get("heuristic_lambda_unmet_main_mass", 0.93),
+                tricky_global_mass=self.ED_args.get("heuristic_lambda_tricky_global_mass", 0.45),
+                tricky_all_gen_mass=self.ED_args.get("heuristic_lambda_tricky_all_gen_mass", 0.35),
+                tricky_unmet_mass=self.ED_args.get("heuristic_lambda_tricky_unmet_mass", 0.20),
+                similarity_temperature=self.ED_args.get("heuristic_lambda_similarity_temperature", 2.0),
+            )
+
+            print("Heuristic lambda soft labels:", self.heuristic_lambda_soft_labels.shape)
+            print("Heuristic lambda confidence:", self.heuristic_lambda_confidence.shape)
+            print("Heuristic lambda tier:", self.heuristic_lambda_tier.shape)
+
         self.xdim = self.X.shape[1]
 
         self.opt_targets = self.compute_opt_targets() # Solve for the opt target
@@ -215,6 +239,220 @@ class GEPOperationalProblemSet():
         self.capacity_samples = self.capacity_samples[perm]
 
         return X
+    
+    def compute_heuristic_lambda_soft_labels(
+        self,
+        X=None,
+        local_main_mass=0.80,
+        local_unmet_mass=0.03,
+        unmet_main_mass=0.93,
+        tricky_global_mass=0.45,
+        tricky_all_gen_mass=0.35,
+        tricky_unmet_mass=0.20,
+        similarity_temperature=2.0,
+        eps=1e-8,
+    ):
+        """
+        Precompute heuristic soft lambda labels for all samples.
+
+        Returns:
+            soft_labels: [B, N, K]
+            confidence:  [B, N]
+            tier:        [B, N]
+            classes:     [K]
+        """
+        if X is None:
+            X = self.X
+
+        device = X.device
+        dtype = X.dtype
+
+        B = X.shape[0]
+        N = self.num_n
+        G = self.num_g
+
+        D = X[:, :N]
+        cap = X[:, N:N + G]
+
+        cost_vec = self.cost_vec
+        if not isinstance(cost_vec, torch.Tensor):
+            cost_vec = torch.tensor(cost_vec, dtype=dtype, device=device)
+        cost_vec = cost_vec.to(device=device, dtype=dtype)
+
+        classes = -1.0 * torch.cat([
+            torch.unique(cost_vec),
+            torch.tensor([self.pVOLL], device=device, dtype=dtype),
+        ])
+        K = classes.numel()
+
+        def nearest_class_idx(values):
+            return torch.abs(
+                values.unsqueeze(-1) - classes.view(*([1] * values.ndim), -1)
+            ).argmin(dim=-1)
+
+        node_to_gen_mask = self.node_to_gen_mask.to(device=device)
+        node_of_g = node_to_gen_mask.argmax(dim=0).long()
+
+        gen_lambda_values = -1.0 * cost_vec
+        gen_class_idx = nearest_class_idx(gen_lambda_values)
+
+        unmet_value = torch.tensor(-float(self.pVOLL), device=device, dtype=dtype)
+        unmet_class_idx = int(nearest_class_idx(unmet_value).item())
+
+        # Import capacity per node.
+        if hasattr(self, "lineflow_mask") and hasattr(self, "pImpCap"):
+            line_mask = self.lineflow_mask.to(device=device, dtype=dtype)
+            import_mask = (line_mask == 1).to(dtype)
+
+            F_imp = torch.tensor(
+                [self.pImpCap[l] for l in self.L],
+                device=device,
+                dtype=dtype,
+            )
+            import_capacity = import_mask @ F_imp
+        else:
+            import_capacity = torch.zeros(N, device=device, dtype=dtype)
+
+        gens_at_node = []
+        for n in range(N):
+            gens_n = [g for g in range(G) if int(node_of_g[g].item()) == n]
+            gens_n.sort(key=lambda g: float(cost_vec[g].detach().cpu()))
+            gens_at_node.append(gens_n)
+
+        gens_global = list(range(G))
+        gens_global.sort(key=lambda g: float(cost_vec[g].detach().cpu()))
+
+        soft_labels = torch.zeros((B, N, K), device=device, dtype=dtype)
+        confidence = torch.zeros((B, N), device=device, dtype=dtype)
+        tier = torch.zeros((B, N), device=device, dtype=torch.long)
+
+        gen_class_mask = torch.zeros(K, device=device, dtype=torch.bool)
+        for k in gen_class_idx:
+            gen_class_mask[int(k.item())] = True
+        gen_class_mask[unmet_class_idx] = False
+
+        def add_cost_similarity_mass(q, center_class_idx, mass):
+            if mass <= 0:
+                return q
+
+            center_value = classes[center_class_idx]
+            dist = torch.abs(classes - center_value)
+
+            logits = -dist / max(float(similarity_temperature), eps)
+            logits[~gen_class_mask] = -1e9
+            logits[center_class_idx] = -1e9
+
+            weights = torch.softmax(logits, dim=0)
+
+            if torch.isfinite(weights).all() and weights.sum() > 0:
+                q = q + mass * weights
+
+            return q
+
+        def make_smoothed_unmet_label(q, unmet_mass):
+            q[:] = 0.0
+            q[unmet_class_idx] = unmet_mass
+
+            rest_mass = 1.0 - unmet_mass
+            if rest_mass > 0:
+                gen_indices = torch.where(gen_class_mask)[0]
+                if len(gen_indices) > 0:
+                    q[gen_indices] += rest_mass / len(gen_indices)
+
+            q = q / q.sum().clamp_min(eps)
+            return q
+
+        for b in range(B):
+            total_demand = D[b].sum()
+
+            global_marginal_class = None
+            cumulative = torch.tensor(0.0, device=device, dtype=dtype)
+
+            for g in gens_global:
+                cumulative = cumulative + cap[b, g]
+                if cumulative + eps >= total_demand:
+                    global_marginal_class = int(gen_class_idx[g].item())
+                    break
+
+            if global_marginal_class is None:
+                global_marginal_class = unmet_class_idx
+
+            for n in range(N):
+                q = torch.zeros(K, device=device, dtype=dtype)
+
+                local_gens = gens_at_node[n]
+
+                if local_gens:
+                    local_capacity = torch.stack([cap[b, g] for g in local_gens]).sum()
+                else:
+                    local_capacity = torch.tensor(0.0, device=device, dtype=dtype)
+
+                demand_n = D[b, n]
+                import_n = import_capacity[n]
+
+                # Tier 3
+                if local_capacity + import_n + eps < demand_n:
+                    q = make_smoothed_unmet_label(q, unmet_main_mass)
+
+                    soft_labels[b, n] = q
+                    confidence[b, n] = unmet_main_mass
+                    tier[b, n] = 3
+                    continue
+
+                # Tier 1
+                if local_capacity + eps >= demand_n:
+                    remaining = demand_n.clone()
+                    marginal_g = None
+
+                    for g in local_gens:
+                        if cap[b, g] + eps >= remaining:
+                            marginal_g = g
+                            break
+                        remaining = remaining - cap[b, g]
+
+                    if marginal_g is None:
+                        marginal_g = local_gens[-1]
+
+                    marginal_class = int(gen_class_idx[marginal_g].item())
+
+                    q[marginal_class] += local_main_mass
+                    q[unmet_class_idx] += local_unmet_mass
+
+                    rest_mass = 1.0 - local_main_mass - local_unmet_mass
+                    q = add_cost_similarity_mass(q, marginal_class, rest_mass)
+                    q = q / q.sum().clamp_min(eps)
+
+                    cap_g = cap[b, marginal_g].clamp_min(eps)
+                    used_frac = (remaining / cap_g).clamp(0.0, 1.0)
+                    boundary_score = torch.minimum(used_frac, 1.0 - used_frac)
+                    conf = 0.65 + 0.30 * (2.0 * boundary_score)
+                    conf = conf.clamp(0.55, 0.95)
+
+                    soft_labels[b, n] = q
+                    confidence[b, n] = conf
+                    tier[b, n] = 1
+                    continue
+
+                # Tier 2
+                q[global_marginal_class] += tricky_global_mass
+
+                if tricky_all_gen_mass > 0:
+                    gen_indices = torch.where(gen_class_mask)[0]
+                    if len(gen_indices) > 0:
+                        center_value = classes[global_marginal_class]
+                        dist = torch.abs(classes[gen_indices] - center_value)
+                        logits = -dist / max(float(similarity_temperature), eps)
+                        weights = torch.softmax(logits, dim=0)
+                        q[gen_indices] += tricky_all_gen_mass * weights
+
+                q[unmet_class_idx] += tricky_unmet_mass
+                q = q / q.sum().clamp_min(eps)
+
+                soft_labels[b, n] = q
+                confidence[b, n] = 0.30
+                tier[b, n] = 2
+
+        return soft_labels, confidence, tier, classes
 
     def generate_capacity_data_constraint(
         self,

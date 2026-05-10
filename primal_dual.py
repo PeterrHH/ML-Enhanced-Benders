@@ -10,6 +10,8 @@ from mtadam import MTAdam
 from networks import DualClassificationNetEndToEnd, DualNet, DualNetEndToEnd, PrimalNet, PrimalNetEndToEnd
 import optuna
 import matplotlib.pyplot as plt
+import torch.nn.functional as F
+
 torch.autograd.set_detect_anomaly(False)
 torch.set_num_threads(4)
 torch.set_num_interop_threads(1)
@@ -186,6 +188,30 @@ class PrimalDualTrainer():
         self.total_demands_train = self.total_demands[self.train_indices]
         self.total_demands_valid = self.total_demands[self.valid_indices]
 
+
+        if self.args.get("use_heuristic_lambda_loss", False):
+            # Using Heuristic Soft Label in computing Loss
+
+            self.heur_soft_all = self.data.heuristic_lambda_soft_labels.to(self.DTYPE).to(self.DEVICE)
+            self.heur_conf_all = self.data.heuristic_lambda_confidence.to(self.DTYPE).to(self.DEVICE)
+            self.heur_tier_all = self.data.heuristic_lambda_tier.to(self.DEVICE)
+
+            self.heur_soft_train = self.heur_soft_all[self.train_indices]
+            self.heur_conf_train = self.heur_conf_all[self.train_indices]
+            self.heur_tier_train = self.heur_tier_all[self.train_indices]
+
+            self.heur_soft_valid = self.heur_soft_all[self.valid_indices]
+            self.heur_conf_valid = self.heur_conf_all[self.valid_indices]
+            self.heur_tier_valid = self.heur_tier_all[self.valid_indices]
+
+        else:
+            self.heur_soft_train = None
+            self.heur_conf_train = None
+            self.heur_tier_train = None
+            self.heur_soft_valid = None
+            self.heur_conf_valid = None
+            self.heur_tier_valid = None
+
         self.mu_targets_all = self.data.opt_targets["mu_operational"].to(self.DTYPE).to(self.DEVICE)
         self.lamb_targets_all = self.data.opt_targets["lamb_operational"].to(self.DTYPE).to(self.DEVICE)
 
@@ -206,23 +232,45 @@ class PrimalDualTrainer():
         self.opt_target_val = self.data.opt_targets["y_operational"].to(self.DTYPE).to(self.DEVICE)[self.valid_indices]
         self.target_obj_val  = self.data.opt_targets["obj"].to(self.DTYPE).to(self.DEVICE)[self.valid_indices]
         
-        self.train_dataset = TensorDataset(
-            self.X_train,
-            self.total_demands_train,
-            self.target_obj_train,
-            self.mu_targets_train,
-            self.lamb_targets_train,
-        )
+        if self.args.get("use_heuristic_lambda_loss", False):
+            self.train_dataset = TensorDataset(
+                self.X_train,
+                self.total_demands_train,
+                self.target_obj_train,
+                self.mu_targets_train,
+                self.lamb_targets_train,
+                self.heur_soft_train,
+                self.heur_conf_train,
+                self.heur_tier_train,
+            )
 
-        self.valid_dataset = TensorDataset(
-            self.X_valid,
-            self.total_demands_valid,
-            self.target_obj_val,
-            self.mu_targets_valid,
-            self.lamb_targets_valid,
-        )
-        # self.test_dataset = TensorDataset(self.data.testX.to(self.DEVICE), self.data.testX_scaled.to(self.DEVICE))
+            self.valid_dataset = TensorDataset(
+                self.X_valid,
+                self.total_demands_valid,
+                self.target_obj_val,
+                self.mu_targets_valid,
+                self.lamb_targets_valid,
+                self.heur_soft_valid,
+                self.heur_conf_valid,
+                self.heur_tier_valid,
+            )
+        else:
+            self.train_dataset = TensorDataset(
+                self.X_train,
+                self.total_demands_train,
+                self.target_obj_train,
+                self.mu_targets_train,
+                self.lamb_targets_train,
+            )
 
+            self.valid_dataset = TensorDataset(
+                self.X_valid,
+                self.total_demands_valid,
+                self.target_obj_val,
+                self.mu_targets_valid,
+                self.lamb_targets_valid,
+            )
+            
         self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, generator=torch.Generator(device=self.DEVICE))
         self.valid_loader = DataLoader(self.valid_dataset, batch_size=len(self.valid_dataset), generator=torch.Generator(device=self.DEVICE))
         # self.test_loader = DataLoader(self.test_dataset, batch_size=len(self.test_dataset))
@@ -271,6 +319,25 @@ class PrimalDualTrainer():
         # self.primal_optim = MTAdam(self.primal_net.parameters(), lr=self.primal_lr)
         # self.dual_optim = MTAdam(self.dual_net.parameters(), lr=self.dual_lr)
 
+
+        if self.args.get("use_heuristic_lambda_loss", False):
+            data_classes = self.data.heuristic_lambda_classes.to(
+                device=self.DEVICE,
+                dtype=self.DTYPE,
+            )
+            model_classes = self.dual_net.classes.to(
+                device=self.DEVICE,
+                dtype=self.DTYPE,
+            )
+
+            print("data heuristic classes:", data_classes)
+            print("model lambda classes:", model_classes)
+
+            if data_classes.shape != model_classes.shape or not torch.allclose(data_classes, model_classes, atol=1e-10):
+                raise ValueError(
+                    "Heuristic lambda class order does not match dual_net.classes. "
+                    "Soft labels would supervise the wrong class indices."
+                )
         # Add schedulers
         self.primal_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.primal_optim, mode='min', factor=self.decay, patience=self.patience
@@ -555,7 +622,30 @@ class PrimalDualTrainer():
 
                     num_batches = 0
 
-                    for (Xtrain, total_demands, X_opt,  mu_true_batch, lamb_true_batch) in self.train_loader:
+                    for batch in self.train_loader:
+                        if self.args.get("use_heuristic_lambda_loss", False):
+                            (
+                                Xtrain,
+                                total_demands,
+                                X_opt,
+                                mu_true_batch,
+                                lamb_true_batch,
+                                heur_soft_batch,
+                                heur_conf_batch,
+                                heur_tier_batch,
+                            ) = batch
+                        else:
+                            (
+                                Xtrain,
+                                total_demands,
+                                X_opt,
+                                mu_true_batch,
+                                lamb_true_batch,
+                            ) = batch
+
+                            heur_soft_batch = None
+                            heur_conf_batch = None
+                            heur_tier_batch = None
                         
                         compute_begin_time = time.time()
 
@@ -673,7 +763,30 @@ class PrimalDualTrainer():
                     total_penalty = 0.0
 
                     num_batches = 0
-                    for (Xtrain, total_demands, X_opt,  mu_true_batch, lamb_true_batch) in self.train_loader:
+                    for batch in self.train_loader:
+                        if self.args.get("use_heuristic_lambda_loss", False):
+                            (
+                                Xtrain,
+                                total_demands,
+                                X_opt,
+                                mu_true_batch,
+                                lamb_true_batch,
+                                heur_soft_batch,
+                                heur_conf_batch,
+                                heur_tier_batch,
+                            ) = batch
+                        else:
+                            (
+                                Xtrain,
+                                total_demands,
+                                X_opt,
+                                mu_true_batch,
+                                lamb_true_batch,
+                            ) = batch
+
+                            heur_soft_batch = None
+                            heur_conf_batch = None
+                            heur_tier_batch = None
                         compute_begin_time = time.time()
                         self.dual_optim.zero_grad()
                         if self.dual_regularization == "S3L":
@@ -718,6 +831,9 @@ class PrimalDualTrainer():
                                 lamb_k=lamb_k,
                                 X_opt=X_opt,
                                 lamb_true=lamb_true_batch if self.args.get("oracle_loss_weight", False) else None,
+                                heur_soft=heur_soft_batch,
+                                heur_conf=heur_conf_batch,
+                                heur_tier=heur_tier_batch,
                             )
 
 
@@ -825,13 +941,29 @@ class PrimalDualTrainer():
             
             # EVALUATE primal and dual net after each outer iteration
             if self.args["learn_primal"] and self.args["learn_dual"]:
-                obj_value, primal_obj, dual_obj_target, dual_obj= self.compute_primal_dual_metric(self.valid_dataset.tensors[0], self.valid_dataset.tensors[1], self.primal_net, self.dual_net, self.valid_dataset.tensors[2])    
+                obj_value, primal_obj, dual_obj_target, dual_obj= self.compute_primal_dual_metric(self.valid_dataset.tensors[0], self.valid_dataset.tensors[1], self.primal_net, self.dual_net, self.valid_dataset.tensors[2])   
+
+
+                if self.args.get("use_heuristic_lambda_loss", False):
+                    valid_heur_loss = self.evaluate_heuristic_lambda_loss(
+                        X=self.valid_dataset.tensors[0],
+                        heur_soft=self.valid_dataset.tensors[5],
+                        heur_conf=self.valid_dataset.tensors[6],
+                        heur_tier=self.valid_dataset.tensors[7],
+                        prefix="outer_valid",
+                        outer_iter=k,
+                    )
+                else:
+                    valid_heur_loss = None
+
+
                 primal_opt_gap, primal_opt_gap_full = self.compute_opt_gap(primal_obj, obj_value, if_primal=True)
                 dual_opt_gap,dual_opt_gap_full = self.compute_opt_gap(dual_obj, dual_obj_target, if_primal = False)
                 duality_gap,_ = self.compute_dual_gap(primal_obj, dual_obj, obj_value)
                 self.primal_obj_list.append(primal_opt_gap)
                 self.dual_obj_list.append(dual_opt_gap)
                 self.duality_gap_list.append(duality_gap)
+
                 '''
                 Eval Metric Here
                 '''
@@ -943,15 +1075,54 @@ class PrimalDualTrainer():
                 # Update the best objective for this threshold
                 self.best_primal_objs[i] = obj_val_mean
 
-        # Dual Model Saving Logic
-        # if dual_obj_val_mean > self.best_dual_obj:
-        #     print(f"Saving new best dual model: Obj: {dual_obj_val_mean:.4f}")
-            
-        #     dual_save_path = os.path.join(self.save_dir, 'best_dual_net.pth')
-        #     torch.save(self.dual_net.state_dict(), dual_save_path)
-            
-        #     # Update the best overall dual objective
-        #     self.best_dual_obj = dual_obj_val_mean
+    @torch.no_grad()
+    def evaluate_heuristic_lambda_loss(
+        self,
+        X,
+        heur_soft,
+        heur_conf,
+        heur_tier,
+        prefix="valid",
+        outer_iter=None,
+    ):
+        """
+        Evaluate current dual model against precomputed heuristic soft labels.
+
+        Returns:
+            mean heuristic CE loss after tier/confidence weighting.
+        """
+        if not isinstance(self.dual_net, DualClassificationNetEndToEnd):
+            return None
+
+        if heur_soft is None:
+            return None
+
+        self.dual_net.eval()
+
+        heuristic_term = self.heuristic_lambda_regularization_loss_from_batch(
+            X=X,
+            soft_labels=heur_soft,
+            confidence=heur_conf,
+            tier=heur_tier,
+        )  # [B]
+
+        mean_heur_loss = heuristic_term.mean().item()
+
+        row = {
+            "outer_iter": -1 if outer_iter is None else int(outer_iter),
+            "step": int(self.step),
+            "prefix": prefix,
+            "heuristic_lambda_loss": mean_heur_loss,
+        }
+
+        print(
+            f"[HeurLoss:{prefix}] "
+            f"outer={row['outer_iter']} step={row['step']} | "
+            f"heur_lambda_loss={mean_heur_loss:.6f}"
+        )
+
+        return mean_heur_loss
+
 
     def evaluate(self, X, total_demands, primal_net, dual_net, X_Opt, lamb_true=None, outer_iter=None, inner_iter=None, print_diff_weighting = False):    
         # Forward pass through networks
@@ -1013,6 +1184,8 @@ class PrimalDualTrainer():
                         f"diff range: [{difficulty[top_mask].min():.2f}, {difficulty[top_mask].max():.2f}]) | "
                         f"bot-10% diff: {dual_gap_per_sample[bot_mask].mean():.2f}% "
                         f"({bot_mask.sum().item()} samples)")
+
+        
 
         return torch.mean(obj_values), torch.mean(primal_obj), torch.mean(primal_losses), torch.mean(ineq_max_vals), torch.mean(ineq_mean_vals), torch.mean(eq_max_vals), torch.mean(eq_mean_vals), torch.mean(dual_obj), torch.mean(dual_losses)
 
@@ -1169,7 +1342,58 @@ class PrimalDualTrainer():
 
         return entropy_per_sample
     
-    def alternate_dual_loss(self, X, y, mu, lamb, X_opt ,mu_k=None, lamb_k=None, lamb_true = None):
+    def heuristic_lambda_regularization_loss_from_batch(
+        self,
+        X,
+        soft_labels,
+        confidence,
+        tier,
+    ):
+        """
+        Use precomputed heuristic soft labels.
+
+        Returns:
+            loss_per_sample: [B]
+        """
+        if not isinstance(self.dual_net, DualClassificationNetEndToEnd):
+            raise TypeError("Heuristic lambda loss requires DualClassificationNetEndToEnd.")
+
+        logits = self.dual_net.get_lambda_logits(X)  # [B, N, K]
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+        ce_per_node = -(soft_labels * log_probs).sum(dim=-1)  # [B, N]
+
+        tier1_weight = float(self.args.get("heuristic_lambda_tier1_weight", 1.0))
+        tier2_weight = float(self.args.get("heuristic_lambda_tier2_weight", 0.1))
+        tier3_weight = float(self.args.get("heuristic_lambda_tier3_weight", 1.0))
+
+        weights = torch.zeros_like(confidence)
+
+        weights = torch.where(
+            tier == 1,
+            torch.tensor(tier1_weight, device=X.device, dtype=X.dtype),
+            weights,
+        )
+        weights = torch.where(
+            tier == 2,
+            torch.tensor(tier2_weight, device=X.device, dtype=X.dtype),
+            weights,
+        )
+        weights = torch.where(
+            tier == 3,
+            torch.tensor(tier3_weight, device=X.device, dtype=X.dtype),
+            weights,
+        )
+
+        weights = weights * confidence
+
+        loss_per_sample = (weights * ce_per_node).sum(dim=1) / weights.sum(dim=1).clamp_min(1e-12)
+
+        return loss_per_sample
+    
+    def alternate_dual_loss(self, X, y, mu, lamb, X_opt ,
+                            mu_k=None, lamb_k=None, lamb_true = None,
+                            heur_soft = None, heur_conf = None, heur_tier = None):
         #! We maximize the dual obj func, so to use it in the loss, take the negation.
         dual_obj = self.data.dual_obj_fn(X, mu, lamb)
 
@@ -1225,6 +1449,21 @@ class PrimalDualTrainer():
             weights = self.compute_oracle_loss_weights(lamb_true)
             loss = loss * weights
         #! Dual constraints are never violated, so we do not include penalty and lagrangian terms.
+
+
+        heuristic_term = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+
+        if self.args.get("use_heuristic_lambda_loss", False) and heur_soft is not None:
+            if not isinstance(self.dual_net, DualClassificationNetEndToEnd):
+                raise TypeError("use_heuristic_lambda_loss=True requires dual_classification=True.")
+            
+            heuristic_weight = float(self.args.get("heuristic_lambda_weight", 0.01))
+            heuristic_term = self.heuristic_lambda_regularization_loss_from_batch(X,
+                                                                                  soft_labels=heur_soft,
+                                                                                  confidence=heur_conf,
+                                                                                  tier=heur_tier)
+            loss = loss + heuristic_weight * heuristic_term
+            
 
         if self.args.get("entropy_in_loss", False):
             # Add entropy to regularize and pushes model to pick one of the discrete classes, instead of a mixture.
