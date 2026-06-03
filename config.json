@@ -22,7 +22,7 @@
         "2n_synthetic_samples": 15,
         "synthetic_demand_capacity": false,
         "normalize_input": false,
-        "repeats": 1,
+        "repeats": 5,
         "device": "cpu",
         "gen_data_constraint": true,
         "gen_data_constraint_lb": false,
@@ -38,16 +38,10 @@
         "capacity_sobol_use_hard_cap": false,
 
 
-        "precompute_heuristic_lambda_labels": true,
-        "heuristic_lambda_local_main_mass": 0.90,
-        "heuristic_lambda_local_unmet_mass": 0.01,
-        "heuristic_lambda_unmet_main_mass": 0.93,
-      
-        "heuristic_lambda_tricky_global_mass": 0.45,
-        "heuristic_lambda_tricky_all_gen_mass": 0.35,
-        "heuristic_lambda_tricky_unmet_mass": 0.20,
-      
-        "heuristic_lambda_similarity_temperature": 2.0
+        "precompute_heuristic_lambda_labels": false,
+        "heuristic_lambda_main_mass": 0.85,
+        "heuristic_lambda_unmet_safety_mass": 0.02,
+        "heuristic_lambda_tier2_confidence": 0.10
     },
 
     "Benders_args": {
@@ -58,7 +52,7 @@
         "scale_problem": false,
         "scale_input": false,
         "perturb_operating_costs": false,
-        "sample_duration": 120,
+        "sample_duration": 1752, 
         "_comment_sample_duration": "Max sample duration is 8760",
         "max_investment": 100000,
         "2n_synthetic_samples": 15,
@@ -66,16 +60,17 @@
         "normalize_input": false,
         "repeats": 1,
         "device": "cpu",
-        "primal_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-SoftLabel-EqualTierW/repeat:0", 
-        "dual_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-SoftLabel-EqualTierW/repeat:0",
+        "primal_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/Constraint-byNode/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-SoftLabel-w=100-Official/repeat:3", 
+        "dual_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/Constraint-byNode/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-SoftLabel-w=100-Official/repeat:3",
         "exp_save_directory":"outputs/Benders/3Node",
-        "specific_name":"D_CAB_SoftLabel_single",
+        "specific_name":"D_ConstNode_SoftLabel_100_kmeans",
         "benders_setup": "Inexact_Refine",
         "_Comment_benders_setup": "Benders setup options: [Exact, Inexact, Inexact_Refine, All], All is when all three are run",
         "init_investment": "Zero",
         "_Comment_init_investment": "Options for initial investment solution for Benders: Zero, HalfMax",
-        "cut_selection": "single",
+        "cut_selection": "kmeans",
         "cut_selection_k": 10,
+        "bound_alpha_by_0": true,
         "_cut_selection_comment":"Options are: single, kmeans, stress, full",
         "parallel_subproblems": false,
         "n_workers": null
@@ -162,7 +157,7 @@
 
     "use_prod_surplus_input": false,
 
-    "SeperatePredicationHead": true,
+    "SeperatePredicationHead": false,
     "oracle_loss_weight": false,
     "oracle_weight_alpha": 5.0,
     "oracle_supervised_dual": false,
@@ -179,9 +174,6 @@
 
 
     "use_heuristic_lambda_loss": true,
-    "heuristic_lambda_weight": 1.0,
+    "heuristic_lambda_weight": 100.0
 
-    "heuristic_lambda_tier1_weight": 1.0,
-    "heuristic_lambda_tier2_weight": 1.0,
-    "heuristic_lambda_tier3_weight": 1.0
 }   

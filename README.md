@@ -68,6 +68,8 @@ data/ED_data/Constraint/3Loc/ED_NB-G-F_GB2-G2-F2_L3_c0_s0_p0_CapSobol_GenConst_u
 # Key Model Trained
 
 1. $D_{uniform}: `learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BendersBaseline`
+1. $D_{uniform} Dual: `experiment-output/ch7/3nodes/dual_model`
+1. $D_{uniform} Primal: `experiment-output/ch7/3nodes/primal_model`
 2. $D_{CAB}: `Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-BaselineConst2`
 2.1 $D_{CAB}: `Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-D_CAB_Classify`
 3. $D_{CAB-NR50}: `Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-Const10000Perc50`
@@ -78,3 +80,28 @@ data/ED_data/Constraint/3Loc/ED_NB-G-F_GB2-G2-F2_L3_c0_s0_p0_CapSobol_GenConst_u
 7. Capacity Beta 1.0: `Capacity-Based/beta_1.0/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-Cap-Baseline`
 
 
+
+
+## Official Models 
+Three NOde home directory `outputs/PDL/ED/3Nodes-FraBelGer`
+1. Self-supervised Baseline
+`Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-ConstBaseline-Official/repeat:3`
+2. Soft Label beta = 1:
+`Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-SoftLabel-w=1-Official/repeat:3`
+3. Soft Label beta = 10:
+`Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-SoftLabel-w=10-Official/repeat:1`
+4. Soft Label beta = 100:
+`Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-SoftLabel-w=100-Official/repeat:3`
+5. Soft Label beta = 1000:
+`Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-SoftLabel-w=1000-Official/repeat:4`
+6. Fully Supervised:
+`Constraint/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-Fully-Supervised-Officialrepeat:4`
+
+## Node Const
+
+7. Self-supervised Baseline
+`Constraint-byNode/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-SSBaseline/repeat:2`
+8. Soft Label beta = 10:
+`Constraint-byNode/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-SoftLabel-w=10-Official/repeat:2`
+9. Soft Label beta = 100:
+`Constraint-byNode/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-SoftLabel-w=100-Official/repeat:3`

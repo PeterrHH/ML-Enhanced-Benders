@@ -850,9 +850,8 @@ class PrimalDualTrainer():
           
 
                         batch_loss.backward()
-                        # output_layer = self.dual_net.feed_forward.net[-1]  # last Linear
-                        #print("[DEBUG] Output layer grad norm:", output_layer.weight.grad.norm().item())
 
+                        # After first batch loss computation, before backward:
                         self.dual_optim.step()
                         compute_end_time = time.time()
                         self.train_time += compute_end_time - compute_begin_time
@@ -1347,11 +1346,17 @@ class PrimalDualTrainer():
         X,
         soft_labels,
         confidence,
-        tier,
+        tier,  # kept for logging/debugging, not used in loss
     ):
         """
-        Use precomputed heuristic soft labels.
-
+        Heuristic soft-label cross-entropy loss for the dual lambda classifier.
+        
+        Per-node weighting is fully encoded in `confidence`, which is set
+        per tier in compute_heuristic_lambda_soft_labels:
+            Tier 1 (locally feasible)   
+            Tier 2 (needs transmission) 
+            Tier 3 (infeasible)         
+        
         Returns:
             loss_per_sample: [B]
         """
@@ -1363,31 +1368,10 @@ class PrimalDualTrainer():
 
         ce_per_node = -(soft_labels * log_probs).sum(dim=-1)  # [B, N]
 
-        tier1_weight = float(self.args.get("heuristic_lambda_tier1_weight", 1.0))
-        tier2_weight = float(self.args.get("heuristic_lambda_tier2_weight", 0.1))
-        tier3_weight = float(self.args.get("heuristic_lambda_tier3_weight", 1.0))
-
-        weights = torch.zeros_like(confidence)
-
-        weights = torch.where(
-            tier == 1,
-            torch.tensor(tier1_weight, device=X.device, dtype=X.dtype),
-            weights,
+        loss_per_sample = (
+            (confidence * ce_per_node).sum(dim=1)
+            / confidence.sum(dim=1).clamp_min(1e-12)
         )
-        weights = torch.where(
-            tier == 2,
-            torch.tensor(tier2_weight, device=X.device, dtype=X.dtype),
-            weights,
-        )
-        weights = torch.where(
-            tier == 3,
-            torch.tensor(tier3_weight, device=X.device, dtype=X.dtype),
-            weights,
-        )
-
-        weights = weights * confidence
-
-        loss_per_sample = (weights * ce_per_node).sum(dim=1) / weights.sum(dim=1).clamp_min(1e-12)
 
         return loss_per_sample
     
@@ -1463,7 +1447,13 @@ class PrimalDualTrainer():
                                                                                   confidence=heur_conf,
                                                                                   tier=heur_tier)
             loss = loss + heuristic_weight * heuristic_term
-            
+            # After first batch loss computation, before backward:
+            effective_dual = loss.detach()
+            effective_heur = heuristic_weight * heuristic_term.detach()
+            # print(f"[Loss magnitudes, post-norm] "
+            #     f"effective_dual: {effective_dual.abs().mean().item():.4e}, "
+            #     f"effective_heur: {effective_heur.mean().item():.4e}, "
+            #     f"ratio: {effective_dual.abs().mean().item() / max(effective_heur.mean().item(), 1e-12):.2e}")
 
         if self.args.get("entropy_in_loss", False):
             # Add entropy to regularize and pushes model to pick one of the discrete classes, instead of a mixture.

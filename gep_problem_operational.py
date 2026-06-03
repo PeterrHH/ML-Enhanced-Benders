@@ -157,30 +157,60 @@ class GEPOperationalProblemSet():
 
         if self.ED_args.get("precompute_heuristic_lambda_labels", False):
             print("Precomputing heuristic lambda soft labels...")
+            # (
+            #     self.heuristic_lambda_soft_labels,
+            #     self.heuristic_lambda_confidence,
+            #     self.heuristic_lambda_tier,
+            #     self.heuristic_lambda_classes,
+            # ) = self.compute_heuristic_lambda_soft_labels(
+            #     X=self.X,
+            #     main_mass=self.ED_args.get("heuristic_lambda_main_mass", 0.85),
+            #     unmet_safety_mass=self.ED_args.get("heuristic_lambda_unmet_safety_mass", 0.02),
+            #     tier2_confidence=self.ED_args.get("heuristic_lambda_tier2_confidence", 0.10),
+            # )
 
+            start_time = time.perf_counter()
             (
                 self.heuristic_lambda_soft_labels,
                 self.heuristic_lambda_confidence,
                 self.heuristic_lambda_tier,
                 self.heuristic_lambda_classes,
-            ) = self.compute_heuristic_lambda_soft_labels(
+            ) = self.compute_heuristic_lambda_soft_labels_vectorized(
                 X=self.X,
-                local_main_mass=self.ED_args.get("heuristic_lambda_local_main_mass", 0.80),
-                local_unmet_mass=self.ED_args.get("heuristic_lambda_local_unmet_mass", 0.03),
-                unmet_main_mass=self.ED_args.get("heuristic_lambda_unmet_main_mass", 0.93),
-                tricky_global_mass=self.ED_args.get("heuristic_lambda_tricky_global_mass", 0.45),
-                tricky_all_gen_mass=self.ED_args.get("heuristic_lambda_tricky_all_gen_mass", 0.35),
-                tricky_unmet_mass=self.ED_args.get("heuristic_lambda_tricky_unmet_mass", 0.20),
-                similarity_temperature=self.ED_args.get("heuristic_lambda_similarity_temperature", 2.0),
+                main_mass=self.ED_args.get("heuristic_lambda_main_mass", 0.85),
+                unmet_safety_mass=self.ED_args.get("heuristic_lambda_unmet_safety_mass", 0.02),
+                tier2_confidence=self.ED_args.get("heuristic_lambda_tier2_confidence", 0.10),
             )
 
+            
+            self.soft_label_runtime = time.perf_counter() - start_time
+            print(f"Computing Soft Label took: {self.soft_label_runtime:.2f} seconds")
             print("Heuristic lambda soft labels:", self.heuristic_lambda_soft_labels.shape)
             print("Heuristic lambda confidence:", self.heuristic_lambda_confidence.shape)
             print("Heuristic lambda tier:", self.heuristic_lambda_tier.shape)
 
-        self.xdim = self.X.shape[1]
 
+        else:
+            self.soft_label_runtime = None
+
+        self.xdim = self.X.shape[1]
+        print("Computing optimal dual labels with Gurobi...")
+        start_time = time.perf_counter()
         self.opt_targets = self.compute_opt_targets() # Solve for the opt target
+        self.opt_label_runtime = time.perf_counter() - start_time
+        print(f"Computing optimal labels took: {self.opt_label_runtime:.4f} seconds")
+        print(f"Computing Soft Label took: {self.soft_label_runtime:.4f} seconds")
+        print(f"Speedup:        {self.opt_label_runtime / self.soft_label_runtime:.1f}x")
+
+
+        # sl1, conf1, tier1, cls1 = self.compute_heuristic_lambda_soft_labels(X=self.X)
+        # sl2, conf2, tier2, cls2 = self.compute_heuristic_lambda_soft_labels_vectorized(X=self.X)
+
+        # print(torch.equal(tier1, tier2))
+        # print(torch.allclose(conf1, conf2))
+        # print(torch.allclose(cls1, cls2))
+        # print(torch.allclose(sl1, sl2, atol=1e-8))
+        # print((sl1 - sl2).abs().max())
 
         # if self.args["device"] == 'mps':
             # self.obj_coeff = self.obj_coeff.to(torch.float32).to(torch.device('mps'))
@@ -240,20 +270,228 @@ class GEPOperationalProblemSet():
 
         return X
     
+    def compute_heuristic_lambda_soft_labels_vectorized(
+        self,
+        X=None,
+        main_mass=0.85,
+        unmet_safety_mass=0.02,
+        tier2_confidence=0.10,
+        eps=1e-8,
+    ):
+        """
+        vectorized precomputation of heuristic soft λ-labels.
+    
+        Three tiers based on local feasibility:
+            Tier 1 — Locally feasible  (C_loc >= D_n):
+                Peaky label on greedy cost-stacked local marginal generator.
+                Confidence = 1.0.
+            Tier 2 — Needs transmission (C_loc < D_n <= C_loc + C_imp):
+                Uniform label over all K classes.
+                Confidence = tier2_confidence.
+            Tier 3 — Infeasible  (D_n > C_loc + C_imp):
+                One-hot on unmet-demand class.
+                Confidence = 1.0.
+    
+        Returns
+        -------
+        soft_labels : [B, N, K]
+        confidence  : [B, N]
+        tier        : [B, N]   (dtype long: 1/2/3)
+        classes     : [K]      (shadow-price class values)
+        """
+        if X is None:
+            X = self.X
+    
+        device = X.device
+        dtype  = X.dtype
+    
+        B = X.shape[0]
+        N = self.num_n
+        G = self.num_g
+    
+        D   = X[:, :N]       # [B, N]  — nodal demand
+        cap = X[:, N:N + G]  # [B, G]  — availability-adjusted generation capacity
+    
+        # ------------------------------------------------------------------
+        # Class space: unique generator costs  +  unmet-demand penalty
+        # ------------------------------------------------------------------
+        cost_vec = self.cost_vec
+        if not isinstance(cost_vec, torch.Tensor):
+            cost_vec = torch.tensor(cost_vec, dtype=dtype, device=device)
+        cost_vec = cost_vec.to(device=device, dtype=dtype)   # [G]
+    
+        classes = -1.0 * torch.cat([
+            torch.unique(cost_vec),
+            torch.tensor([self.pVOLL], device=device, dtype=dtype),
+        ])                                                   # [K]
+        K = classes.numel()
+    
+        # ------------------------------------------------------------------
+        # Map each generator to its class index; identify the unmet class
+        # ------------------------------------------------------------------
+        gen_lambda_values = -1.0 * cost_vec                  # [G]
+        gen_class_idx = torch.abs(
+            gen_lambda_values.unsqueeze(-1) - classes.unsqueeze(0)
+        ).argmin(dim=-1)                                     # [G]
+    
+        unmet_value     = torch.tensor(-float(self.pVOLL), device=device, dtype=dtype)
+        unmet_class_idx = int(torch.abs(unmet_value - classes).argmin().item())
+    
+        # gen_class_mask[k] = True  iff  class k is a generator cost class (not unmet)
+        gen_class_mask = torch.zeros(K, device=device, dtype=torch.bool)
+        gen_class_mask[gen_class_idx] = True
+        gen_class_mask[unmet_class_idx] = False
+        n_other_global = int(gen_class_mask.sum().item())    # # unique generator cost classes
+    
+        # ------------------------------------------------------------------
+        # Node ↔ generator mapping
+        # ------------------------------------------------------------------
+        node_to_gen_mask = self.node_to_gen_mask.to(device=device, dtype=dtype)  # [N, G]
+        node_of_g        = node_to_gen_mask.argmax(dim=0).long()                 # [G]
+    
+        # ------------------------------------------------------------------
+        # Local generation capacity per node  [B, N]
+        # ------------------------------------------------------------------
+        local_capacity_all = cap @ node_to_gen_mask.T   # [B, N]
+    
+        # ------------------------------------------------------------------
+        # Import capacity per node  [N]
+        # ------------------------------------------------------------------
+        if hasattr(self, "lineflow_mask") and hasattr(self, "pImpCap"):
+            line_mask       = self.lineflow_mask.to(device=device, dtype=dtype)  # [N, L]
+            import_mask     = (line_mask == 1).to(dtype)                          # [N, L]
+            F_imp           = torch.tensor(
+                [self.pImpCap[l] for l in self.L], device=device, dtype=dtype,
+            )                                                                     # [L]
+            import_capacity = import_mask @ F_imp                                 # [N]
+        else:
+            import_capacity = torch.zeros(N, device=device, dtype=dtype)
+    
+        # ------------------------------------------------------------------
+        # Tier classification  [B, N]
+        # ------------------------------------------------------------------
+        import_all        = import_capacity.unsqueeze(0)                  # [1, N]
+        infeasible        = local_capacity_all + import_all + eps < D     # [B, N]
+        locally_feasible  = local_capacity_all + eps >= D                 # [B, N]
+        needs_transmission = (~infeasible) & (~locally_feasible)          # [B, N]
+    
+        tier = torch.zeros((B, N), device=device, dtype=torch.long)
+        tier[locally_feasible]   = 1
+        tier[needs_transmission] = 2
+        tier[infeasible]         = 3
+    
+        # ------------------------------------------------------------------
+        # Per-node cost-sorted generator list  (loop over N, small constant)
+        # ------------------------------------------------------------------
+        gens_at_node_sorted: list[torch.Tensor] = []
+        for n in range(N):
+            gens_n = [g for g in range(G) if int(node_of_g[g].item()) == n]
+            gens_n.sort(key=lambda g: float(cost_vec[g].detach().cpu()))
+            gens_at_node_sorted.append(
+                torch.tensor(gens_n, dtype=torch.long, device=device)
+            )
+    
+        # ------------------------------------------------------------------
+        # Vectorised greedy cost-stack → marginal class per (b, n)
+        # Loop is over N (small), inner ops are batched over B.
+        # ------------------------------------------------------------------
+        marginal_class_per_bn = torch.zeros((B, N), device=device, dtype=torch.long)
+    
+        for n in range(N):
+            gens_n = gens_at_node_sorted[n]
+            if len(gens_n) == 0:
+                continue
+    
+            caps_at_n  = cap[:, gens_n]              # [B, num_local_gens]
+            cumcap     = caps_at_n.cumsum(dim=1)     # [B, num_local_gens]
+            demand_n   = D[:, n:n + 1]              # [B, 1]
+            sufficient = cumcap + eps >= demand_n   # [B, num_local_gens]
+    
+            # First True column = marginal generator index (local ordering)
+            first_true = sufficient.float().argmax(dim=1)   # [B]
+            has_any    = sufficient.any(dim=1)              # [B]
+            fallback   = torch.full((B,), len(gens_n) - 1, device=device, dtype=torch.long)
+            local_idx  = torch.where(has_any, first_true, fallback)  # [B]
+    
+            global_g   = gens_n[local_idx]                  # [B]  global generator index
+            marginal_class_per_bn[:, n] = gen_class_idx[global_g]   # [B]
+    
+        # ------------------------------------------------------------------
+        # Build soft labels
+        # ------------------------------------------------------------------
+        soft_labels = torch.zeros((B, N, K), device=device, dtype=dtype)
+        confidence  = torch.zeros((B, N),    device=device, dtype=dtype)
+    
+        # ----- TIER 3: one-hot on unmet demand -----
+        # FIX BUG 1: use a one-hot broadcast instead of mixed bool+int indexing
+        if infeasible.any():
+            tier3_label = torch.zeros(K, device=device, dtype=dtype)
+            tier3_label[unmet_class_idx] = 1.0
+            soft_labels[infeasible] = tier3_label   # broadcasts [K] → [num_infeasible, K]
+            confidence[infeasible]  = 1.0
+    
+        # ----- TIER 2: uniform over all K classes -----
+        # FIX BUG 2: remove the trailing ", :" which caused the indexing crash
+        if needs_transmission.any():
+            uniform_label = torch.full((K,), 1.0 / K, device=device, dtype=dtype)
+            soft_labels[needs_transmission] = uniform_label  # ← was: [needs_transmission, :]
+            confidence[needs_transmission]  = tier2_confidence
+    
+        # ----- TIER 1: peaky on marginal, uniform remainder on other gen classes -----
+        if locally_feasible.any():
+            remainder     = 1.0 - main_mass - unmet_safety_mass
+    
+            # Mass spread over the (n_other_global - 1) non-marginal generator classes.
+            # n_other_global is constant across (b,n) because class topology doesn't change.
+            per_other_mass = (
+                remainder / max(n_other_global - 1, 1)
+                if n_other_global > 1 else 0.0
+            )
+    
+            # Base template: all gen classes get per_other_mass, unmet gets safety mass.
+            # The marginal class entry is overwritten per (b, n) in the scatter below.
+            base = torch.zeros(K, device=device, dtype=dtype)
+            base[gen_class_mask]    = per_other_mass
+            base[unmet_class_idx]   = unmet_safety_mass
+    
+            soft_labels[locally_feasible] = base   # broadcast [K] → [num_tier1, K]
+    
+            # Scatter main_mass onto each (b, n)'s specific marginal class
+            b_idx    = torch.where(locally_feasible)[0]          # [num_tier1]
+            n_idx    = torch.where(locally_feasible)[1]          # [num_tier1]
+            marg_idx = marginal_class_per_bn[b_idx, n_idx]       # [num_tier1]
+            soft_labels[b_idx, n_idx, marg_idx] = main_mass
+    
+            # FIX BUG 3: read the boolean-masked slice only once per operation
+            tier1_rows = soft_labels[locally_feasible]            # [num_tier1, K]  — one copy
+            tier1_rows = tier1_rows / tier1_rows.sum(dim=-1, keepdim=True).clamp_min(eps)
+            soft_labels[locally_feasible] = tier1_rows
+    
+            confidence[locally_feasible] = 1.0
+    
+        return soft_labels, confidence, tier, classes
+        
     def compute_heuristic_lambda_soft_labels(
         self,
         X=None,
-        local_main_mass=0.80,
-        local_unmet_mass=0.03,
-        unmet_main_mass=0.93,
-        tricky_global_mass=0.45,
-        tricky_all_gen_mass=0.35,
-        tricky_unmet_mass=0.20,
-        similarity_temperature=2.0,
+        main_mass=0.85,
+        unmet_safety_mass=0.02,
+        tier2_confidence=0.10,
         eps=1e-8,
     ):
         """
         Precompute heuristic soft lambda labels for all samples.
+
+        Three tiers based on local feasibility of demand:
+            Tier 1 — Locally feasible (C_loc >= D_n):
+                Peaky label on the greedy cost-stacked local marginal generator.
+                Confidence = 1.0.
+            Tier 2 — Needs transmission (C_loc < D_n <= C_loc + C_imp):
+                Uniform label over all K classes (generators + unmet).
+                Confidence = tier2_confidence (low, defers to dual objective).
+            Tier 3 — Infeasible (D_n > C_loc + C_imp):
+                One-hot label on unmet demand.
+                Confidence = 1.0.
 
         Returns:
             soft_labels: [B, N, K]
@@ -274,6 +512,9 @@ class GEPOperationalProblemSet():
         D = X[:, :N]
         cap = X[:, N:N + G]
 
+        # ------------------------------------------------------------------
+        # Class space: unique generator costs + unmet-demand penalty
+        # ------------------------------------------------------------------
         cost_vec = self.cost_vec
         if not isinstance(cost_vec, torch.Tensor):
             cost_vec = torch.tensor(cost_vec, dtype=dtype, device=device)
@@ -290,6 +531,9 @@ class GEPOperationalProblemSet():
                 values.unsqueeze(-1) - classes.view(*([1] * values.ndim), -1)
             ).argmin(dim=-1)
 
+        # ------------------------------------------------------------------
+        # Map generators to their class, identify unmet class
+        # ------------------------------------------------------------------
         node_to_gen_mask = self.node_to_gen_mask.to(device=device)
         node_of_g = node_to_gen_mask.argmax(dim=0).long()
 
@@ -299,7 +543,15 @@ class GEPOperationalProblemSet():
         unmet_value = torch.tensor(-float(self.pVOLL), device=device, dtype=dtype)
         unmet_class_idx = int(nearest_class_idx(unmet_value).item())
 
-        # Import capacity per node.
+        # Mask: True for generator classes, False for the unmet class
+        gen_class_mask = torch.zeros(K, device=device, dtype=torch.bool)
+        for k in gen_class_idx:
+            gen_class_mask[int(k.item())] = True
+        gen_class_mask[unmet_class_idx] = False
+
+        # ------------------------------------------------------------------
+        # Import capacity per node
+        # ------------------------------------------------------------------
         if hasattr(self, "lineflow_mask") and hasattr(self, "pImpCap"):
             line_mask = self.lineflow_mask.to(device=device, dtype=dtype)
             import_mask = (line_mask == 1).to(dtype)
@@ -313,143 +565,91 @@ class GEPOperationalProblemSet():
         else:
             import_capacity = torch.zeros(N, device=device, dtype=dtype)
 
+        # ------------------------------------------------------------------
+        # Local generators per node, sorted by cost (cheap first)
+        # ------------------------------------------------------------------
         gens_at_node = []
         for n in range(N):
             gens_n = [g for g in range(G) if int(node_of_g[g].item()) == n]
             gens_n.sort(key=lambda g: float(cost_vec[g].detach().cpu()))
             gens_at_node.append(gens_n)
 
-        gens_global = list(range(G))
-        gens_global.sort(key=lambda g: float(cost_vec[g].detach().cpu()))
-
+        # ------------------------------------------------------------------
+        # Allocate outputs
+        # ------------------------------------------------------------------
         soft_labels = torch.zeros((B, N, K), device=device, dtype=dtype)
         confidence = torch.zeros((B, N), device=device, dtype=dtype)
         tier = torch.zeros((B, N), device=device, dtype=torch.long)
 
-        gen_class_mask = torch.zeros(K, device=device, dtype=torch.bool)
-        for k in gen_class_idx:
-            gen_class_mask[int(k.item())] = True
-        gen_class_mask[unmet_class_idx] = False
+        # Precompute the uniform-over-K distribution used in Tier 2
+        uniform_all = torch.full((K,), 1.0 / K, device=device, dtype=dtype)
 
-        def add_cost_similarity_mass(q, center_class_idx, mass):
-            if mass <= 0:
-                return q
-
-            center_value = classes[center_class_idx]
-            dist = torch.abs(classes - center_value)
-
-            logits = -dist / max(float(similarity_temperature), eps)
-            logits[~gen_class_mask] = -1e9
-            logits[center_class_idx] = -1e9
-
-            weights = torch.softmax(logits, dim=0)
-
-            if torch.isfinite(weights).all() and weights.sum() > 0:
-                q = q + mass * weights
-
-            return q
-
-        def make_smoothed_unmet_label(q, unmet_mass):
-            q[:] = 0.0
-            q[unmet_class_idx] = unmet_mass
-
-            rest_mass = 1.0 - unmet_mass
-            if rest_mass > 0:
-                gen_indices = torch.where(gen_class_mask)[0]
-                if len(gen_indices) > 0:
-                    q[gen_indices] += rest_mass / len(gen_indices)
-
-            q = q / q.sum().clamp_min(eps)
-            return q
-
+        # ------------------------------------------------------------------
+        # Main loop
+        # ------------------------------------------------------------------
         for b in range(B):
-            total_demand = D[b].sum()
-
-            global_marginal_class = None
-            cumulative = torch.tensor(0.0, device=device, dtype=dtype)
-
-            for g in gens_global:
-                cumulative = cumulative + cap[b, g]
-                if cumulative + eps >= total_demand:
-                    global_marginal_class = int(gen_class_idx[g].item())
-                    break
-
-            if global_marginal_class is None:
-                global_marginal_class = unmet_class_idx
-
             for n in range(N):
-                q = torch.zeros(K, device=device, dtype=dtype)
-
                 local_gens = gens_at_node[n]
 
                 if local_gens:
-                    local_capacity = torch.stack([cap[b, g] for g in local_gens]).sum()
+                    local_capacity = torch.stack(
+                        [cap[b, g] for g in local_gens]
+                    ).sum()
                 else:
                     local_capacity = torch.tensor(0.0, device=device, dtype=dtype)
 
                 demand_n = D[b, n]
                 import_n = import_capacity[n]
 
-                # Tier 3
+                # ===== TIER 3: Infeasible =====
                 if local_capacity + import_n + eps < demand_n:
-                    q = make_smoothed_unmet_label(q, unmet_main_mass)
+                    q = torch.zeros(K, device=device, dtype=dtype)
+                    q[unmet_class_idx] = 1.0
 
                     soft_labels[b, n] = q
-                    confidence[b, n] = unmet_main_mass
+                    confidence[b, n] = 1.0
                     tier[b, n] = 3
                     continue
 
-                # Tier 1
+                # ===== TIER 1: Locally feasible =====
                 if local_capacity + eps >= demand_n:
+                    # Greedy cost-stack to find local marginal generator
                     remaining = demand_n.clone()
-                    marginal_g = None
-
+                    marginal_g = local_gens[-1]  # fallback to most expensive
                     for g in local_gens:
                         if cap[b, g] + eps >= remaining:
                             marginal_g = g
                             break
                         remaining = remaining - cap[b, g]
 
-                    if marginal_g is None:
-                        marginal_g = local_gens[-1]
-
                     marginal_class = int(gen_class_idx[marginal_g].item())
 
-                    q[marginal_class] += local_main_mass
-                    q[unmet_class_idx] += local_unmet_mass
+                    # Build soft label
+                    q = torch.zeros(K, device=device, dtype=dtype)
+                    q[marginal_class] = main_mass
+                    q[unmet_class_idx] = unmet_safety_mass
 
-                    rest_mass = 1.0 - local_main_mass - local_unmet_mass
-                    q = add_cost_similarity_mass(q, marginal_class, rest_mass)
+                    # Distribute remaining mass uniformly over OTHER generator classes
+                    other_gen_mask = gen_class_mask.clone()
+                    other_gen_mask[marginal_class] = False
+                    n_other = other_gen_mask.sum().item()
+
+                    remainder = 1.0 - main_mass - unmet_safety_mass
+                    if n_other > 0 and remainder > 0:
+                        q = q + remainder * other_gen_mask.to(dtype) / n_other
+
+                    # Normalize for numerical safety
                     q = q / q.sum().clamp_min(eps)
 
-                    cap_g = cap[b, marginal_g].clamp_min(eps)
-                    used_frac = (remaining / cap_g).clamp(0.0, 1.0)
-                    boundary_score = torch.minimum(used_frac, 1.0 - used_frac)
-                    conf = 0.65 + 0.30 * (2.0 * boundary_score)
-                    conf = conf.clamp(0.55, 0.95)
-
                     soft_labels[b, n] = q
-                    confidence[b, n] = conf
+                    confidence[b, n] = 1.0
                     tier[b, n] = 1
                     continue
 
-                # Tier 2
-                q[global_marginal_class] += tricky_global_mass
-
-                if tricky_all_gen_mass > 0:
-                    gen_indices = torch.where(gen_class_mask)[0]
-                    if len(gen_indices) > 0:
-                        center_value = classes[global_marginal_class]
-                        dist = torch.abs(classes[gen_indices] - center_value)
-                        logits = -dist / max(float(similarity_temperature), eps)
-                        weights = torch.softmax(logits, dim=0)
-                        q[gen_indices] += tricky_all_gen_mass * weights
-
-                q[unmet_class_idx] += tricky_unmet_mass
-                q = q / q.sum().clamp_min(eps)
-
-                soft_labels[b, n] = q
-                confidence[b, n] = 0.30
+                # ===== TIER 2: Needs transmission (ambiguous) =====
+                # local_capacity < demand_n <= local_capacity + import_n
+                soft_labels[b, n] = uniform_all
+                confidence[b, n] = tier2_confidence
                 tier[b, n] = 2
 
         return soft_labels, confidence, tier, classes

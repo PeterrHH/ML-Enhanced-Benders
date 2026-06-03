@@ -519,7 +519,8 @@ class BendersSolver():
         # Variables
         u = m.addMVar(shape=data.num_g, lb=0.0, ub=100000.0,
                     vtype=GRB.INTEGER, name="u")
-        alpha = m.addMVar(shape=num_alpha, lb=-1e6,
+        #! If we are solving the master problem, we know the investments are positive, so the lowerbound of each recourse value can be set to 0.
+        alpha = m.addMVar(shape=num_alpha, lb=0.0,
                         vtype=GRB.CONTINUOUS, name="alpha")
 
         # Objective: c_u^T u + sum_k alpha_k

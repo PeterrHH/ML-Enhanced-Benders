@@ -33,8 +33,10 @@ def build_ed_data_save_path(ED_args, nodes_count, nodes_str, gens_str, lines_str
     """
 
     if ED_args.get("generate_capacity_sobol", False) and ED_args.get("gen_data_constraint", False):
+
         node_constraint = ED_args.get("gen_data_node_constraint", False)
         node_tag = "_NodeConst" if node_constraint else ""
+        label_tag = "_Label" if ED_args.get("precompute_heuristic_lambda_labels", False) else ""
         gen_data_renew_availability = ED_args.get("gen_data_renew_availability", 100)
         print(f"Cap Use Hard Cap setting is {ED_args.get('capacity_sobol_use_hard_cap', False)}")
         if ED_args.get("capacity_sobol_use_hard_cap", False):
@@ -53,7 +55,7 @@ def build_ed_data_save_path(ED_args, nodes_count, nodes_str, gens_str, lines_str
                 f"_ui_constraint{ED_args['max_investment']}"
                 f"_smp{ED_args['2n_synthetic_samples']}"
                 f"_renewMaxInv{ED_args.get('gen_data_constraint_ub_renewable_max_inv', True)}"
-                f"{node_tag}.pkl"
+                f"{node_tag}{label_tag}.pkl"
             )
         else:
             data_save_path = (
@@ -66,7 +68,7 @@ def build_ed_data_save_path(ED_args, nodes_count, nodes_str, gens_str, lines_str
                 f"_ui_constraint{ED_args['max_investment']}"
                 f"_smp{ED_args['2n_synthetic_samples']}"
                 f"_renewPerc{gen_data_renew_availability}"
-                f"{node_tag}.pkl"
+                f"{node_tag}{label_tag}.pkl"
             )
 
     elif ED_args.get("gen_data_constraint", False):
@@ -75,6 +77,7 @@ def build_ed_data_save_path(ED_args, nodes_count, nodes_str, gens_str, lines_str
         gen_data_renew_availability = ED_args.get("gen_data_renew_availability", 100)
         node_constraint = ED_args.get("gen_data_node_constraint", False)
         node_tag = "_NodeConst" if node_constraint else ""
+        label_tag = "_Label" if ED_args.get("precompute_heuristic_lambda_labels", False) else ""
 
         if gen_data_renew_availability == 100:
             data_save_path = (
@@ -87,7 +90,7 @@ def build_ed_data_save_path(ED_args, nodes_count, nodes_str, gens_str, lines_str
                 f"_smp{ED_args['2n_synthetic_samples']}"
                 f"_GenConst_lb{lb_setting_name}"
                 f"_renewMaxInv{renewable_ub_max_inv}"
-                f"{node_tag}.pkl"
+                f"{node_tag}{label_tag}.pkl"
             )
         else:
             data_save_path = (
@@ -100,7 +103,7 @@ def build_ed_data_save_path(ED_args, nodes_count, nodes_str, gens_str, lines_str
                 f"_smp{ED_args['2n_synthetic_samples']}"
                 f"_GenConst_lb{lb_setting_name}"
                 f"_renewPerc{gen_data_renew_availability}"
-                f"{node_tag}.pkl"
+                f"{node_tag}{label_tag}.pkl"
             )
 
     else:
