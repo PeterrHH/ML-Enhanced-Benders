@@ -43,16 +43,15 @@ from prior work by Ben Jacobs (linked below). QP support is present in
 Python 3.9.20 was used for all experiments.
 
 ```bash
-conda create -n graphpdl python=3.9.20
-conda activate graphpdl
+conda create -n {env_name} python=3.9.20
+conda activate {env_name}
 pip install -r requirements.txt
 ```
 
 ### Gurobi licence
 
-Almost every ED, GEP, and Benders run calls Gurobi. You need a working
-[Gurobi](https://www.gurobi.com/) installation with an active licence before
-running either main entry point.
+To fully reproduce experience. You need a working
+[Gurobi](https://www.gurobi.com/) installation with an active licence.
 
 ---
 
@@ -127,11 +126,6 @@ If the dataset for the chosen configuration does not yet exist, `main.py`
 generates it automatically before training begins (this can take several
 minutes for large configurations).
 
-**Monitor training in TensorBoard:**
-
-```bash
-tensorboard --logdir outputs/PDL
-```
 
 ### Key training options (in `config*.json`)
 
@@ -139,23 +133,53 @@ tensorboard --logdir outputs/PDL
 |---|---|
 | `learn_primal` | Train the primal (investment + dispatch) network |
 | `learn_dual` | Train the dual (Lagrange multiplier) network |
-| `problem_type` | `"ED"` or `"GEP"` for this thesis (QP is inherited from prior work) |
-| `Optuna_args.optuna` | `true` to run Optuna hyperparameter search first |
 | `ED_args.repeats` | Number of independent training runs |
+| `use_heuristic_lambda_loss` |Whether to use **SLA** in dual training|
+|`heuristic_lambda_weight`|Value of $\beta$ in SLA training|
+
 
 ---
 
 ## Stage 2 — Benders decomposition (`gep_benders.py`)
 
-### What it does
 
-Runs Benders decomposition on the GEP problem. Three modes are available:
+Runs Benders decomposition on the GEP problem. 
 
+### Benders Mode
+Three modes are available:
 | Mode | Flag / config | Subproblem solver |
 |---|---|---|
-| Inexact Benders | `benders_setup: "Inexact_Refine"` | Neural net (PDL), switches to exact at the end |
-| Exact Benders | `benders_setup: "Exact"` | Gurobi LP |
-| Direct solve | `--solve-direct` CLI flag | Full MIP via Gurobi, no decomposition |
+| Inexact_Refine | `benders_setup: "Inexact_Refine"` | ML-enhanced Benderes |
+| Exact Benders | `benders_setup: "Exact"` | Use Benders Decomposition but subproblems always solve with Gurobi |
+| Direct solve | `--solve-direct` or `-s` CLI flag | Solve GEP with Gurobi, no decomposition |
+
+
+
+### Cut Management
+
+The Benders cut aggregation strategy is set via `Benders_args.cut_selection`.
+Each Benders iteration solves one ED subproblem per timestep; the cut
+strategy controls how those per-timestep duals are combined into cuts added
+to the master problem.
+
+| `cut_selection` | `cut_selection_k` used? | Description |
+|---|---|---|
+| `"single"` | No | All timesteps aggregated into **one** Benders cut per iteration. Fastest master solve, but least information per cut. |
+| `"kmeans"` | Yes (`k` clusters) | Timesteps clustered by demand + available-capacity features (k-means); one cut per cluster. Balances cut richness and master-problem size. |
+| `"full"` | No | One cut per timestep. Most informative, but master problem grows fastest. |
+
+`cut_selection_k` sets the number of groups for `kmeans` ; it is
+ignored for `single` and `full`.
+
+### Other key `Benders_args` settings
+
+| Key | Description |
+|---|---|
+| `primal_net_directory` | Path to the folder containing `primal_weights.pth` and `args.json` for the trained primal network. Must match the node/generator configuration of the current config file. |
+| `dual_net_directory` | Path to the folder containing `dual_weights.pth` and `args.json` for the trained dual network. Can point to the same folder as `primal_net_directory` (weights are loaded by filename). |
+| `sample_duration` | Length (in hours) of one GEP sample. The full year (8 760 h) is split into `8760 / sample_duration` non-overlapping samples, each solved as an independent Benders problem. Longer samples capture richer seasonal patterns but take more time per solve. |
+
+
 
 ### How to run
 
@@ -166,7 +190,7 @@ python gep_benders.py --config config-4node.json
 python gep_benders.py --config config-6node.json
 
 # Solve the full GEP as a single MIP (no Benders, no neural net needed)
-python gep_benders.py --config config.json --solve-direct
+python gep_benders.py --config config.json -s
 ```
 
 All commands must be run from the **repository root**.
@@ -180,20 +204,7 @@ All commands must be run from the **repository root**.
 
 ---
 
-## Setting trained model paths for Benders
 
-When running Benders in Inexact or Inexact\_Refine mode, the script loads
-trained primal and dual networks. The paths are set in the `Benders_args`
-section of the chosen `config*.json`:
-
-```jsonc
-"Benders_args": {
-    ...
-    "primal_net_directory": "experiment-output/ch7/3nodes/primal_model",
-    "dual_net_directory":   "experiment-output/ch7/3nodes/dual_model",
-    ...
-}
-```
 
 ### Where to find / put your trained models
 
@@ -272,8 +283,8 @@ results without retraining.
 
 ```bash
 # 1. Create and activate the environment
-conda create -n graphpdl python=3.9.20
-conda activate graphpdl
+conda create -n {env_name} python=3.9.20
+conda activate {env_name}
 pip install -r requirements.txt
 
 # 2. Train the PDL models (generates dataset if needed, then trains)
