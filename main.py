@@ -17,7 +17,7 @@ ARGS_FILE_NAME option:
 - "config-5node.json": Config for 5-node experiments.
 - "config-6node.json": Config for 6-node experiments.
 '''
-ARGS_FILE_NAME = "config.json"
+ARGS_FILE_NAME = "config-6node.json"
 
 def build_ed_data_save_path(ED_args, nodes_count, nodes_str, gens_str, lines_str):
     """
