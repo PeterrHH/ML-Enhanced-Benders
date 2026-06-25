@@ -303,18 +303,18 @@ python gep_benders.py --config config.json --solve-direct
 
 ---
 
-## Repository map
+## Repository map (key files)
 
 ```
 .
 ├── main.py                      # Stage 1: dataset generation + PDL training
 ├── gep_benders.py               # Stage 2: Benders decomposition + direct solve
 ├── configs /
-│   ├── config.json                  # 3-node experiment config (default)
-│   ├── config-4node.json            # 4-node experiment config
-│   ├── config-5node.json            # 5-node experiment config
-│   ├── config-6node.json            # 6-node experiment config
-│   ├── config.toml                  # Solver selection + raw input paths
+│   ├── config.json              # 3-node experiment config (default)
+│   ├── config-4node.json        # 4-node experiment config
+│   ├── config-5node.json        # 5-node experiment config
+│   ├── config-6node.json        # 6-node experiment config
+│   ├── config.toml              # Solver selection + raw input paths
 │
 ├── inputs/                      # Raw CSV/TOML energy-system data
 │   ├── iGEP_data_demand.csv
@@ -339,8 +339,6 @@ python gep_benders.py --config config.json --solve-direct
 │
 │── primal_dual.py               # PDL training loop
 ├── networks.py                  # Neural network architectures
-├── graphPDL.py                  # Graph-based PDL variant
-├── graphBuilder.py              # Graph construction utilities
 ├── logger.py                    # TensorBoard logging
 │
 ├── gep_problem.py               # GEP (investment) problem representation
@@ -349,10 +347,8 @@ python gep_benders.py --config config.json --solve-direct
 ├── gep_config_parser.py         # TOML and CSV input parser
 │
 ├── create_gep_dataset.py        # ED and GEP dataset generation
-├── create_QP_dataset.py         # QP benchmark dataset generation
 ├── data_wrangling.py            # Input-data preparation utilities
 │
-├── QP_problem.py                # QP problem representation
 ├── Benders_Eval.py              # Benders result analysis and plots
 ├── Cut_selection_experiment.py  # Cut-selection method comparison
 ├── evaluate_filter.py           # Model and Benders evaluation

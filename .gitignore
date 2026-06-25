@@ -224,5 +224,6 @@ outputs/Benders
 figures/*
 icons/*
 availability_with_icons.png
-GraphMethod-Exploration
+experiment-output/
+GraphMethod-Exploration/
 note.md
