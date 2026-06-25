@@ -23,7 +23,7 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-CONFIG_FILE_NAME        = "config.toml"
+CONFIG_FILE_NAME        = "configs/config.toml"
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -1493,8 +1493,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "-c", "--config",
         type=str,
-        default="config.json",
-        help="Path to run config JSON file, e.g. config.json, config-5node.json, config-6node.json"
+        default="configs/config.json",
+        help="Path to run config JSON file, e.g. configs/config.json"
     )
     args_cli = parser.parse_args()
 
@@ -1503,13 +1503,13 @@ if __name__ == "__main__":
     print("Parsing the config file")
     RUN_CONFIG_FILE = args_cli.config
     NumNode = None
-    if RUN_CONFIG_FILE == "config.json":
+    if RUN_CONFIG_FILE == "configs/config.json":
         NumNode = 3
-    elif RUN_CONFIG_FILE == "config-4node.json":
+    elif RUN_CONFIG_FILE == "configs/config-4node.json":
         NumNode = 4
-    elif RUN_CONFIG_FILE == "config-5node.json":
+    elif RUN_CONFIG_FILE == "configs/config-5node.json":
         NumNode = 5
-    elif RUN_CONFIG_FILE == "config-6node.json":
+    elif RUN_CONFIG_FILE == "configs/config-6node.json":
         NumNode = 6
     else:
         raise ValueError("Invalid config file name.")

@@ -1,9 +1,8 @@
-# GraphPDL — Generation Expansion Planning with Primal-Dual Learning
+# Accelerating Generation Expansion Planning with ML-Enhanced Benders Decomposition
 
-Research code for the master's thesis: learning primal and dual solutions to
-energy-system optimisation problems with formal feasibility guarantees, and
-using those learned solutions to warm-start and accelerate Benders
-decomposition for Generation Expansion Planning (GEP).
+The master thesis can be accessed at: 
+
+https://repository.tudelft.nl/record/uuid:18f3745d-38ba-4aba-855b-a60f27d03c39
 
 ---
 
@@ -13,13 +12,13 @@ The pipeline has two sequential stages:
 
 ```
 Stage 1 — Train PDL models
-  config*.json + config.toml
+  configs/config*.json + config.toml
        └─> main.py
             ├─> auto-generates dataset (data/)
             └─> trains primal & dual networks → outputs/PDL/
 
 Stage 2 — Run Benders decomposition
-  config*.json  (with model paths set under Benders_args)
+  configs/config*.json  (with model paths set under Benders_args)
        └─> gep_benders.py
             ├─> Inexact Benders  (neural warm-start)
             ├─> Exact Benders    (Gurobi only)
@@ -57,7 +56,7 @@ To fully reproduce experience. You need a working
 
 ## Configuration files
 
-Two configuration layers control each experiment.
+Two configuration layers control each experiment. All files are in the 'configs' folder.
 
 ### `config.toml` — solver and raw-input settings
 
@@ -110,10 +109,7 @@ the config file you want:
 
 ```python
 # main.py, line ~20
-ARGS_FILE_NAME = "config.json"        # 3-node  (default)
-# ARGS_FILE_NAME = "config-4node.json"
-# ARGS_FILE_NAME = "config-5node.json"
-# ARGS_FILE_NAME = "config-6node.json"
+ARGS_FILE_NAME = "configs/config.json"        # 3-node  (default)
 ```
 
 **Step 2.** Run from the repository root:
@@ -226,8 +222,8 @@ outputs/PDL/<problem_type>/<run_name>/repeat:<n>/
    ```
 3. Update `Benders_args` in your config:
    ```jsonc
-   "primal_net_directory": "outputs/PDL/ED/<run_name>/repeat:0",
-   "dual_net_directory":   "outputs/PDL/ED/<run_name>/repeat:0"
+   "primal_net_directory": "outputs/PDL/ED/<run_name>/repeat:<repeat_number>",
+   "dual_net_directory":   "outputs/PDL/ED/<run_name>/repeat:<repeat_number>"
    ```
    (Primal and dual weights are stored in the **same** repeat folder; the
    loader picks up `primal_weights.pth` and `dual_weights.pth` separately.)
@@ -313,11 +309,12 @@ python gep_benders.py --config config.json --solve-direct
 .
 ├── main.py                      # Stage 1: dataset generation + PDL training
 ├── gep_benders.py               # Stage 2: Benders decomposition + direct solve
-├── config.json                  # 3-node experiment config (default)
-├── config-4node.json            # 4-node experiment config
-├── config-5node.json            # 5-node experiment config
-├── config-6node.json            # 6-node experiment config
-├── config.toml                  # Solver selection + raw input paths
+├── configs /
+│   ├── config.json                  # 3-node experiment config (default)
+│   ├── config-4node.json            # 4-node experiment config
+│   ├── config-5node.json            # 5-node experiment config
+│   ├── config-6node.json            # 6-node experiment config
+│   ├── config.toml                  # Solver selection + raw input paths
 │
 ├── inputs/                      # Raw CSV/TOML energy-system data
 │   ├── iGEP_data_demand.csv
@@ -370,6 +367,7 @@ python gep_benders.py --config config.json --solve-direct
 | Folder | Purpose | Treat as |
 |---|---|---|
 | `inputs/` | Source energy-system tables | Input (do not modify) |
+| `configs/` | Config files for all experiments | Input to experiments |
 | `data/ED_data/` | Generated economic-dispatch datasets | Generated, re-creatable |
 | `data/GEP_data/` | Generated generation-expansion datasets | Generated, re-creatable |
 | `outputs/PDL/` | New training weights and logs | Generated output |
@@ -406,3 +404,4 @@ python Cut_selection_experiment.py \
   3-node model cannot be used with a 6-node Benders run.
 - This is research code. Test with a small `sample_duration` (e.g. 24) before
   launching a full 8 760-hour run.
+

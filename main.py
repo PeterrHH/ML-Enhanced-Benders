@@ -9,7 +9,7 @@ import optuna
 from primal_dual import PrimalDualTrainer
 from create_gep_dataset import create_gep_ed_dataset
 from create_QP_dataset import create_QP_dataset, create_nonconvex_QP_dataset, create_varying_G_dataset, create_varying_Q_dataset
-CONFIG_FILE_NAME = "config.toml"
+CONFIG_FILE_NAME = "configs/config.toml"
 '''
 ARGS_FILE_NAME option:
 - "config.json": Default config for experiments. (3 Node)
@@ -17,7 +17,7 @@ ARGS_FILE_NAME option:
 - "config-5node.json": Config for 5-node experiments.
 - "config-6node.json": Config for 6-node experiments.
 '''
-ARGS_FILE_NAME = "config-6node.json"
+ARGS_FILE_NAME = "configs/config.json"
 
 def build_ed_data_save_path(ED_args, nodes_count, nodes_str, gens_str, lines_str):
     """
@@ -107,13 +107,17 @@ def build_ed_data_save_path(ED_args, nodes_count, nodes_str, gens_str, lines_str
             )
 
     else:
+        if ED_args.get("precompute_heuristic_lambda_labels", False):
+            label_tag = "_Label"
+        else:
+            label_tag = ""
         data_save_path = (
             f"data/ED_data/"
             f"ED_N{nodes_str}_G{gens_str}_{lines_str}"
             f"_c{int(ED_args['benders_compact'])}"
             f"_s{int(ED_args['scale_problem'])}"
             f"_p{int(ED_args['perturb_operating_costs'])}"
-            f"_smp{ED_args['2n_synthetic_samples']}.pkl"
+            f"_smp{ED_args['2n_synthetic_samples']}{label_tag}.pkl"
         )
 
     return data_save_path
