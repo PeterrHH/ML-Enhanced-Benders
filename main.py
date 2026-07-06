@@ -5,11 +5,19 @@ import os
 import time
 import pickle
 import optuna
+import argparse
 
 from primal_dual import PrimalDualTrainer
 from create_gep_dataset import create_gep_ed_dataset
-from create_QP_dataset import create_QP_dataset, create_nonconvex_QP_dataset, create_varying_G_dataset, create_varying_Q_dataset
+from create_QP_dataset import (
+    create_QP_dataset,
+    create_nonconvex_QP_dataset,
+    create_varying_G_dataset,
+    create_varying_Q_dataset,
+)
+
 CONFIG_FILE_NAME = "configs/config.toml"
+
 '''
 ARGS_FILE_NAME option:
 - "config.json": Default config for experiments. (3 Node)
@@ -18,6 +26,55 @@ ARGS_FILE_NAME option:
 - "config-6node.json": Config for 6-node experiments.
 '''
 ARGS_FILE_NAME = "configs/config.json"
+
+
+def parse_cli_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--data-root",
+        default=None,
+        help=(
+            "Parent folder for generated/loaded datasets. "
+            "For example, set this to $SCRATCH/my_project on DelftBlue. "
+            "Relative dataset paths such as data/ED_data/... will become "
+            "$SCRATCH/my_project/data/ED_data/...."
+        ),
+    )
+    return parser.parse_args()
+
+
+def get_data_root(args, cli_data_root=None):
+    """
+    Resolve the parent folder used for dataset storage.
+
+    Priority:
+    1. command line: --data-root ...
+    2. config JSON:  "data_root": "..."
+    3. environment:  DATA_ROOT
+    4. default:      current working directory
+    """
+    root = cli_data_root or args.get("data_root") or os.environ.get("DATA_ROOT") or "."
+    return os.path.abspath(os.path.expanduser(os.path.expandvars(root)))
+
+
+def under_data_root(path, data_root):
+    """
+    Put a relative dataset path under data_root.
+
+    Example:
+        path="data/ED_data/x.pkl"
+        data_root="$SCRATCH/my_project"
+
+    becomes:
+        "$SCRATCH/my_project/data/ED_data/x.pkl"
+
+    Absolute paths are left unchanged.
+    """
+    path = os.path.expanduser(os.path.expandvars(path))
+    if os.path.isabs(path):
+        return path
+    return os.path.join(data_root, path)
+
 
 def build_ed_data_save_path(ED_args, nodes_count, nodes_str, gens_str, lines_str):
     """
@@ -38,7 +95,9 @@ def build_ed_data_save_path(ED_args, nodes_count, nodes_str, gens_str, lines_str
         node_tag = "_NodeConst" if node_constraint else ""
         label_tag = "_Label" if ED_args.get("precompute_heuristic_lambda_labels", False) else ""
         gen_data_renew_availability = ED_args.get("gen_data_renew_availability", 100)
+
         print(f"Cap Use Hard Cap setting is {ED_args.get('capacity_sobol_use_hard_cap', False)}")
+
         if ED_args.get("capacity_sobol_use_hard_cap", False):
             cap_sobel_tag = "_CapSobol_GenConst"
         else:
@@ -111,6 +170,7 @@ def build_ed_data_save_path(ED_args, nodes_count, nodes_str, gens_str, lines_str
             label_tag = "_Label"
         else:
             label_tag = ""
+
         data_save_path = (
             f"data/ED_data/"
             f"ED_N{nodes_str}_G{gens_str}_{lines_str}"
@@ -122,98 +182,193 @@ def build_ed_data_save_path(ED_args, nodes_count, nodes_str, gens_str, lines_str
 
     return data_save_path
 
+
 if __name__ == "__main__":
+    cli_args = parse_cli_args()
+
     # Load the arguments
     with open(ARGS_FILE_NAME, "r") as file:
         args = json.load(file)
 
-    
+    data_root = get_data_root(args, cli_args.data_root)
+    args["data_root"] = data_root
+    print(f"Dataset root: {data_root}")
 
     QP_args = args["QP_args"]
 
-    assert args["problem_type"] in ["ED", "GEP", "QP"], "Problem type must be either 'ED', 'GEP', or 'QP'"
+    assert args["problem_type"] in ["ED", "GEP", "QP"], (
+        "Problem type must be either 'ED', 'GEP', or 'QP'"
+    )
 
+    run_name = (
+        f"learn_primal:{args['learn_primal']}"
+        f"_train:{args['train']}"
+        f"_rho:{args['rho']}"
+        f"_rhomax:{args['rho_max']}"
+        f"_alpha:{args['alpha']}"
+        f"_L:{args['alpha']}"
+    )
 
-    run_name = f"learn_primal:{args['learn_primal']}_train:{args['train']}_rho:{args['rho']}_rhomax:{args['rho_max']}_alpha:{args['alpha']}_L:{args['alpha']}"
-    save_dir = os.path.join('outputs', 'PDL', args['problem_type'], run_name + "-" + str(time.time()).replace('.', '-'))
+    save_dir = os.path.join(
+        "outputs",
+        "PDL",
+        args["problem_type"],
+        run_name + "-" + str(time.time()).replace(".", "-"),
+    )
+
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
-    with open(os.path.join(save_dir, 'args.json'), 'w') as f:
+
+    with open(os.path.join(save_dir, "args.json"), "w") as f:
         json.dump(args, f, indent=4)
-            
+
     if args["problem_type"] == "QP":
-        if QP_args['random_hyperparams']:
-            tau = np.random.choice([0.5, 0.6, 0.7, 0.8, 0.9], size=QP_args['repeats'])
-            rho = np.random.choice([0.1, 0.5, 1, 10], size=QP_args['repeats'])
-            rho_max = np.random.choice([1000, 5000, 10000, 50000], size=QP_args['repeats'])
-            alpha = np.random.choice([1, 1.5, 2, 5, 10], size=QP_args['repeats'])
+        if QP_args["random_hyperparams"]:
+            tau = np.random.choice([0.5, 0.6, 0.7, 0.8, 0.9], size=QP_args["repeats"])
+            rho = np.random.choice([0.1, 0.5, 1, 10], size=QP_args["repeats"])
+            rho_max = np.random.choice([1000, 5000, 10000, 50000], size=QP_args["repeats"])
+            alpha = np.random.choice([1, 1.5, 2, 5, 10], size=QP_args["repeats"])
         else:
-            rho = args['rho']
-            rho_max = args['rho_max']
-            alpha = args['alpha']
-        for QP_type in QP_args['type']:
-            data_save_path = f"data/QP_data/QP_type:{QP_type}_var:{QP_args['var']}_ineq:{QP_args['ineq']}_eq:{QP_args['eq']}_num_samples:{QP_args['num_samples']}.pkl"
+            rho = args["rho"]
+            rho_max = args["rho_max"]
+            alpha = args["alpha"]
+
+        for QP_type in QP_args["type"]:
+            relative_data_save_path = (
+                f"data/QP_data/QP_type:{QP_type}"
+                f"_var:{QP_args['var']}"
+                f"_ineq:{QP_args['ineq']}"
+                f"_eq:{QP_args['eq']}"
+                f"_num_samples:{QP_args['num_samples']}.pkl"
+            )
+
+            data_save_path = under_data_root(relative_data_save_path, data_root)
             curr_type_save_dir = os.path.join(save_dir, QP_type)
-            
-            # Create dataset if it doesn't exist:
+
+            # Create dataset if it doesn't exist
             if not os.path.exists(data_save_path):
                 directory = os.path.dirname(data_save_path)
                 os.makedirs(directory, exist_ok=True)
+
                 if QP_type == "simple":
-                    create_QP_dataset(QP_args['var'], QP_args['ineq'], QP_args['eq'], QP_args['num_samples'], data_save_path)
+                    create_QP_dataset(
+                        QP_args["var"],
+                        QP_args["ineq"],
+                        QP_args["eq"],
+                        QP_args["num_samples"],
+                        data_save_path,
+                    )
                 elif QP_type == "row":
-                    create_varying_G_dataset(QP_args['var'], QP_args['ineq'], QP_args['eq'], QP_args['num_samples'], 'row', data_save_path)
+                    create_varying_G_dataset(
+                        QP_args["var"],
+                        QP_args["ineq"],
+                        QP_args["eq"],
+                        QP_args["num_samples"],
+                        "row",
+                        data_save_path,
+                    )
                 elif QP_type == "column":
-                    create_varying_G_dataset(QP_args['var'], QP_args['ineq'], QP_args['eq'], QP_args['num_samples'], 'column', data_save_path)
+                    create_varying_G_dataset(
+                        QP_args["var"],
+                        QP_args["ineq"],
+                        QP_args["eq"],
+                        QP_args["num_samples"],
+                        "column",
+                        data_save_path,
+                    )
                 elif QP_type == "random":
-                    create_varying_G_dataset(QP_args['var'], QP_args['ineq'], QP_args['eq'], QP_args['num_samples'], 'random', data_save_path)
+                    create_varying_G_dataset(
+                        QP_args["var"],
+                        QP_args["ineq"],
+                        QP_args["eq"],
+                        QP_args["num_samples"],
+                        "random",
+                        data_save_path,
+                    )
                 elif QP_type == "obj":
-                    create_varying_Q_dataset(QP_args['var'], QP_args['ineq'], QP_args['eq'], QP_args['num_samples'], data_save_path)
+                    create_varying_Q_dataset(
+                        QP_args["var"],
+                        QP_args["ineq"],
+                        QP_args["eq"],
+                        QP_args["num_samples"],
+                        data_save_path,
+                    )
                 elif QP_type == "nonconvex":
-                    create_nonconvex_QP_dataset(QP_args['var'], QP_args['ineq'], QP_args['eq'], QP_args['num_samples'], data_save_path)
+                    create_nonconvex_QP_dataset(
+                        QP_args["var"],
+                        QP_args["ineq"],
+                        QP_args["eq"],
+                        QP_args["num_samples"],
+                        data_save_path,
+                    )
                 else:
                     raise ValueError(f"QP type {QP_type} not supported")
-        
-            # Load data:
-            with open(data_save_path, 'rb') as file:
+
+            # Load data
+            with open(data_save_path, "rb") as file:
                 data = pickle.load(file)
-            for repeat in range(QP_args['repeats']):
-                if QP_args['random_hyperparams']:
-                    curr_repeat_save_dir = os.path.join(curr_type_save_dir, f"tau_{tau[repeat]}_rho_{rho[repeat]}_rhomax_{rho_max[repeat]}_alpha_{alpha[repeat]}_repeat:{repeat}")
-                    args['tau'] = tau[repeat]
-                    args['rho'] = rho[repeat]
-                    args['rho_max'] = rho_max[repeat]
-                    args['alpha'] = alpha[repeat]
+
+            for repeat in range(QP_args["repeats"]):
+                if QP_args["random_hyperparams"]:
+                    curr_repeat_save_dir = os.path.join(
+                        curr_type_save_dir,
+                        (
+                            f"tau_{tau[repeat]}"
+                            f"_rho_{rho[repeat]}"
+                            f"_rhomax_{rho_max[repeat]}"
+                            f"_alpha_{alpha[repeat]}"
+                            f"_repeat:{repeat}"
+                        ),
+                    )
+                    args["tau"] = tau[repeat]
+                    args["rho"] = rho[repeat]
+                    args["rho_max"] = rho_max[repeat]
+                    args["alpha"] = alpha[repeat]
                 else:
                     curr_repeat_save_dir = os.path.join(curr_type_save_dir, f"repeat:{repeat}")
+
                 if not os.path.exists(curr_repeat_save_dir):
                     os.makedirs(curr_repeat_save_dir)
+
                 trainer = PrimalDualTrainer(data, args, curr_repeat_save_dir)
                 primal_net, dual_net = trainer.train_PDL()
-    
+
     else:
         ED_args = args["ED_args"]
 
-        input_data = parse_config(CONFIG_FILE_NAME) # Reads the input data using config.toml's experiment.inputs.data path.
-        
-        gep_ed_data = input_data["experiment"]["experiments"][0] # Take first experiment, we don't change the inputs here.
+        # Reads the input data using config.toml's experiment.inputs.data path.
+        input_data = parse_config(CONFIG_FILE_NAME)
+
+        # Take first experiment, we don't change the inputs here.
+        gep_ed_data = input_data["experiment"]["experiments"][0]
+
         print("--------_GEP ED Dataset Info--------")
         print(gep_ed_data)
+
         if args["problem_type"] == "ED":
-            #! TODO: not all configs are correctly parsed here. E.g. when first running BEL and GER with both coal generators, is the same as with both gas generators.
-            # For nodes, just use first letters: ['BEL', 'GER', 'NED'] → 'B-G-N'
-            nodes_str = "-".join([n[0] for n in ED_args['N']])
-            nodes_count = len(ED_args['N'])
-            # For generators, count per node: [['BEL', 'WindOn'], ['BEL', 'Gas'],...] = 'B3-G2-N2'
+            # TODO:
+            # Not all configs are correctly parsed here.
+            # E.g. when first running BEL and GER with both coal generators,
+            # is the same as with both gas generators.
+
+            # For nodes, just use first letters:
+            # ['BEL', 'GER', 'NED'] → 'B-G-N'
+            nodes_str = "-".join([n[0] for n in ED_args["N"]])
+            nodes_count = len(ED_args["N"])
+
+            # For generators, count per node:
+            # [['BEL', 'WindOn'], ['BEL', 'Gas'], ...] = 'B3-G2-N2'
             gen_counts = {}
-            for g in ED_args['G']:
+            for g in ED_args["G"]:
                 node = g[0]
                 gen_counts[node] = gen_counts.get(node, 0) + 1
+
             gens_str = "-".join([f"{node[0]}{count}" for node, count in gen_counts.items()])
-            
-            # For lines, just count: [['BEL', 'GER'], ['BEL', 'NED'], ['GER', 'NED']] → 'L3'
+
+            # For lines, just count:
+            # [['BEL', 'GER'], ['BEL', 'NED'], ['GER', 'NED']] → 'L3'
             lines_str = f"L{len(ED_args['L'])}"
-            
+
             data_save_path = build_ed_data_save_path(
                 ED_args=ED_args,
                 nodes_count=nodes_count,
@@ -221,37 +376,74 @@ if __name__ == "__main__":
                 gens_str=gens_str,
                 lines_str=lines_str,
             )
-                        
+
         elif args["problem_type"] == "GEP":
-            # SOLVER CODE
-            data_save_path = f"data/GEP_data/N:{ED_args['N']}_G:{ED_args['G']}_L:{ED_args['L']}_scale-prob:{ED_args['scale_problem']}.pkl"
-        
+            data_save_path = (
+                f"data/GEP_data/"
+                f"N:{ED_args['N']}"
+                f"_G:{ED_args['G']}"
+                f"_L:{ED_args['L']}"
+                f"_scale-prob:{ED_args['scale_problem']}.pkl"
+            )
+
+        data_save_path = under_data_root(data_save_path, data_root)
+
         print(f"Data save path: {data_save_path} and does it exist? {os.path.exists(data_save_path)}")
         print("---------------------")
+
         if not os.path.exists(data_save_path):
             directory = os.path.dirname(data_save_path)
             os.makedirs(directory, exist_ok=True)
-            data = create_gep_ed_dataset(args=args, problem_args=ED_args, inputs=gep_ed_data, problem_type=args["problem_type"], save_path=data_save_path)
 
-        # Load data:
-        with open(data_save_path, 'rb') as file:
+            data = create_gep_ed_dataset(
+                args=args,
+                problem_args=ED_args,
+                inputs=gep_ed_data,
+                problem_type=args["problem_type"],
+                save_path=data_save_path,
+            )
+
+        # Load data
+        with open(data_save_path, "rb") as file:
             data = pickle.load(file)
 
         if args["Optuna_args"]["optuna"]:
-            # Tune the hyperparameters using Optuna:
+            # Tune the hyperparameters using Optuna
             optuna_args = args["Optuna_args"]
+
             # Don't log to tensorboard for Optuna trials, it will be too slow.
             args["log"] = False
+
             def objective(trial):
                 # Suggest hyperparameters with Optuna
                 if args["learn_primal"]:
-                    args["primal_lr"] = trial.suggest_float("primal_lr", *optuna_args["primal_lr"])
+                    args["primal_lr"] = trial.suggest_float(
+                        "primal_lr",
+                        *optuna_args["primal_lr"],
+                    )
+
                 if args["learn_dual"]:
-                    args["dual_lr"] = trial.suggest_float("dual_lr", *optuna_args["dual_lr"])
-                args["hidden_size_factor"] = trial.suggest_int("hidden_size_factor", *optuna_args["hidden_size_factor"])
-                args["n_layers"] = trial.suggest_int("n_layers", *optuna_args["n_layers"])
-                args["decay"] = trial.suggest_float("decay", *optuna_args["decay"])
-                args["batch_size"] = trial.suggest_categorical("batch_size", optuna_args["batch_size"])
+                    args["dual_lr"] = trial.suggest_float(
+                        "dual_lr",
+                        *optuna_args["dual_lr"],
+                    )
+
+                args["hidden_size_factor"] = trial.suggest_int(
+                    "hidden_size_factor",
+                    *optuna_args["hidden_size_factor"],
+                )
+                args["n_layers"] = trial.suggest_int(
+                    "n_layers",
+                    *optuna_args["n_layers"],
+                )
+                args["decay"] = trial.suggest_float(
+                    "decay",
+                    *optuna_args["decay"],
+                )
+                args["batch_size"] = trial.suggest_categorical(
+                    "batch_size",
+                    optuna_args["batch_size"],
+                )
 
                 trial_save_dir = os.path.join(save_dir, f"optuna_trial:{trial.number}")
                 os.makedirs(trial_save_dir, exist_ok=True)
@@ -266,17 +458,31 @@ if __name__ == "__main__":
                 else:
                     raise ValueError("Must learn either primal or dual")
 
-            pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=2000, interval_steps=10)
+            pruner = optuna.pruners.MedianPruner(
+                n_startup_trials=5,
+                n_warmup_steps=2000,
+                interval_steps=10,
+            )
+
             study = optuna.create_study(direction="minimize", pruner=pruner)
             study.optimize(objective, n_trials=optuna_args["optuna_trials"])
+
             df = study.trials_dataframe()
             df.to_csv(os.path.join(save_dir, "optuna_trials.csv"), index=False)
-            print("Best trial:", study.best_trial.params)
-        else:
 
-            #! Use best-found hyperparameters using Optuna
+            print("Best trial:", study.best_trial.params)
+
+        else:
+            # Use best-found hyperparameters using Optuna
             if args["learn_primal"]:
-                best_args = {'primal_lr': 0.0006785456069117277, 'hidden_size_factor': 28, 'n_layers': 2, 'decay': 0.9989743016070536, 'batch_size': 2048}
+                best_args = {
+                    "primal_lr": 0.0006785456069117277,
+                    "hidden_size_factor": 28,
+                    "n_layers": 2,
+                    "decay": 0.9989743016070536,
+                    "batch_size": 2048,
+                }
+
                 args["primal_lr"] = best_args["primal_lr"]
                 args["hidden_size_factor"] = best_args["hidden_size_factor"]
                 args["n_layers"] = best_args["n_layers"]
@@ -286,6 +492,7 @@ if __name__ == "__main__":
             for repeat in range(ED_args["repeats"]):
                 curr_repeat_save_dir = os.path.join(save_dir, f"repeat:{repeat}")
                 os.makedirs(curr_repeat_save_dir, exist_ok=True)
+
                 # Run PDL
                 trainer = PrimalDualTrainer(data, args, curr_repeat_save_dir)
                 primal_net, dual_net, primal_loss, dual_loss, train_time = trainer.train_PDL()
