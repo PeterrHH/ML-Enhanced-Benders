@@ -710,7 +710,7 @@ def plot_mean_lb_percent_vs_time(
     else:
         ax.set_xlim(0.0, max_time)
 
-    ax.set_xlabel("Cumulative solver time (s)", fontsize=  16)
+    ax.set_xlabel("Cumulative solve time (s)", fontsize=  16)
 
     if plot_optimality_gap:
         ax.set_ylabel(r"Optimality gap $100 \cdot (LB^{\star} - LB)/LB^{\star}$ (%)", fontsize = 16)
@@ -861,7 +861,7 @@ def plot_combined_gap_figure(
     ax_b.set_xlim(0.0, xmax_b)
     ax_b.set_yscale("log")
     ax_b.set_ylim(optimality_y_floor, None)
-    ax_b.set_xlabel("Cumulative solver time (s)")
+    ax_b.set_xlabel("Cumulative solve time (s)")
     ax_b.set_ylabel(r"Optimality gap $100 \cdot (LB^\star - LB)/LB^\star$ (%)")
     ax_b.grid(True, which="both", alpha=0.3, linestyle="--")
     ax_b.legend(loc="upper right", fontsize=9, framealpha=0.9)
@@ -890,7 +890,298 @@ def plot_combined_gap_figure(
     print(f"Saved combined figure to: {out_path}")
 
 
+from matplotlib.animation import FuncAnimation, PillowWriter, FFMpegWriter
 
+
+def animate_mean_lb_percent_vs_time(
+    method_logs,
+    exact_logs,
+    figures_dir: Path,
+    filename: str = "mean_optimality_gap_vs_time_animation.gif",
+    grid_size: int = 500,
+    title: str = "Mean optimality gap vs time (averaged across all samples)",
+    plot_optimality_gap: bool = True,
+    log_y: bool = True,
+    y_stop_threshold: float = 1e-6,
+    trim_x_at_threshold: bool = True,
+    duration: float = 8.0,
+    fps: int = 24,
+):
+    """
+    Animate the mean optimality-gap curve over cumulative fair solver time.
+
+    Saves either .gif or .mp4 depending on filename extension.
+    GIF requires pillow.
+    MP4 requires ffmpeg.
+    """
+    ensure_dir(figures_dir)
+
+    time_col = "cum_fair_time"
+    lb_star_map = get_lb_star_map(exact_logs)
+
+    # ------------------------------------------------------------
+    # Build common time grid
+    # ------------------------------------------------------------
+    max_time = 0.0
+    for logs in method_logs.values():
+        for sid, df in logs.items():
+            if sid in lb_star_map and len(df) > 0:
+                df = _ensure_fair_time_columns(df)
+                max_time = max(max_time, float(df[time_col].iloc[-1]))
+
+    grid = np.linspace(0.0, max_time, grid_size)
+
+    # ------------------------------------------------------------
+    # Precompute curves
+    # ------------------------------------------------------------
+    color_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+    curves = []
+    all_mean_curves = []
+
+    for idx, (method_name, logs) in enumerate(method_logs.items()):
+        color = color_cycle[idx % len(color_cycle)]
+        display_name = _display_name(method_name)
+
+        mean_curve, _ = aggregate_lb_percent_curves(
+            logs=logs,
+            lb_star_map=lb_star_map,
+            grid=grid,
+            x_mode="time_raw",
+            as_optimality_gap=plot_optimality_gap,
+            time_col=time_col,
+        )
+
+        if log_y:
+            mean_curve = np.maximum(mean_curve, y_stop_threshold)
+
+        all_mean_curves.append(mean_curve)
+
+        cross_stats = None
+        if "exact" not in method_name.lower():
+            cross_stats = aggregate_crossover_lb_percent(
+                logs=logs,
+                lb_star_map=lb_star_map,
+                as_optimality_gap=plot_optimality_gap,
+                time_col=time_col,
+            )
+
+        curves.append({
+            "name": display_name,
+            "color": color,
+            "y": mean_curve,
+            "cross": cross_stats,
+        })
+
+    # ------------------------------------------------------------
+    # Trim x-axis like your static plot
+    # ------------------------------------------------------------
+    if trim_x_at_threshold and plot_optimality_gap:
+        xmax = _find_xmax_from_y_threshold(
+            grid=grid,
+            curves=all_mean_curves,
+            y_threshold=y_stop_threshold,
+            buffer_frac=0.03,
+        )
+    else:
+        xmax = max_time
+
+    mask = grid <= xmax
+    grid_plot = grid[mask]
+
+    for c in curves:
+        c["y_plot"] = c["y"][mask]
+
+    n_plot = len(grid_plot)
+
+    # ------------------------------------------------------------
+    # Figure setup
+    # ------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(11.5, 6.2))
+
+    line_objs = []
+    for c in curves:
+        line, = ax.plot(
+            [],
+            [],
+            color=c["color"],
+            linewidth=2.5,
+            label=c["name"],
+        )
+        line_objs.append(line)
+
+    # Static 100% line
+    ax.axhline(
+        y=100.0,
+        color="black",
+        linestyle="--",
+        linewidth=1.4,
+        alpha=0.8,
+        label="100% Optimality Gap",
+    )
+
+    # Crossover lines: initially hidden, appear once time reaches them
+    crossover_lines = []
+    crossover_dots = []
+
+    for c in curves:
+        cross = c["cross"]
+
+        if cross is None:
+            crossover_lines.append(None)
+            crossover_dots.append(None)
+            continue
+
+        x_cross = cross["mean_time"]
+        y_cross = cross["mean_val"]
+
+        if x_cross is None or y_cross is None or x_cross > xmax:
+            crossover_lines.append(None)
+            crossover_dots.append(None)
+            continue
+
+        vline = ax.axvline(
+            x=x_cross,
+            color=c["color"],
+            linestyle=":",
+            linewidth=2.0,
+            alpha=0.8,
+            zorder=4,
+            label=f"{c['name']} crossover: {y_cross:.1f}%",
+        )
+
+        vline.set_visible(False)
+
+        y_dot = np.interp(x_cross, grid_plot, c["y_plot"])
+        dot = ax.scatter(
+            [],
+            [],
+            color=c["color"],
+            s=65,
+            marker="o",
+            edgecolors="black",
+            linewidths=0.8,
+            zorder=6,
+            alpha=0.0,
+        )
+
+        crossover_lines.append(vline)
+        crossover_dots.append((dot, x_cross, y_dot))
+
+    # Moving current-time line
+    current_time_line, = ax.plot(
+        [],
+        [],
+        color="black",
+        linestyle="-",
+        linewidth=1.2,
+        alpha=0.45,
+        # label="Current time",
+    )
+
+    ax.set_xlim(0.0, xmax)
+
+    ymax_data = max(np.nanmax(c["y_plot"]) for c in curves)
+
+    if log_y:
+        ymax = ymax_data * 1.15
+        ax.set_yscale("log")
+        ax.set_ylim(y_stop_threshold, ymax)
+    else:
+        # keep linear axis tight: start at 0 and only a tiny bit above the max
+        ymax = max(100.0, ymax_data) * 1.03
+        ax.set_ylim(0.0, ymax)
+
+    ax.set_xlabel("Cumulative solve time (s)", fontsize=18)
+
+    if plot_optimality_gap:
+        ax.set_ylabel(
+            r"Relative Optimality gap (%)",
+            fontsize=18,
+        )
+    else:
+        ax.set_ylabel(r"$100 \cdot LB / LB^{\star}$ (%)", fontsize=16)
+
+    ax.grid(True, which="both" if log_y else "major")
+    ax.legend(loc="upper right", fontsize=11)
+    title_text = ax.set_title(title, fontsize=16, pad=14)
+
+    subtitle_text = fig.text(
+        0.5, 0.94, "",
+        ha="center",
+        va="top",
+        fontsize=12
+    )
+
+    fig.tight_layout(rect=(0, 0, 1, 0.90))
+
+    # ------------------------------------------------------------
+    # Animation update
+    # ------------------------------------------------------------
+    n_frames = int(duration * fps)
+    frame_indices = np.unique(
+        np.linspace(2, n_plot, n_frames).astype(int)
+    )
+
+    y_low, y_high = ax.get_ylim()
+
+    def update(frame_i):
+        current_t = grid_plot[frame_i - 1]
+
+        for line, c in zip(line_objs, curves):
+            line.set_data(grid_plot[:frame_i], c["y_plot"][:frame_i])
+
+        current_time_line.set_data(
+            [current_t, current_t],
+            [y_low, y_high],
+        )
+
+        for vline, dot_pack in zip(crossover_lines, crossover_dots):
+            if vline is None or dot_pack is None:
+                continue
+
+            dot, x_cross, y_dot = dot_pack
+
+            if current_t >= x_cross:
+                vline.set_visible(True)
+                dot.set_offsets([[x_cross, y_dot]])
+                dot.set_alpha(1.0)
+            else:
+                vline.set_visible(False)
+                dot.set_offsets(np.empty((0, 2)))
+                dot.set_alpha(0.0)
+
+        title_text.set_text(title)
+        subtitle_text.set_text(f"Current time: {current_t:.2f} s")
+
+        return line_objs + [current_time_line]
+
+    ani = FuncAnimation(
+        fig,
+        update,
+        frames=frame_indices,
+        interval=1000 / fps,
+        blit=False,
+        repeat=False,
+    )
+
+    out_path = figures_dir / filename
+
+    if filename.lower().endswith(".gif"):
+        ani.save(out_path, writer=PillowWriter(fps=fps))
+    elif filename.lower().endswith(".mp4"):
+        writer = FFMpegWriter(
+            fps=fps,
+            codec="libx264",
+            bitrate=1200,
+            extra_args=["-pix_fmt", "yuv420p", "-crf", "28"]
+        )
+        ani.save(out_path, writer=writer, dpi=120)
+    else:
+        raise ValueError("filename must end with .gif or .mp4")
+
+    plt.close(fig)
+    print(f"Saved animation to: {out_path}")
 
 if __name__ == "__main__":
     BASE = "outputs/Benders/3Node/Sample_1752"
@@ -915,82 +1206,56 @@ if __name__ == "__main__":
 
     #dCABCap_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_Capacity_1_0_Base_single"))
 
-
-    #exact_full_logs = load_logs(Path(f"{BASE}/iter_logs_Exact_Exact_full"))
-    #dCAB_full_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_D_CAB_full"))
-    #dUniform_full_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_D_uniform_full"))
-    #dCABCap_full_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_Capacity_1_0_Base_full"))
-    # ---- Duality gap plot: now configurable to hide median ----
-    # plot_mean_gap_vs_time(
+    # # # ---- LB plot, now showing OPTIMALITY GAP (LB*-LB)/LB* on log scale ----
+    # plot_mean_lb_percent_vs_time(
     #     method_logs={
-    #         "Exact Benders": exact_logs,
-    #         "D_CAB Self-Supervised": dCAB_SS_logs,
-    #         "D_Uniform": dUniform_logs,
-    #         # "D_CAB SLA 1000": dCAB_SLA_1000_logs,
+    #         #"Exact Benders (single)": exact_logs,
+    #         "Exact Benders (full)": exact_logs,
+    #         #"Exact Benders (kmeans10)": exact_kmeans10_logs,
+    #         r"$D_{\mathrm{Uniform}}$": dUniform_logs,
+    #         r"$D_{\mathrm{CAB}}$": dCAB_SS_logs,
+    #         #r"SLA $\beta=$10 Single Cut": dCAB_SLA_10_single_logs,
+    #         #r"SLA $\beta=$10 (full) Full Multi-Cut": dCAB_SLA_10_full_logs,
+    #         #"D_CAB SLA 100 (full)": dCAB_SLA_100_full_logs,
+    #         #"D_CAB SS (full)": dCAB_SS_full_logs,
+    #         #r"SLA $\beta=$10 Kmeans(10) Clustered Multi-Cut": dCAB_SLA_10_kmeans10_logs,
+    #         #"D_CAB SLA 1000": dCAB_SLA_100_single_logs,
     #         # "D_CABCap": dCABCap_logs,
     #         # "Exact Full": exact_full_logs,
     #         # "D_CAB Full": dCAB_full_logs,
-    #         # "D_Uniform Full": dUniform_full_logs,
+    #         # "D_Uniform Full": dUniform_full_logs,       
     #         # "D_CABCap Full": dCABCap_full_logs,
     #     },
-    #     figures_dir=Path("comparison_gap_time_figures"),
-    #     title="Mean relative duality gap vs time (averaged across all samples), Single Cut",
-    #     y_stop_threshold=1e-4,
-    #     annotate_crossover=True,
-    #     show_median=False,   # set True to also plot the median curves
-    #     log_y=True,         # log scale is recommended for the gap plot because it spans many orders of magnitude
+    #     exact_logs=exact_logs,
+    #     figures_dir=Path("comparison_lb_time_figures"),
+    #     filename="mean_optimality_gap_vs_time_with_crossover.pdf",
+    #     title="Mean optimality gap vs time (averaged across all samples) Comparision",
+    #     show_median=False,           # set True to also plot the median curves
+    #     plot_optimality_gap=True,    # set False to recover the old 100*LB/LB* plot,
+    #     log_y=True,                 # log scale is recommended for the optimality gap plot
+    #     y_stop_threshold=1e-6,
+    #     trim_x_at_threshold=True
+
     # )
 
-    # # ---- LB plot, now showing OPTIMALITY GAP (LB*-LB)/LB* on log scale ----
-    plot_mean_lb_percent_vs_time(
+
+    animate_mean_lb_percent_vs_time(
         method_logs={
-            #"Exact Benders (single)": exact_logs,
-            "Exact Benders (full)": exact_logs,
-            #"Exact Benders (kmeans10)": exact_kmeans10_logs,
-            r"$D_{\mathrm{Uniform}}$": dUniform_logs,
-            r"$D_{\mathrm{CAB}}$": dCAB_SS_logs,
-            #r"SLA $\beta=$10 Single Cut": dCAB_SLA_10_single_logs,
-            #r"SLA $\beta=$10 (full) Full Multi-Cut": dCAB_SLA_10_full_logs,
-            #"D_CAB SLA 100 (full)": dCAB_SLA_100_full_logs,
-            #"D_CAB SS (full)": dCAB_SS_full_logs,
-            #r"SLA $\beta=$10 Kmeans(10) Clustered Multi-Cut": dCAB_SLA_10_kmeans10_logs,
-            #"D_CAB SLA 1000": dCAB_SLA_100_single_logs,
-            # "D_CABCap": dCABCap_logs,
-            # "Exact Full": exact_full_logs,
-            # "D_CAB Full": dCAB_full_logs,
-            # "D_Uniform Full": dUniform_full_logs,       
-            # "D_CABCap Full": dCABCap_full_logs,
+            "Exact Benders": exact_logs,
+            "Single Cut  (Baseline)": dCAB_SLA_10_single_logs,
+            "Full Multi-Cut ": dCAB_SLA_10_full_logs,
+            "K-means Clustered Multi-Cut (Proposed)": dCAB_SLA_10_kmeans10_logs,
+            #r"$D_{\mathrm{Uniform}}$ (Baseline)": dUniform_logs,
+            #r"$D_{\mathrm{CAB}}$ (Proposed)": dCAB_SS_logs,
         },
         exact_logs=exact_logs,
         figures_dir=Path("comparison_lb_time_figures"),
-        filename="mean_optimality_gap_vs_time_with_crossover.pdf",
-        title="Mean optimality gap vs time (averaged across all samples) Comparision",
-        show_median=False,           # set True to also plot the median curves
-        plot_optimality_gap=True,    # set False to recover the old 100*LB/LB* plot,
-        log_y=True,                 # log scale is recommended for the optimality gap plot
-        y_stop_threshold=1e-6,
-        trim_x_at_threshold=True
-
+        filename="mean_optimality_gap_vs_time_animation_Cut.mp4",
+        title="Mean optimality gap vs time (averaged across 5 samples) - GEP 1752 hour",
+        plot_optimality_gap=True,
+        log_y=True,
+        y_stop_threshold=1e-4,
+        trim_x_at_threshold=True,
+        duration=12.0,
+        fps=12,
     )
-
-
-    # plot_combined_gap_figure(
-    #     method_logs={
-    #         "Exact Benders (single)": exact_logs,
-    #         "Exact Benders (full)": exact_full_logs,
-    #         # "D_CAB Self-Supervised": dCAB_SS_logs,
-    #         # "D_Uniform": dUniform_logs,
-    #         "D_CAB SLA 10 (single)": dCAB_SLA_10_single_logs,
-    #         "D_CAB SLA 10 (full)": dCAB_SLA_10_full_logs,
-    #         "D_CAB SLA 10 (kmeans10)": dCAB_SLA_10_kmeans10_logs,
-    #     },
-    #     exact_logs=exact_logs,
-    #     figures_dir=Path("comparison_combined_figures"),
-    #     filename="benders_gaps_vs_time.png",
-    # )
-    
-    # ---------------- usage at the bottom of Benders_Eval.py ----------------
-    # Replace your two existing plot_*  calls with:
-    #
-
-    
