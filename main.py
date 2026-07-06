@@ -9,12 +9,7 @@ import argparse
 
 from primal_dual import PrimalDualTrainer
 from create_gep_dataset import create_gep_ed_dataset
-from create_QP_dataset import (
-    create_QP_dataset,
-    create_nonconvex_QP_dataset,
-    create_varying_G_dataset,
-    create_varying_Q_dataset,
-)
+
 
 CONFIG_FILE_NAME = "configs/config.toml"
 
@@ -223,6 +218,12 @@ if __name__ == "__main__":
         json.dump(args, f, indent=4)
 
     if args["problem_type"] == "QP":
+        from create_QP_dataset import (
+            create_QP_dataset,
+            create_nonconvex_QP_dataset,
+            create_varying_G_dataset,
+            create_varying_Q_dataset,
+        )
         if QP_args["random_hyperparams"]:
             tau = np.random.choice([0.5, 0.6, 0.7, 0.8, 0.9], size=QP_args["repeats"])
             rho = np.random.choice([0.1, 0.5, 1, 10], size=QP_args["repeats"])
