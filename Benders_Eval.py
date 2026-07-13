@@ -1198,47 +1198,6 @@ if __name__ == "__main__":
     #dCAB_SLA_1000_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_D_CAB_SoftLabel_1000_single"))
     dUniform_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_D_uniform_single_Ben"))
 
-    #dCAB_NR50 = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_D_CAB-NR50_single"))
-    #dCAB_NR90 = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_D_CAB-NR90_single"))
-
-    #dCAB_Kmeans_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_D_CAB_kmeans"))
-    #exact_Kmeans_logs = load_logs(Path(f"{BASE}/iter_logs_Exact_Exact_kmeans"))
-
-    #dCABCap_logs = load_logs(Path(f"{BASE}/iter_logs_Inexact_Refine_Capacity_1_0_Base_single"))
-
-    # # # ---- LB plot, now showing OPTIMALITY GAP (LB*-LB)/LB* on log scale ----
-    # plot_mean_lb_percent_vs_time(
-    #     method_logs={
-    #         #"Exact Benders (single)": exact_logs,
-    #         "Exact Benders (full)": exact_logs,
-    #         #"Exact Benders (kmeans10)": exact_kmeans10_logs,
-    #         r"$D_{\mathrm{Uniform}}$": dUniform_logs,
-    #         r"$D_{\mathrm{CAB}}$": dCAB_SS_logs,
-    #         #r"SLA $\beta=$10 Single Cut": dCAB_SLA_10_single_logs,
-    #         #r"SLA $\beta=$10 (full) Full Multi-Cut": dCAB_SLA_10_full_logs,
-    #         #"D_CAB SLA 100 (full)": dCAB_SLA_100_full_logs,
-    #         #"D_CAB SS (full)": dCAB_SS_full_logs,
-    #         #r"SLA $\beta=$10 Kmeans(10) Clustered Multi-Cut": dCAB_SLA_10_kmeans10_logs,
-    #         #"D_CAB SLA 1000": dCAB_SLA_100_single_logs,
-    #         # "D_CABCap": dCABCap_logs,
-    #         # "Exact Full": exact_full_logs,
-    #         # "D_CAB Full": dCAB_full_logs,
-    #         # "D_Uniform Full": dUniform_full_logs,       
-    #         # "D_CABCap Full": dCABCap_full_logs,
-    #     },
-    #     exact_logs=exact_logs,
-    #     figures_dir=Path("comparison_lb_time_figures"),
-    #     filename="mean_optimality_gap_vs_time_with_crossover.pdf",
-    #     title="Mean optimality gap vs time (averaged across all samples) Comparision",
-    #     show_median=False,           # set True to also plot the median curves
-    #     plot_optimality_gap=True,    # set False to recover the old 100*LB/LB* plot,
-    #     log_y=True,                 # log scale is recommended for the optimality gap plot
-    #     y_stop_threshold=1e-6,
-    #     trim_x_at_threshold=True
-
-    # )
-
-
     animate_mean_lb_percent_vs_time(
         method_logs={
             "Exact Benders": exact_logs,
