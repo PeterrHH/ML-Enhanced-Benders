@@ -346,67 +346,74 @@ if __name__ == "__main__":
         print("--------_GEP ED Dataset Info--------")
         print(gep_ed_data)
 
-        if args["problem_type"] == "ED":
-            # TODO:
-            # Not all configs are correctly parsed here.
-            # E.g. when first running BEL and GER with both coal generators,
-            # is the same as with both gas generators.
+        if ED_args["use_direct_data"]:
+            data_save_path = under_data_root(ED_args["direct_data_path"], data_root)
+            print(f"[direct] loading ED data from: {data_save_path}")
+            assert os.path.exists(data_save_path), f"direct_data_path not found: {data_save_path}"
+            with open(data_save_path, "rb") as file:
+                data = pickle.load(file)
+        else:
+            if args["problem_type"] == "ED":
+                # TODO:
+                # Not all configs are correctly parsed here.
+                # E.g. when first running BEL and GER with both coal generators,
+                # is the same as with both gas generators.
 
-            # For nodes, just use first letters:
-            # ['BEL', 'GER', 'NED'] → 'B-G-N'
-            nodes_str = "-".join([n[0] for n in ED_args["N"]])
-            nodes_count = len(ED_args["N"])
+                # For nodes, just use first letters:
+                # ['BEL', 'GER', 'NED'] → 'B-G-N'
+                nodes_str = "-".join([n[0] for n in ED_args["N"]])
+                nodes_count = len(ED_args["N"])
 
-            # For generators, count per node:
-            # [['BEL', 'WindOn'], ['BEL', 'Gas'], ...] = 'B3-G2-N2'
-            gen_counts = {}
-            for g in ED_args["G"]:
-                node = g[0]
-                gen_counts[node] = gen_counts.get(node, 0) + 1
+                # For generators, count per node:
+                # [['BEL', 'WindOn'], ['BEL', 'Gas'], ...] = 'B3-G2-N2'
+                gen_counts = {}
+                for g in ED_args["G"]:
+                    node = g[0]
+                    gen_counts[node] = gen_counts.get(node, 0) + 1
 
-            gens_str = "-".join([f"{node[0]}{count}" for node, count in gen_counts.items()])
+                gens_str = "-".join([f"{node[0]}{count}" for node, count in gen_counts.items()])
 
-            # For lines, just count:
-            # [['BEL', 'GER'], ['BEL', 'NED'], ['GER', 'NED']] → 'L3'
-            lines_str = f"L{len(ED_args['L'])}"
+                # For lines, just count:
+                # [['BEL', 'GER'], ['BEL', 'NED'], ['GER', 'NED']] → 'L3'
+                lines_str = f"L{len(ED_args['L'])}"
 
-            data_save_path = build_ed_data_save_path(
-                ED_args=ED_args,
-                nodes_count=nodes_count,
-                nodes_str=nodes_str,
-                gens_str=gens_str,
-                lines_str=lines_str,
-            )
+                data_save_path = build_ed_data_save_path(
+                    ED_args=ED_args,
+                    nodes_count=nodes_count,
+                    nodes_str=nodes_str,
+                    gens_str=gens_str,
+                    lines_str=lines_str,
+                )
 
-        elif args["problem_type"] == "GEP":
-            data_save_path = (
-                f"data/GEP_data/"
-                f"N:{ED_args['N']}"
-                f"_G:{ED_args['G']}"
-                f"_L:{ED_args['L']}"
-                f"_scale-prob:{ED_args['scale_problem']}.pkl"
-            )
+            elif args["problem_type"] == "GEP":
+                data_save_path = (
+                    f"data/GEP_data/"
+                    f"N:{ED_args['N']}"
+                    f"_G:{ED_args['G']}"
+                    f"_L:{ED_args['L']}"
+                    f"_scale-prob:{ED_args['scale_problem']}.pkl"
+                )
 
-        data_save_path = under_data_root(data_save_path, data_root)
+            data_save_path = under_data_root(data_save_path, data_root)
 
-        print(f"Data save path: {data_save_path} and does it exist? {os.path.exists(data_save_path)}")
-        print("---------------------")
+            print(f"Data save path: {data_save_path} and does it exist? {os.path.exists(data_save_path)}")
+            print("---------------------")
 
-        if not os.path.exists(data_save_path):
-            directory = os.path.dirname(data_save_path)
-            os.makedirs(directory, exist_ok=True)
+            if not os.path.exists(data_save_path):
+                directory = os.path.dirname(data_save_path)
+                os.makedirs(directory, exist_ok=True)
 
-            data = create_gep_ed_dataset(
-                args=args,
-                problem_args=ED_args,
-                inputs=gep_ed_data,
-                problem_type=args["problem_type"],
-                save_path=data_save_path,
-            )
+                data = create_gep_ed_dataset(
+                    args=args,
+                    problem_args=ED_args,
+                    inputs=gep_ed_data,
+                    problem_type=args["problem_type"],
+                    save_path=data_save_path,
+                )
 
-        # Load data
-        with open(data_save_path, "rb") as file:
-            data = pickle.load(file)
+            # Load data
+            with open(data_save_path, "rb") as file:
+                data = pickle.load(file)
 
         if args["Optuna_args"]["optuna"]:
             # Tune the hyperparameters using Optuna

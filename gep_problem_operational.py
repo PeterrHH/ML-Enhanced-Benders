@@ -182,7 +182,7 @@ class GEPOperationalProblemSet():
                 tier2_confidence=self.ED_args.get("heuristic_lambda_tier2_confidence", 0.10),
             )
 
-            
+
             self.soft_label_runtime = time.perf_counter() - start_time
             print(f"Computing Soft Label took: {self.soft_label_runtime:.2f} seconds")
             print("Heuristic lambda soft labels:", self.heuristic_lambda_soft_labels.shape)
@@ -199,8 +199,9 @@ class GEPOperationalProblemSet():
         self.opt_targets = self.compute_opt_targets() # Solve for the opt target
         self.opt_label_runtime = time.perf_counter() - start_time
         print(f"Computing optimal labels took: {self.opt_label_runtime:.4f} seconds")
-        print(f"Computing Soft Label took: {self.soft_label_runtime:.4f} seconds")
-        print(f"Speedup:        {self.opt_label_runtime / self.soft_label_runtime:.1f}x")
+        if self.soft_label_runtime is not None:
+            print(f"Computing Soft Label took: {self.soft_label_runtime:.4f} seconds")
+            print(f"Speedup:        {self.opt_label_runtime / self.soft_label_runtime:.1f}x")
 
 
         # sl1, conf1, tier1, cls1 = self.compute_heuristic_lambda_soft_labels(X=self.X)

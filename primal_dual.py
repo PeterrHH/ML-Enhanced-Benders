@@ -174,14 +174,24 @@ class PrimalDualTrainer():
         self.step = 0
         indices = torch.arange(self.X.shape[0])
         # Compute sizes for each set
-        train_size = int(self.train * self.X.shape[0])
-        valid_size = int(self.valid * self.X.shape[0])
-        print(f"Train size: {train_size}, Valid size: {valid_size}, Test size: {self.X.shape[0] - train_size - valid_size}")
+        if self.args.get("train_count") is not None:
+            train_size = min(int(self.args["train_count"]), self.X.shape[0])
+        else:
+            train_size = int(self.train * self.X.shape[0])
 
-        # Split the indices
+        # surplus beyond train -> val/test, split equally by default
+        remaining = self.X.shape[0] - train_size
+        if self.args.get("split_remainder_equally", True):
+            valid_size = remaining // 2
+        else:
+            valid_size = int(self.valid * self.X.shape[0])
+
+        print(f"Train size: {train_size}, Valid size: {valid_size}, "
+              f"Test size: {self.X.shape[0] - train_size - valid_size}")
+
         self.train_indices = indices[:train_size]
-        self.valid_indices = indices[train_size:train_size+valid_size]
-        self.test_indices = indices[train_size+valid_size:]
+        self.valid_indices = indices[train_size:train_size + valid_size]
+        self.test_indices  = indices[train_size + valid_size:]
 
         self.X_train = self.X[self.train_indices]
         self.X_valid = self.X[self.valid_indices]

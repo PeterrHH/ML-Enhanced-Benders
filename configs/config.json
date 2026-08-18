@@ -22,7 +22,7 @@
         "2n_synthetic_samples": 15,
         "synthetic_demand_capacity": false,
         "normalize_input": false,
-        "repeats": 5,
+        "repeats": 3,
         "device": "cpu",
         "gen_data_constraint": false,
         "gen_data_constraint_lb": false,
@@ -41,7 +41,10 @@
         "precompute_heuristic_lambda_labels": true,
         "heuristic_lambda_main_mass": 0.85,
         "heuristic_lambda_unmet_safety_mass": 0.02,
-        "heuristic_lambda_tier2_confidence": 0.10
+        "heuristic_lambda_tier2_confidence": 0.10,
+
+        "use_direct_data": true,
+        "direct_data_path": "data/ED_data_gen/harvested_training_data_cluster_inv.pkl"
     },
 
     "Benders_args": {
@@ -52,7 +55,7 @@
         "scale_problem": false,
         "scale_input": false,
         "perturb_operating_costs": false,
-        "sample_duration": 1752, 
+        "sample_duration": 2190, 
         "_comment_sample_duration": "Max sample duration is 8760",
         "max_investment": 100000,
         "2n_synthetic_samples": 15,
@@ -60,10 +63,10 @@
         "normalize_input": false,
         "repeats": 1,
         "device": "cpu",
-        "primal_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-Unifrom_SLA/repeat:0", 
-        "dual_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-Unifrom_SLA/repeat:0",
+        "primal_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/Benders_ED/Classification_SLA/repeat:2", 
+        "dual_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/Benders_ED/Classification_SLA/repeat:2",
         "exp_save_directory":"outputs/Benders/3Node",
-        "specific_name":"D_Uniform_SLA_kmeans10",
+        "specific_name":"Benders_data_SLA_kmeans10",
         "benders_setup": "Inexact_Refine",
         "_Comment_benders_setup": "Benders setup options: [Exact, Inexact, Inexact_Refine, All], All is when all three are run",
         "init_investment": "Zero",
@@ -74,6 +77,7 @@
         "_cut_selection_comment":"Options are: single, kmeans, stress, full",
         "parallel_subproblems": false,
         "n_workers": null
+        
     },
     "Optuna_args": {
         "optuna": false,
