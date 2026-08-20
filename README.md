@@ -350,7 +350,7 @@ optima — `create_GEP_for_training.py` supports a class mixture via
 
 | Class | Setting | Optima region |
 |---|---|---|
-| Renewable-heavy | low demand + reduced renewable $C^inv$ | large solar/wind builds |
+| Renewable-heavy | low demand + reduced renewable $C^{inv}$ | large solar/wind builds |
 | High-demand | high demand | dispatchable (gas/nuclear) capacity |
 | Middle | broad random perturbation | between the two |
 
