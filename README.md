@@ -317,6 +317,94 @@ python Cut_selection_experiment.py \
   --k 6
 ```
 
+## Stage 1b — Trajectory-based training data (`gen_GEP/`) (Non-thesis)
+
+By default, `main.py` builds ED training data by sampling investments within a fixed range (Sobol/box sampling). This alternative pipeline instead **harvests the investment trajectories that exact Benders actually visits**, concentrating training states in the region the deployed solver traverses. It runs as two scripts before Stage 1.
+
+## Pipeline
+
+```
+gen_GEP/create_GEP_for_training.py   → perturbed GEP instances
+                                        (data/GEP_for_training*/)
+gen_GEP/solve_for_train.py           → solve each with exact Benders,
+                                        harvest trajectories, build ED dataset
+                                        (data/ED_data_gen/*.pkl)
+```
+
+1. **`create_GEP_for_training.py`** — builds perturbed GEP instances by drawing
+   real (demand, availability) hours from the provided data and perturbing
+   demand level, per-generator investment cost (C^inv), and (lightly)
+   availability.
+2. **`solve_for_train.py`** — solves each instance to optimality with exact
+   Benders, harvests the master's investment trajectory, and pairs each
+   investment with the instance's operational hours to form ED subproblems,
+   labelled by their exact duals. Investments and hours are clustered per
+   instance to control dataset size.
+
+## Instance-class engineering (coverage)
+
+The surrogate produces weak cuts where training data is sparse. To cover the
+full investment space — from renewable-dominated to dispatchable-dominated
+optima — `create_GEP_for_training.py` supports a class mixture via
+`USE_CLASS_MIXTURE`:
+
+| Class | Setting | Optima region |
+|---|---|---|
+| Renewable-heavy | low demand + reduced renewable $C^inv$ | large solar/wind builds |
+| High-demand | high demand | dispatchable (gas/nuclear) capacity |
+| Middle | broad random perturbation | between the two |
+
+Set `USE_CLASS_MIXTURE = False` to fall back to pure random perturbation.
+
+## Key settings (top of each script)
+
+| Script | Key | Effect |
+|---|---|---|
+| `create_GEP_for_training.py` | `N_INSTANCES` | Number of GEP instances to generate |
+| | `USE_CLASS_MIXTURE` | Class-mixture vs pure-random perturbation |
+| | `RENEWABLE_FRAC` | Share of renewable-heavy instances |
+| | `POOL_TIMES` | Hours the draw pool is restricted to (set to exclude eval hours) |
+| `solve_for_train.py` | `CUT_SELECTION` | Cut aggregation used when harvesting (`single` recommended) |
+| | `N_INV_CLUSTERS` | Representative investments kept per instance |
+| | `N_HOUR_CLUSTERS`, `HOURS_PER_CLUSTER` | Representative hours kept per instance |
+
+> **Leakage guard:** leave `POOL_TIMES` set to the training-block hours. If left
+> as `None`, all hours (including evaluation hours) enter the draw pool and leak
+> into training.
+
+## How to run
+
+```bash
+# 1. Generate perturbed GEP instances
+python gen_GEP/create_GEP_for_training.py
+
+# 2. Solve them, harvest trajectories, build the ED dataset
+python gen_GEP/solve_for_train.py
+```
+
+This writes an ED dataset to `data/ED_data_gen/`.
+
+## Training on the harvested dataset
+
+Point `main.py` at the harvested file instead of generating one:
+
+```jsonc
+// config*.json
+"ED_args": { "use_direct_data": true },
+"direct_data_path": "data/ED_data_gen/<harvested_dataset>.pkl"
+```
+
+Then run Stage 1 as usual:
+
+```bash
+python main.py
+```
+
+`main.py` loads the harvested dataset directly and trains the primal and dual
+networks on it — all other training options and outputs are identical to
+Stage 1.
+
+
 ---
 
 ## Notes

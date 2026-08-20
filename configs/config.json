@@ -22,7 +22,7 @@
         "2n_synthetic_samples": 15,
         "synthetic_demand_capacity": false,
         "normalize_input": false,
-        "repeats": 3,
+        "repeats": 2,
         "device": "cpu",
         "gen_data_constraint": false,
         "gen_data_constraint_lb": false,
@@ -43,8 +43,8 @@
         "heuristic_lambda_unmet_safety_mass": 0.02,
         "heuristic_lambda_tier2_confidence": 0.10,
 
-        "use_direct_data": true,
-        "direct_data_path": "data/ED_data_gen/harvested_training_data_cluster_inv.pkl"
+        "use_direct_data": false,
+        "direct_data_path": "data/ED_data_gen/harvested_training_data_perturb_mix.pkl"
     },
 
     "Benders_args": {
@@ -55,7 +55,7 @@
         "scale_problem": false,
         "scale_input": false,
         "perturb_operating_costs": false,
-        "sample_duration": 2190, 
+        "sample_duration": 219, 
         "_comment_sample_duration": "Max sample duration is 8760",
         "max_investment": 100000,
         "2n_synthetic_samples": 15,
@@ -63,15 +63,15 @@
         "normalize_input": false,
         "repeats": 1,
         "device": "cpu",
-        "primal_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/Benders_ED/Classification_SLA/repeat:2", 
-        "dual_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/Benders_ED/Classification_SLA/repeat:2",
+        "primal_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/NoClassification/repeat:1", 
+        "dual_net_directory":"outputs/PDL/ED/3Nodes-FraBelGer/NoClassification/repeat:1",
         "exp_save_directory":"outputs/Benders/3Node",
-        "specific_name":"Benders_data_SLA_kmeans10",
-        "benders_setup": "Inexact_Refine",
+        "specific_name":"Exact_full",
+        "benders_setup": "Exact",
         "_Comment_benders_setup": "Benders setup options: [Exact, Inexact, Inexact_Refine, All], All is when all three are run",
         "init_investment": "Zero",
         "_Comment_init_investment": "Options for initial investment solution for Benders: Zero, HalfMax",
-        "cut_selection": "kmeans",
+        "cut_selection": "full",
         "cut_selection_k": 10,
         "bound_alpha_by_0": true,
         "_cut_selection_comment":"Options are: single, kmeans, stress, full",
@@ -99,7 +99,7 @@
     "use_primal_penalty": false,
     "use_blend_repair": false,
     "alpha": 10,
-    "outer_iterations": 10, 
+    "outer_iterations": 20, 
     "inner_iterations": 100, 
     "batch_size": 2000,
     "primal_lr": 1e-4,
@@ -119,7 +119,7 @@
     "dual_completion": true,
     "snap_lambda_dual_completion": false,
 
-    "dual_classification": true,
+    "dual_classification": false,
     "normalize_by_gt": false,
     "loss_option": "Original",
     "_Comments": "loss option: Original, Norm_GT (Normalize by ground truth obj), Norm_Obj (Normalize by obj), Duality_Gap, Log",
@@ -177,7 +177,8 @@
     "use_topology_features": false,
 
 
-    "use_heuristic_lambda_loss": true,
-    "heuristic_lambda_weight": 10.0
+    "use_heuristic_lambda_loss": false,
+    "heuristic_lambda_weight": 10.0,
+    "train_count": 26142
 
 }   

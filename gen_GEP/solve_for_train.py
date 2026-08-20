@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import json
 from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
 import sys
 sys.path.insert(
     0,
@@ -11,15 +12,17 @@ sys.path.insert(
 from gep_benders import BendersSolver
 from gep_problem_operational import GEPOperationalProblemSet
 
-DIR    = "data/GEP_for_training"
-ED_OUT = "data/ED_data_gen/harvested_training_data_cluster_inv.pkl"
+DIR    = "data/GEP_for_training_perturb_mix"
+ED_OUT = "data/ED_data_gen/harvested_training_data_perturb_mix.pkl"
 os.makedirs(os.path.dirname(ED_OUT), exist_ok=True)
 args = json.load(open("configs/config.json", "r"))
 
-SPLIT_SEED = 0   # near your other knobs at the top, for reproducibility
-N_HOUR_CLUSTERS   = 40    # representative hour-groups per instance
-HOURS_PER_CLUSTER = 2     # hours kept per cluster
-N_INV_CLUSTERS = 40       # Unique amount of Inv Clusters
+SPLIT_SEED = 42   # near your other knobs at the top, for reproducibility
+N_HOUR_CLUSTERS   = 20    # representative hour-groups per instance
+HOURS_PER_CLUSTER = 1     # hours kept per cluster
+N_INV_CLUSTERS = 30       # Unique amount of Inv Clusters
+
+CUT_SELECTION = "single"  # "single" or "full" (full = all cuts, single = one cut per iteration)
 
 def build_operational_companion(gep_data, args):
     a = copy.deepcopy(args); a["ED_args"] = copy.deepcopy(args["ED_args"])
@@ -140,10 +143,49 @@ print(len(paths), "GEP instances found for training data harvest")
 harvest = []
 for p in paths:
     print(f"\n===== solving {os.path.basename(p)} =====")
-    h = solve_and_harvest(p, args, "single", 1)
+    h = solve_and_harvest(p, args, CUT_SELECTION, 1)
     harvest.append(h)
     print(f"  iters={h['iterations']}  traj_pts={h['n_traj_points']}  "
           f"gap={h['gap_rel']:.2e}  wall={h['wall_sec']:.1f}s")
+
+
+
+import matplotlib.pyplot as plt
+
+G_names = ["BEL_WindOff","BEL_Gas","GER_Gas","GER_SunPV","FRA_Nuclear","FRA_SunPV"]
+renew_idx = [0, 3, 5]   # WindOff, GER_SunPV, FRA_SunPV
+
+# every unique investment across ALL trajectories, NO clustering
+raw_inv = np.vstack([np.unique(h["trajectory"], axis=0) for h in harvest])
+# what clustering would keep, for comparison
+clust_inv = np.vstack([cluster_investments(h["trajectory"], N_INV_CLUSTERS) for h in harvest])
+# the deployment optima you're trying to cover
+opt_inv = np.vstack([h["u_opt"] for h in harvest])
+
+print(f"raw unique investments:      {raw_inv.shape[0]:,}")
+print(f"after clustering (kept):     {clust_inv.shape[0]:,}")
+
+fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+for j, ax in enumerate(axes.ravel()):
+    c = "#009E73" if j in renew_idx else "#0072B2"
+    ax.hist(raw_inv[:, j],   bins=50, alpha=0.5, color=c,        density=True, label="raw (all traj)")
+    ax.hist(clust_inv[:, j], bins=50, alpha=0.5, color="#D55E00", density=True, label="after clustering")
+    # mark where deployment optima live
+    for uo in opt_inv[:, j]:
+        ax.axvline(uo, color="black", alpha=0.15, lw=0.5)
+    ax.set_title(G_names[j] + (" (RENEWABLE)" if j in renew_idx else ""))
+    ax.set_xlabel("investment units"); ax.grid(alpha=0.3)
+    if j == 0: ax.legend(fontsize=8)
+plt.tight_layout(); plt.show()
+
+# the decisive numbers, per renewable
+print("\n--- renewable investment coverage ---")
+for j in renew_idx:
+    opt_max = opt_inv[:, j].max()
+    print(f"{G_names[j]:<12}: raw max {raw_inv[:,j].max():7.0f} | "
+          f"opt max {opt_max:7.0f} | "
+          f"raw frac > {0.5*opt_max:.0f}: {np.mean(raw_inv[:,j] > 0.5*opt_max):.1%} | "
+          f"clustered frac > {0.5*opt_max:.0f}: {np.mean(clust_inv[:,j] > 0.5*opt_max):.1%}")
 
 
 
