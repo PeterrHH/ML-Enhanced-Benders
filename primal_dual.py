@@ -391,58 +391,8 @@ class PrimalDualTrainer():
 
         self.duality_gap_list =[]
 
-        # Fit the scalers:
-        if args.get("normalize") == "z_score":
-            with torch.no_grad():
-                Xtr = self.X_train
 
-            n = self.data.num_n
-            g = self.data.num_g
 
-            d = Xtr[:, :n]
-            p = Xtr[:, n:n + g]
-            cover = Xtr[:, n + g:n + g + n]
-            export = Xtr[:, n + g + n:n + g + 2 * n]
-
-            d_mean = d.mean(dim=0)
-            d_std  = d.std(dim=0).clamp_min(1e-8)
-
-            p_mean = p.mean(dim=0)
-            p_std  = p.std(dim=0).clamp_min(1e-8)
-
-            self.primal_net.d_mean.copy_(d_mean)
-            self.primal_net.d_std.copy_(d_std)
-            self.primal_net.p_mean.copy_(p_mean)
-            self.primal_net.p_std.copy_(p_std)
-
-            self.dual_net.d_mean.copy_(d_mean)
-            self.dual_net.d_std.copy_(d_std)
-            self.dual_net.p_mean.copy_(p_mean)
-            self.dual_net.p_std.copy_(p_std)
-
-            if cover.shape[1] == n:
-                cover_mean = cover.mean(dim=0)
-                cover_std  = cover.std(dim=0).clamp_min(1e-8)
-
-                if hasattr(self.dual_net, "cover_mean"):
-                    self.dual_net.cover_mean.copy_(cover_mean)
-                    self.dual_net.cover_std.copy_(cover_std)
-
-            if export.shape[1] == n:
-                export_mean = export.mean(dim=0)
-                export_std  = export.std(dim=0).clamp_min(1e-8)
-
-                if hasattr(self.dual_net, "export_mean"):
-                    self.dual_net.export_mean.copy_(export_mean)
-                    self.dual_net.export_std.copy_(export_std)
-
-            print("Computed and set normalization stats.")
-            print(f"D mean: {d_mean}, D std: {d_std}")
-            print(f"P mean: {p_mean}, P std: {p_std}")
-            if cover.shape[1] == n:
-                print(f"Cover mean: {cover_mean}, Cover std: {cover_std}")
-            if export.shape[1] == n:
-                print(f"Export mean: {export_mean}, Export std: {export_std}")
 
     def build_topology_features(self, X):
         """

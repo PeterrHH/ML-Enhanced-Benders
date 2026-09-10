@@ -155,6 +155,22 @@ def make_stress_bin_groups(data, sample, K):
     return groups, labels, stress
 
 
+def make_kmeans_dual_groups(dual_vals, K, random_state=0):
+    """
+    Adaptive grouping: cluster timesteps by their current subproblem dual vectors.
+    Used by cut_selection="kmeans_dynamic" (recomputed every Benders iteration).
+    Returns a list of timestep-index groups.
+    """
+    duals = np.asarray(dual_vals)
+    T = duals.shape[0]
+    K_eff = min(K, T)
+    if K_eff <= 1:
+        return [list(range(T))]
+    Xs = (duals - duals.mean(0)) / (duals.std(0) + 1e-8)
+    labels = KMeans(n_clusters=K_eff, n_init=10, random_state=random_state).fit_predict(Xs)
+    return [np.where(labels == k)[0].tolist() for k in range(K_eff) if (labels == k).any()]
+
+
 def make_cut_groups(data, sample, cut_selection="single", cut_selection_k=1, random_state=0):
     """
     Create timestep groups for cut aggregation.
@@ -182,7 +198,7 @@ def make_cut_groups(data, sample, cut_selection="single", cut_selection_k=1, ran
             "group_sizes": [len(g) for g in groups],
         }
 
-    elif cut_selection == "kmeans":
+    elif cut_selection in ("kmeans", "kmeans_dynamic"):
         groups, labels, X = make_kmeans_capacity_demand_groups(
             data=data,
             sample=sample,
@@ -249,6 +265,16 @@ class BendersSolver():
         self.master_alpha = None      # MVar of alpha vars
         self.master_num_alpha = None
         self._num_cuts_in_master = 0  # how many cuts already added
+
+        # --- surrogate duality-gap tracking (inexact iters only) ---
+        self.gap_abs_mean_hist   = []
+        self.gap_abs_median_hist = []
+        self.gap_rel_mean_hist   = []
+        self.gap_rel_median_hist = []
+        self.gap_abs_total_hist  = []   # == UB-LB bracket at this investment
+        self.gap_neg_count_hist  = []   # feasibility audit: should be 0
+        self.gap_t_hist          = []   # per-timestep arrays, one per iter (for distributions)
+        self._last_gap_stats     = None
 
         self.wall_iter_hist = []
         self.wall_master_hist = []
@@ -489,26 +515,42 @@ class BendersSolver():
         #! Negate duals, for some reason these are flipped in Gurobi.
         dual_sol = torch.concat([-mu, -lamb], dim=1).squeeze()
 
+        # per-timestep gap; note mu,lamb already scaled by pWeight above
+        primal_t = self.operational_data.obj_fn(X, primal_sol).detach().cpu().numpy().reshape(-1) * self.pWeight
+        dual_t   = self.operational_data.dual_obj_fn(X, mu, lamb).detach().cpu().numpy().reshape(-1)
+        self._last_gap_stats = self._compute_gap_stats(primal_t, dual_t)
+
         return primal_obj_val, dual_obj_val, primal_sol.detach().numpy(), dual_sol.detach().numpy(), inference_time
+
+    @staticmethod
+    def _compute_gap_stats(primal_t, dual_t, eps=1e-9):
+        primal_t = np.asarray(primal_t, float).reshape(-1)
+        dual_t   = np.asarray(dual_t,   float).reshape(-1)
+        gap_t = primal_t - dual_t
+        rel_t = gap_t / np.clip(np.abs(primal_t), eps, None)
+        return {
+            "gap_abs_mean":   float(np.mean(gap_t)),
+            "gap_abs_median": float(np.median(gap_t)),
+            "gap_rel_mean":   float(np.mean(rel_t)),
+            "gap_rel_median": float(np.median(rel_t)),
+            "gap_abs_total":  float(np.sum(gap_t)),
+            "n_negative_gap": int((gap_t < -1e-6).sum()),
+            "gap_t": gap_t,
+        }
     
     def _ensure_master_model(self, data, sample):
         """Build the master Gurobi model once. Cheap to call repeatedly."""
         if self.master_model is not None:
             return
 
-        # Determine number of alphas
+        # Determine number of recourse variables.
+        # "single" uses one aggregate recourse var; all grouped modes (kmeans,
+        # kmeans_dynamic, full, stress) use one theta per timestep. Per-timestep
+        # recourse keeps grouped cuts valid across regroupings without rebuilding.
         if self.cut_selection == "single":
             num_alpha = 1
         else:
-            if self.cut_groups is None:
-                self.cut_groups, self.cut_group_info = make_cut_groups(
-                    data=data, sample=sample,
-                    cut_selection=self.cut_selection,
-                    cut_selection_k=self.cut_selection_k,
-                )
-                print(f"Cut selection: {self.cut_selection}, groups={len(self.cut_groups)}")
-                print("Group sizes:", self.cut_group_info["group_sizes"])
-            num_alpha = len(self.cut_groups)
+            num_alpha = len(data.time_ranges[sample])
 
         self.master_num_alpha = num_alpha
 
@@ -840,7 +882,9 @@ class BendersSolver():
 
         benders_cut_lhs = np.zeros((1, G + num_alpha))
         benders_cut_rhs = 0.0
-        benders_cut_lhs[0, G + alpha_index] = -1.0
+        # Per-timestep recourse (theta_t): place -1 on every timestep in this group,
+        # so the cut constrains sum_{t in group} theta_t. alpha_index is unused now.
+        benders_cut_lhs[0, G + np.asarray(timestep_indices, dtype=int)] = -1.0
 
         # --- LHS: vectorized gather ---
         g_arr = np.arange(G)
@@ -890,7 +934,13 @@ class BendersSolver():
             )
             return [cut]
 
-        if self.cut_groups is None:
+        # Grouping policy:
+        #   kmeans_dynamic -> recluster on the current subproblem duals EVERY iteration
+        #   everything else -> cluster once (cached in self.cut_groups)
+        if self.cut_selection == "kmeans_dynamic":
+            self.cut_groups = make_kmeans_dual_groups(
+                np.asarray(dual_vals), self.cut_selection_k)
+        elif self.cut_groups is None:
             self.cut_groups, self.cut_group_info = make_cut_groups(
                 data=data, sample=sample,
                 cut_selection=self.cut_selection,
@@ -899,7 +949,9 @@ class BendersSolver():
             print(f"Cut selection: {self.cut_selection}, groups={len(self.cut_groups)}")
             print("Group sizes:", self.cut_group_info["group_sizes"])
 
-        num_alpha = len(self.cut_groups)
+        # Per-timestep recourse: one theta_t per timestep, stable across regroupings,
+        # so previously added grouped cuts remain valid even when groups change.
+        num_alpha = len(data.time_ranges[sample])
 
         cuts = []
         for k, group in enumerate(self.cut_groups):
@@ -1253,6 +1305,7 @@ class BendersSolver():
         optimal = False
         i = 0
         while not optimal and i < 1000:
+            self._last_gap_stats = None
             t_iter_start = time.time()
             print("-"*50)
             print("Iteration", i, "Exact:", self.exact)
@@ -1350,7 +1403,25 @@ class BendersSolver():
             self.iter_hist.append(int(i))
             self.exact_flag_hist.append(bool(self.exact))
             self.sub_time_hist.append(float(inference_time_subproblems_total))
-            # master time only exists when i>0 in your code
+
+            gs = self._last_gap_stats
+            if gs is not None and not self.exact:
+                self.gap_abs_mean_hist.append(gs["gap_abs_mean"])
+                self.gap_abs_median_hist.append(gs["gap_abs_median"])
+                self.gap_rel_mean_hist.append(gs["gap_rel_mean"])
+                self.gap_rel_median_hist.append(gs["gap_rel_median"])
+                self.gap_abs_total_hist.append(gs["gap_abs_total"])
+                self.gap_neg_count_hist.append(gs["n_negative_gap"])
+                self.gap_t_hist.append(gs["gap_t"])
+            else:  # exact iter: gap between predictions is undefined
+                for h in (self.gap_abs_mean_hist, self.gap_abs_median_hist,
+                          self.gap_rel_mean_hist, self.gap_rel_median_hist,
+                          self.gap_abs_total_hist):
+                    h.append(np.nan)
+                self.gap_neg_count_hist.append(0)
+                self.gap_t_hist.append(None)
+
+            # master time only exists when i>0 
             if i == 0:
                 self.master_time_hist.append(0.0)
             else:
@@ -1756,6 +1827,12 @@ if __name__ == "__main__":
                                 "t_master": solver.master_time_hist,
                                 "t_sub": solver.sub_time_hist,
                                 "t_iter_wall":    solver.wall_iter_hist,     # wall-clock per iter
+                                "gap_abs_mean":   solver.gap_abs_mean_hist,
+                                "gap_abs_median": solver.gap_abs_median_hist,
+                                "gap_rel_mean":   solver.gap_rel_mean_hist,
+                                "gap_rel_median": solver.gap_rel_median_hist,
+                                "gap_abs_total":  solver.gap_abs_total_hist,
+                                "gap_neg_count":  solver.gap_neg_count_hist,
                             })
                             crossover_metrics = BendersSolver.get_crossover_metrics(iter_df)
                             iter_df["investment"] = [json.dumps(v) for v in solver.inv_hist]
@@ -1864,8 +1941,4 @@ if __name__ == "__main__":
                 # plt.savefig("experiment-output/ch7/3nodes/benders_test_data_exact.pdf", dpi=300, bbox_inches='tight')
                 # plt.show()
 
-
-'''
-PseudoCode
-'''
 

@@ -84,7 +84,7 @@ class DualNet(nn.Module):
 
         self.net = nn.Sequential(*layers)
 
-        self.normalize = args.get("normalize", None)
+        self.normalize = args.get("normalize_input", None)
         if self.normalize == "z_score":
             N = data.num_n
             G = data.num_g
@@ -440,7 +440,7 @@ class PrimalNetEndToEnd(nn.Module):
         if self.args["repair_completion"]:
             self.estimate_slack_layer = EstimateSlackLayer(data.node_to_gen_mask.to(self.DTYPE).to(self.DEVICE), data.lineflow_mask.to(self.DTYPE).to(self.DEVICE))
     
-        self.normalize = args.get("normalize", None)
+        self.normalize = args.get("normalize_input", None)
         if self.normalize == "z_score":
             N = data.num_n
             G = data.num_g
@@ -711,7 +711,7 @@ class DualNetEndToEnd(nn.Module):
             self.DTYPE = torch.float64
             self.DEVICE = torch.device("cpu")
 
-        self.normalize = args.get("normalize", None)
+        self.normalize = args.get("normalize_input", None)
         if self.normalize == "z_score":
             N = data.num_n
             G = data.num_g
@@ -768,35 +768,13 @@ class DualNetEndToEnd(nn.Module):
         return snapped_lamb, class_idx
     
     def scale(self, x):
-        if self.normalize == "z_score":
-            n = self.data.num_n
-            g = self.data.num_g
-
-            d = x[:, :n]
-            p = x[:, n:n + g]
-
-            # topology features, if present
-            cover = x[:, n + g:n + g + n]
-            export = x[:, n + g + n:n + g + 2 * n]
-
-            d = (d - self.d_mean) / self.d_std
-            p = (p - self.p_mean) / self.p_std
-
-            parts = [d, p]
-
-            if cover.shape[1] > 0:
-                cover = (cover - self.cover_mean) / self.cover_std
-                parts.append(cover)
-
-            if export.shape[1] > 0:
-                export = (export - self.export_mean) / self.export_std
-                parts.append(export)
-
-            x_scale = torch.cat(parts, dim=1)
-        else:
-            x_scale = x
-
-        return x_scale
+        if self.normalize == "per_instance_demand":
+            n, g = self.data.num_n, self.data.num_g
+            S = x[:, :n].sum(dim=1, keepdim=True).clamp_min(1e-8)   # per-instance total demand
+            dp   = x[:, :n + g] / S        # scale demand + capacity by shared S (margin preserved)
+            rest = x[:, n + g:]            # leave any later features (topo/surplus) untouched
+            return torch.cat([dp, rest], dim=1)
+        return x
     
     def complete_duals(self, lamb):
         
@@ -1018,35 +996,12 @@ class DualClassificationNetEndToEnd(nn.Module):
         self.tau = float(args.get("gumbel_tau_init", 1.0))
             
     def scale(self, x):
-        if self.normalize == "z_score":
-            n = self.data.num_n
-            g = self.data.num_g
+        n, g = self.data.num_n, self.data.num_g
+        S = x[:, :n].sum(dim=1, keepdim=True).clamp_min(1e-8)   # per-instance total demand
+        dp   = x[:, :n + g] / S        # scale demand + capacity by shared S (margin preserved)
+        rest = x[:, n + g:]            # leave any later features (topo/surplus) untouched
+        return torch.cat([dp, rest], dim=1)
 
-            d = x[:, :n]
-            p = x[:, n:n + g]
-
-            # topology features, if present
-            cover = x[:, n + g:n + g + n]
-            export = x[:, n + g + n:n + g + 2 * n]
-
-            d = (d - self.d_mean) / self.d_std
-            p = (p - self.p_mean) / self.p_std
-
-            parts = [d, p]
-
-            if cover.shape[1] > 0:
-                cover = (cover - self.cover_mean) / self.cover_std
-                parts.append(cover)
-
-            if export.shape[1] > 0:
-                export = (export - self.export_mean) / self.export_std
-                parts.append(export)
-
-            x_scale = torch.cat(parts, dim=1)
-        else:
-            x_scale = x
-
-        return x_scale
     
     def complete_duals(self, lamb):
         eq_cm_D_nt = self.data.eq_cm
