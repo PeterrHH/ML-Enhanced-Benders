@@ -1,6 +1,6 @@
 """Time the inference pipeline of a trained run on a Modal GPU: eager, CUDA graph, torch.compile, both (F30, F31).
 
-    FLOWFIRST_GPU=A100 .venv/bin/modal run --detach flowfirst/modal_bench.py --run-dir <run directory on the runs volume>
+    FLOWFIRST_GPU=A100 .venv/bin/modal run --detach flowfirst/modal/bench.py --run-dir <run directory on the runs volume>
 
 For every precision in `--precisions` (see PRECISIONS; default float64 and the network cast to float32 and to
 float16 with everything else in float64) and batches 1024 and 8192 it prints the ms per instance of `PrimalDual`
@@ -11,7 +11,7 @@ labels, evaluated in float64; and the ratio of the best time to the roofline flo
 Gurobi's marks. `--stages` adds the per-stage table of F29. `benchmark` also runs locally (no graph, no compile,
 no TF32 without CUDA):
 
-    .venv/bin/python -c "from flowfirst.modal_bench import benchmark; benchmark('flowfirst/runs/<run>', 'cpu', sizes=(128,))"
+    .venv/bin/python -c "from flowfirst.modal.bench import benchmark; benchmark('flowfirst/runs/<run>', 'cpu', sizes=(128,))"
 """
 import os
 import sys
@@ -23,10 +23,10 @@ from pathlib import Path
 import modal
 
 # the package must be importable from wherever Modal loads this file: the checkout locally, /repo in the container
-for root in (Path(__file__).resolve().parent.parent, Path("/repo")):
+for root in (Path(__file__).resolve().parent.parent.parent, Path("/repo")):
     if (root / "flowfirst" / "__init__.py").exists() and str(root) not in sys.path:
         sys.path.insert(0, str(root))
-from flowfirst.modal_train import datasets, image, runs  # noqa: E402
+from flowfirst.modal.train import datasets, image, runs  # noqa: E402
 
 app = modal.App("flowfirst-bench")
 

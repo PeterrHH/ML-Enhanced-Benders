@@ -1,4 +1,4 @@
 # Full instance (20 nodes, 107 generators, 44 lines, diameter 5): can the GNN fit at all?
 # Overfit test on 2048 training instances (16 steps/epoch), GNN hidden 128 / 6 rounds / pre-LayerNorm, EMA, fixed rate,
 # on the GPU in float32. Validation and training-set fit on 4096 instances every 10 epochs. ~3 s/epoch -> 1000 epochs ~ 50 min.
---variant flowfirst-gnn --config flowfirst/config-20node-x8.json --device mps --gnn-hidden 128 --gnn-rounds 6 --gnn-layernorm --train-size 2048 --valid-size 4096 --batch-size 128 --epochs 1000 --eval-every 10 --log-every 50 --census-size 512 --ema 0.999 --tag 20node-overfit-2048-gnn128r6ln
+--variant flowfirst-gnn --config flowfirst/configs/config-20node-x8.json --device mps --gnn-hidden 128 --gnn-rounds 6 --gnn-layernorm --train-size 2048 --valid-size 4096 --batch-size 128 --epochs 1000 --eval-every 10 --log-every 50 --census-size 512 --ema 0.999 --tag 20node-overfit-2048-gnn128r6ln

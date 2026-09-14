@@ -1,0 +1,4 @@
+# flow-first, full training set, batch 128, three layers, 1000 epochs:
+# fixed learning rate versus a conservative plateau rule (halve after 50 epochs without validation improvement)
+--variant flowfirst --config flowfirst/configs/config-3node-3gen.json --input-scale zscore --layers 3 --batch-size 128 --epochs 1000 --eval-every 5 --log-every 50 --tag 3gen-b128-l3-e1000
+--variant flowfirst --config flowfirst/configs/config-3node-3gen.json --input-scale zscore --layers 3 --batch-size 128 --epochs 1000 --eval-every 5 --log-every 50 --lr-schedule plateau --lr-decay 0.5 --lr-patience 50 --tag 3gen-b128-l3-e1000-plateau

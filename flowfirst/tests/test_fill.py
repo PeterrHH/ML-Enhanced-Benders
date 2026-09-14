@@ -7,11 +7,11 @@ import os
 import pytest
 import torch
 
-from flowfirst.dataset import PKG_DIR, dataset_path, load_or_create
+from flowfirst.dataset import CONFIG_DIR, dataset_path, load_or_create
 from flowfirst.fill import MeritOrderFill
 
 torch.set_default_dtype(torch.float64)
-CONFIGS = [str(PKG_DIR / "config-3node.json"), str(PKG_DIR / "config-3node-3gen.json")]
+CONFIGS = [str(CONFIG_DIR / "config-3node.json"), str(CONFIG_DIR / "config-3node-3gen.json")]
 
 
 @pytest.fixture(scope="module", params=CONFIGS, ids=["2gen", "3gen"])

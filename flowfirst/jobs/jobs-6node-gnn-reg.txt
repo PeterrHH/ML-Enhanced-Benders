@@ -2,4 +2,4 @@
 # the quadratic flow regularizer (eps 0.3, below the 0.54 bound of F25) and weight averaging (EMA 0.999).
 # Compare with run flowfirst-gnn-6node-x8-b128-gnn96r4-step-clip: the val/ metrics isolate the regularizer,
 # the ema/ metrics add the averaging on top. ~2 h alone.
---variant flowfirst-gnn --config flowfirst/config-6node-x8.json --gnn-hidden 96 --gnn-rounds 4 --batch-size 128 --epochs 250 --eval-every 1 --log-every 10 --lr-schedule step --lr-decay 0.7 --lr-step 50 --clip-grad 8000 --flow-reg 0.3 --ema 0.999 --tag 6node-x8-b128-gnn96r4-step-clip-reg-ema
+--variant flowfirst-gnn --config flowfirst/configs/config-6node-x8.json --gnn-hidden 96 --gnn-rounds 4 --batch-size 128 --epochs 250 --eval-every 1 --log-every 10 --lr-schedule step --lr-decay 0.7 --lr-step 50 --clip-grad 8000 --flow-reg 0.3 --ema 0.999 --tag 6node-x8-b128-gnn96r4-step-clip-reg-ema

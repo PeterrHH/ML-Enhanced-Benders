@@ -27,7 +27,8 @@ from gep_config_parser import parse_config
 PKG_DIR = Path(__file__).resolve().parent
 REPO_ROOT = PKG_DIR.parent
 TOML_PATH = str(REPO_ROOT / "configs" / "config.toml")
-DEFAULT_CONFIG = str(PKG_DIR / "config-3node.json")
+CONFIG_DIR = PKG_DIR / "configs"
+DEFAULT_CONFIG = str(CONFIG_DIR / "config-3node.json")
 
 
 def dataset_path(args):
@@ -47,9 +48,20 @@ def apply_cost_overrides(inputs, overrides):
     return {**inputs, "generation_data": gen}
 
 
+def resolve_config(args_path):
+    """Find a config by name under `CONFIG_DIR` when its recorded path does not exist.
+
+    Run directories from before the configs moved into their own folder store
+    a path next to the package, sometimes absolute, so `load_run` would fail
+    on every saved run without this.
+    """
+    path = Path(args_path)
+    return path if path.exists() else CONFIG_DIR / path.name
+
+
 def load_or_create(args_path=DEFAULT_CONFIG, seed=0):
     """Return (data, args). Builds and pickles the dataset on first use."""
-    with open(args_path) as f:
+    with open(resolve_config(args_path)) as f:
         args = json.load(f)
     path = dataset_path(args)
     if not os.path.exists(path):

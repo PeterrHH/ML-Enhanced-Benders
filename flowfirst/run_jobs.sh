@@ -4,7 +4,7 @@
 # Lines that are empty or start with # are skipped. Console output is
 # prefixed with the job's --tag (or its line number); the clean per-run log
 # is flowfirst/runs/<variant>[-tag]/train.log.
-#     flowfirst/run_jobs.sh flowfirst/jobs-long.txt
+#     flowfirst/run_jobs.sh flowfirst/jobs/jobs-long.txt
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-3}"

@@ -10,9 +10,9 @@ Create the two volumes (once), then upload a dataset (once per dataset; the 20-n
     .venv/bin/modal volume put flowfirst-datasets flowfirst/datasets/flowfirst-20node-allgen_smp18.pkl /flowfirst-20node-allgen_smp18.pkl
 
 Run a jobs file, one GPU container per job, all concurrently (same format as run_jobs.sh):
-    FLOWFIRST_GPU=A100 .venv/bin/modal run --detach flowfirst/modal_train.py --jobs flowfirst/jobs-20node-modal.txt
+    FLOWFIRST_GPU=A100 .venv/bin/modal run --detach flowfirst/modal/train.py --jobs flowfirst/jobs/jobs-20node-modal.txt
 or a single job:
-    FLOWFIRST_GPU=A100 .venv/bin/modal run --detach flowfirst/modal_train.py --args "--variant flowfirst-gnn --config flowfirst/config-20node-x8.json --epochs 2 --train-size 2048 --valid-size 1024 --tag smoke"
+    FLOWFIRST_GPU=A100 .venv/bin/modal run --detach flowfirst/modal/train.py --args "--variant flowfirst-gnn --config flowfirst/configs/config-20node-x8.json --epochs 2 --train-size 2048 --valid-size 1024 --tag smoke"
 
 Fetch the run directories (also possible during a run: the volume is committed every 5 minutes):
     .venv/bin/modal volume get flowfirst-runs / flowfirst/runs/
@@ -31,7 +31,7 @@ from pathlib import Path
 
 import modal
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parent.parent.parent
 # Peter's modules that flowfirst.dataset / flowfirst.train import (needed to unpickle the dataset and to build the nets)
 ROOT_MODULES = ["networks.py", "gep_problem_operational.py", "gep_problem.py", "gep_config_parser.py",
                 "create_gep_dataset.py", "data_wrangling.py"]

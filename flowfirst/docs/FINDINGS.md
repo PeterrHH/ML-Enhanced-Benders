@@ -1081,7 +1081,7 @@ speed claim needs a subproblem where the solver's cost grows.
 The fallback of IDEAS I10 is no longer needed for the primal at this size:
 every instance is optimal, and the certificate reports it.
 
-**On the GPU** (A100 via Modal, `modal_bench.py`, ms per instance, median of
+**On the GPU** (A100 via Modal, `modal/bench.py`, ms per instance, median of
 5, same model and instances; CPU column is the M2 Pro at batch 8192):
 
 | stage | batch 128 | 1024 | 8192 | CPU, 8192 |
@@ -1105,8 +1105,8 @@ Vectorizing that loop and capturing the iteration as a CUDA graph are the
 levers; a five-fold cut would put the exact pipeline at about 0.03 ms.
 
 **Source.** `flowfirst/dual.py` (`PathPolish`, `PrimalDual(exact=True)`),
-`flowfirst/dual_analysis.py` section F29, `flowfirst/modal_bench.py`,
-tests in `flowfirst/test_dual.py`.
+`flowfirst/dual_analysis.py` section F29, `flowfirst/modal/bench.py`,
+tests in `flowfirst/tests/test_dual.py`.
 
 ## F30 (major, confirmed): the deployed pipeline is one CUDA graph at 0.0101 ms per instance; what is left is the network's float64 arithmetic
 
@@ -1186,7 +1186,7 @@ same LP (F29): 0.16 ms per hour on one core from a persistent model, about
 0.02 on eight cores, 0.05 with the optimal basis set after a reset.
 
 **Evidence, A100** (SXM4 80 GB via Modal, torch 2.5.1+cu124, TF32 off,
-`modal_bench.py`, 2026-09-09; ms per instance, median of 5; same model and
+`modal/bench.py`, 2026-09-09; ms per instance, median of 5; same model and
 validation instances as F26 to F29):
 
 | pipeline | float64, 1024 | float64, 8192 | float32, 1024 | float32, 8192 |
@@ -1253,7 +1253,7 @@ levers named above.
 
 **Source.** `flowfirst/dual.py` (`GraphedPrimalDual`,
 `DualRecovery.regions`, `DualRecovery.node_ascent`, `load_run(dtype=)`),
-`flowfirst/test_dual.py`, `flowfirst/modal_bench.py` (`benchmark`,
+`flowfirst/tests/test_dual.py`, `flowfirst/modal/bench.py` (`benchmark`,
 `--stages` for the F29 table); A100 log of 2026-09-09, Modal app
 ap-HQk3gsVkycqKQ7qPrpxkyN.
 
@@ -1289,7 +1289,7 @@ datasets and the 20-node validation set matches the pre-F30 code in every
 field. On the way `line_bounds` was found to return int64 on the 3-node
 datasets (integer line limits); it now returns the default dtype.
 
-CPU smoke run of `modal_bench.py` on 128 validation instances of the
+CPU smoke run of `modal/bench.py` on 128 validation instances of the
 20-node model, scored in float64 (no TF32 or graphs on the CPU, so these
 rows only show what precision does to the outputs):
 
@@ -1301,7 +1301,7 @@ rows only show what precision does to the outputs):
 | net-fp16: network float16, rest float64 | 0.050 % | 0.004 % | 0.992 / 0.898 | 0.313 % | 2e-15 | 2e-15 | 2e-11 MW |
 | net-bf16: network bfloat16, rest float64 | 0.049 % | 0.003 % | 0.992 / 0.883 | 0.288 % | 2e-15 | 2e-15 | 3e-11 MW |
 
-**Evidence, A100** (SXM4 80 GB via Modal, torch 2.5.1+cu124, `modal_bench.py
+**Evidence, A100** (SXM4 80 GB via Modal, torch 2.5.1+cu124, `modal/bench.py
 --precisions float64,tf32,net-fp32,net-fp16,net-bf16`, 2026-09-09; ms per
 instance, median of 5; same model and validation instances as F26 to F30).
 `tf32` is everything in float32 with TF32 products; `net-*` is the network
@@ -1379,7 +1379,7 @@ per batch, a year of hours in 82 ms).
 
 **Source.** `flowfirst/dual.py` (`cast_net`, `cast_data`),
 `flowfirst/train.py` (`FlowFirstGNN.forward` dtype boundary, `line_bounds`),
-`flowfirst/test_dual.py`, `flowfirst/modal_bench.py` (`PRECISIONS`,
+`flowfirst/tests/test_dual.py`, `flowfirst/modal/bench.py` (`PRECISIONS`,
 `accuracy`); A100 log of 2026-09-09, Modal app ap-LZMBBJBJB5J1FtUIqsq7Ne.
 
 

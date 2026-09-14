@@ -2,4 +2,4 @@
 # GNN hidden 128 / 6 rounds / pre-LayerNorm (886k params), GPU float32, full 210k training set (1638 steps/epoch, ~125 ms/step),
 # 100 epochs = 164k steps (~5.7 h), step decay x0.7 every 20 epochs, EMA 0.999, clip 180000 (90th percentile of the early
 # batch gradient norm: median 114k, 90th 186k, max 333k). Validation on 8192 instances every 2 epochs (~7 min in total).
---variant flowfirst-gnn --config flowfirst/config-20node-x8.json --device mps --gnn-hidden 128 --gnn-rounds 6 --gnn-layernorm --batch-size 128 --epochs 100 --valid-size 8192 --eval-every 2 --log-every 5 --census-size 1024 --lr-schedule step --lr-decay 0.7 --lr-step 20 --clip-grad 180000 --ema 0.999 --tag 20node-x8-b128-gnn128r6ln-step-clip-ema
+--variant flowfirst-gnn --config flowfirst/configs/config-20node-x8.json --device mps --gnn-hidden 128 --gnn-rounds 6 --gnn-layernorm --batch-size 128 --epochs 100 --valid-size 8192 --eval-every 2 --log-every 5 --census-size 1024 --lr-schedule step --lr-decay 0.7 --lr-step 20 --clip-grad 180000 --ema 0.999 --tag 20node-x8-b128-gnn128r6ln-step-clip-ema

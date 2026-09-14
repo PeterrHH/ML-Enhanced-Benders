@@ -1,7 +1,0 @@
-# 6 nodes, flow-first only: depth sweep at width 504, 500 epochs (the 250-epoch 3-layer run was still improving).
-# 3 layers is the control for "more steps alone". Roughly 70 / 85 / 100 min per job alone; longer when run together.
---variant flowfirst --config flowfirst/config-6node-x8.json --input-scale zscore --layers 3 --hidden-factor 14 --batch-size 128 --epochs 500 --eval-every 1 --log-every 25 --tag 6node-x8-b128-l3-w504-e500
---variant flowfirst --config flowfirst/config-6node-x8.json --input-scale zscore --layers 4 --hidden-factor 14 --batch-size 128 --epochs 500 --eval-every 1 --log-every 25 --tag 6node-x8-b128-l4-w504-e500
---variant flowfirst --config flowfirst/config-6node-x8.json --input-scale zscore --layers 5 --hidden-factor 14 --batch-size 128 --epochs 500 --eval-every 1 --log-every 25 --tag 6node-x8-b128-l5-w504-e500
-# width instead of depth (2.1M params, about 2.5 h alone); uncomment to include:
-# --variant flowfirst --config flowfirst/config-6node-x8.json --input-scale zscore --layers 3 --hidden-factor 28 --batch-size 128 --epochs 500 --eval-every 1 --log-every 25 --tag 6node-x8-b128-l3-w1008-e500

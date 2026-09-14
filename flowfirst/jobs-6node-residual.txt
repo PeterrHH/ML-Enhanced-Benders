@@ -1,7 +1,0 @@
-# 6 nodes, flow-first with the residual body (skip connections), so that depth is trainable.
-# Width 9 x 36 = 324 keeps the 6-layer net at ~650k parameters, close to the plain 3 x 504 (532k); 10 layers ~1.1M.
-# Roughly 3 h and 4.5 h for 500 epochs when run alone (12.5 and 19.5 ms per step).
---variant flowfirst --config flowfirst/config-6node-x8.json --input-scale zscore --body residual --layers 6 --hidden-factor 9 --batch-size 128 --epochs 500 --eval-every 1 --log-every 25 --tag 6node-x8-b128-res6-w324-e500
---variant flowfirst --config flowfirst/config-6node-x8.json --input-scale zscore --body residual --layers 10 --hidden-factor 9 --batch-size 128 --epochs 500 --eval-every 1 --log-every 25 --tag 6node-x8-b128-res10-w324-e500
-# direct test of the sigmoid-trap diagnosis (F21): the plain 5-layer body again, but with the output layer initialized near zero
---variant flowfirst --config flowfirst/config-6node-x8.json --input-scale zscore --layers 5 --hidden-factor 14 --small-output-init --batch-size 128 --epochs 500 --eval-every 1 --log-every 25 --tag 6node-x8-b128-l5-w504-e500-smallinit

@@ -1,0 +1,9 @@
+# 6 nodes, flow-first GNN hidden 96 / 4 rounds (346k params) on the full 210k training set, 250 epochs (410k steps), ~1.8 h each alone.
+# Three lines isolate the oscillation remedies: fixed rate (control); step decay x0.7 every 50 epochs; step decay plus
+# gradient-norm clipping at 8000 (the trained GNN's batch gradient norm has median 5400, 90th percentile 9000, max 19000,
+# so 8000 only touches the spiky ~10 % of batches).
+--variant flowfirst-gnn --config flowfirst/configs/config-6node-x8.json --gnn-hidden 96 --gnn-rounds 4 --batch-size 128 --epochs 250 --eval-every 1 --log-every 10 --tag 6node-x8-b128-gnn96r4-fixed
+--variant flowfirst-gnn --config flowfirst/configs/config-6node-x8.json --gnn-hidden 96 --gnn-rounds 4 --batch-size 128 --epochs 250 --eval-every 1 --log-every 10 --lr-schedule step --lr-decay 0.7 --lr-step 50 --tag 6node-x8-b128-gnn96r4-step
+--variant flowfirst-gnn --config flowfirst/configs/config-6node-x8.json --gnn-hidden 96 --gnn-rounds 4 --batch-size 128 --epochs 250 --eval-every 1 --log-every 10 --lr-schedule step --lr-decay 0.7 --lr-step 50 --clip-grad 8000 --tag 6node-x8-b128-gnn96r4-step-clip
+# the cheaper 3-round network, same treatment, if wanted:
+# --variant flowfirst-gnn --config flowfirst/configs/config-6node-x8.json --gnn-hidden 80 --gnn-rounds 3 --batch-size 128 --epochs 250 --eval-every 1 --log-every 10 --lr-schedule step --lr-decay 0.7 --lr-step 50 --clip-grad 8000 --tag 6node-x8-b128-gnn80r3-step-clip

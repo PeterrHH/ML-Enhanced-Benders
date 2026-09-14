@@ -8,12 +8,12 @@ import os
 import pytest
 import torch
 
-from flowfirst.dataset import PKG_DIR, dataset_path, load_or_create
+from flowfirst.dataset import CONFIG_DIR, dataset_path, load_or_create
 from flowfirst.dual import DualRecovery, GraphedPrimalDual, PathPolish, Polish, PrimalDual, cast_net
 from flowfirst.train import build_net, line_bounds
 
 torch.set_default_dtype(torch.float64)
-CONFIGS = [str(PKG_DIR / "config-3node.json"), str(PKG_DIR / "config-3node-3gen.json")]
+CONFIGS = [str(CONFIG_DIR / "config-3node.json"), str(CONFIG_DIR / "config-3node-3gen.json")]
 B = 512
 
 
@@ -206,7 +206,7 @@ def test_pipeline_has_no_data_dependent_ops(problem, labels):
 
 def test_graphed_pipeline_matches_eager_for_any_number_of_instances(problem, labels):
     """Chunks of the capture batch, then a partial chunk that reuses the buffer's stale rows; on CPU the chunks run
-    eagerly, the GPU capture itself is checked by modal_bench.py (F30)."""
+    eagerly, the GPU capture itself is checked by modal/bench.py (F30)."""
     data, _ = problem
     X, *_ = labels
     pipeline = PrimalDual(data, small_net(problem, X))
