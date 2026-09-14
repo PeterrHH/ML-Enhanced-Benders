@@ -1,0 +1,6 @@
+# flow-first on the 8x dataset (262k instances): batch 128, three layers, 250 epochs = 410k steps.
+# fixed learning rate versus a step schedule (x0.7 every 50 epochs: 5e-4 -> 8.4e-5 over 250 epochs).
+--variant flowfirst --config flowfirst/config-3node-3gen-x8.json --input-scale zscore --layers 3 --batch-size 128 --epochs 250 --eval-every 5 --log-every 10 --tag 3gen-x8-b128-l3-fixed
+--variant flowfirst --config flowfirst/config-3node-3gen-x8.json --input-scale zscore --layers 3 --batch-size 128 --epochs 250 --eval-every 5 --log-every 10 --lr-schedule step --lr-decay 0.7 --lr-step 50 --tag 3gen-x8-b128-l3-step
+# baseline on the same data, for the comparison table (uncomment to include):
+# --variant old-prioritized --config flowfirst/config-3node-3gen-x8.json --input-scale zscore --layers 3 --batch-size 128 --epochs 250 --eval-every 5 --log-every 10 --tag 3gen-x8-b128-l3-fixed

@@ -1,0 +1,10 @@
+# Full 20-node run on Modal (FLOWFIRST_GPU=A100, ~$2.1/h): the F24 recipe scaled to diameter 5, no 8-hour compromise.
+# GNN hidden 128 / 6 rounds / pre-LayerNorm, float64, full 210k training set, 250 epochs (410k steps), step decay x0.7 every 50,
+# clip 180000, no EMA (its per-parameter update was a third of the kernel launches per step), validation on 8192 instances
+# every 2 epochs, gradient census on 256 instances. Measured 21.7 ms/step on the A100 before the launch-overhead fixes.
+--variant flowfirst-gnn --config flowfirst/config-20node-x8.json --gnn-hidden 128 --gnn-rounds 6 --gnn-layernorm --batch-size 128 --epochs 250 --valid-size 8192 --census-size 256 --eval-every 2 --log-every 5 --lr-schedule step --lr-decay 0.7 --lr-step 50 --clip-grad 180000 --tag 20node-x8-b128-gnn128r6ln-step-clip-modal
+# same with the antisymmetric readout, as a concurrent second job (uncomment):
+# --variant flowfirst-gnn --config flowfirst/config-20node-x8.json --gnn-hidden 128 --gnn-rounds 6 --gnn-layernorm --gnn-antisym --batch-size 128 --epochs 250 --valid-size 8192 --eval-every 2 --log-every 5 --lr-schedule step --lr-decay 0.7 --lr-step 50 --clip-grad 180000 --ema 0.999 --tag 20node-x8-b128-gnn128r6ln-antisym-step-clip-ema-modal
+# large-batch counterpart: batch 1024, learning rate scaled by sqrt(8), 500 epochs. Only worth it on an H100-class card
+# (FLOWFIRST_GPU=H100, ~$2 for the run); on an A10G batch 1024 is compute-bound and slow. Uncomment to include.
+# --variant flowfirst-gnn --config flowfirst/config-20node-x8.json --gnn-hidden 128 --gnn-rounds 6 --gnn-layernorm --batch-size 1024 --lr 1.4e-3 --epochs 500 --eval-every 2 --log-every 10 --lr-schedule step --lr-decay 0.7 --lr-step 100 --clip-grad 180000 --ema 0.999 --tag 20node-x8-b1024-gnn128r6ln-step-clip-ema-h100

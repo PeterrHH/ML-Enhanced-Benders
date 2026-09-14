@@ -1,0 +1,7 @@
+# Rounds vs width for the GNN on 6 nodes, same quick setting as jobs-6node-gnn-quick.txt (65k training instances, 100 epochs, batch 128).
+# Reference from that file: hidden 96 / 2 rounds (198k params) -> no-shortage total 3.3 %, mean gap 2.3 %.
+# hidden 80 / 3 rounds is parameter-matched to it (190k): rounds instead of width. ~10 to 13 min each alone.
+--variant flowfirst-gnn --config flowfirst/config-6node-x8.json --gnn-hidden 80  --gnn-rounds 3 --train-size 65536 --batch-size 128 --epochs 100 --eval-every 1 --log-every 10 --tag 6node-quick-gnn80r3
+--variant flowfirst-gnn --config flowfirst/config-6node-x8.json --gnn-hidden 96  --gnn-rounds 3 --train-size 65536 --batch-size 128 --epochs 100 --eval-every 1 --log-every 10 --tag 6node-quick-gnn96r3
+--variant flowfirst-gnn --config flowfirst/config-6node-x8.json --gnn-hidden 96  --gnn-rounds 4 --train-size 65536 --batch-size 128 --epochs 100 --eval-every 1 --log-every 10 --tag 6node-quick-gnn96r4
+--variant flowfirst-gnn --config flowfirst/config-6node-x8.json --gnn-hidden 128 --gnn-rounds 2 --train-size 65536 --batch-size 128 --epochs 100 --eval-every 1 --log-every 10 --tag 6node-quick-gnn128r2

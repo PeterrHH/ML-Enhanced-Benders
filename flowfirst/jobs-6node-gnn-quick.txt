@@ -1,0 +1,6 @@
+# Quick GNN intuition test on 6 nodes: small GNNs vs the MLP reference, same 65k training instances, 100 epochs, batch 128.
+# GNN hidden 64 / 2 rounds = 89k params (~14 ms/step, ~10 min); hidden 96 / 2 rounds (~20 ms/step, ~15 min); MLP 3 x 504 = 532k (~5 min).
+# Validation is the full 26k split; F20's MLP on the full 210k training set reached 3.4 % no-shortage total at 250 epochs.
+--variant flowfirst     --config flowfirst/config-6node-x8.json --input-scale zscore --layers 3 --hidden-factor 14 --train-size 65536 --batch-size 128 --epochs 100 --eval-every 1 --log-every 10 --tag 6node-quick-mlp504
+--variant flowfirst-gnn --config flowfirst/config-6node-x8.json --gnn-hidden 64 --gnn-rounds 2 --train-size 65536 --batch-size 128 --epochs 100 --eval-every 1 --log-every 10 --tag 6node-quick-gnn64r2
+--variant flowfirst-gnn --config flowfirst/config-6node-x8.json --gnn-hidden 96 --gnn-rounds 2 --train-size 65536 --batch-size 128 --epochs 100 --eval-every 1 --log-every 10 --tag 6node-quick-gnn96r2
