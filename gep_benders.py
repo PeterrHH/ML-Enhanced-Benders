@@ -109,7 +109,7 @@ def make_kmeans_capacity_demand_groups(data, sample, K, random_state=0):
     labels = KMeans(
         n_clusters=K_eff,
         random_state=random_state,
-        n_init="auto"
+        n_init=300
     ).fit_predict(X_scaled)
 
     groups = [np.where(labels == k)[0].tolist() for k in range(K_eff)]
@@ -167,7 +167,7 @@ def make_kmeans_dual_groups(dual_vals, K, random_state=0):
     if K_eff <= 1:
         return [list(range(T))]
     Xs = (duals - duals.mean(0)) / (duals.std(0) + 1e-8)
-    labels = KMeans(n_clusters=K_eff, n_init=10, random_state=random_state).fit_predict(Xs)
+    labels = KMeans(n_clusters=K_eff, n_init=300, random_state=random_state).fit_predict(Xs)
     return [np.where(labels == k)[0].tolist() for k in range(K_eff) if (labels == k).any()]
 
 
@@ -1360,7 +1360,6 @@ class BendersSolver():
                 self.exact_iterations += 1
             else:
                 self.inexact_iterations += 1
-            print(f"Before Subproblem SOlve")
             # Solve subproblems to find new cuts
             #primal_obj_val_total, dual_obj_val_total, benders_cut, inference_time_subproblems_total = self.solve_subproblems(data,compact,sample,investments_iter_k, exact=self.exact)
             primal_obj_val_total, dual_obj_val_total, benders_cuts, inference_time_subproblems_total = self.solve_subproblems(
@@ -1813,7 +1812,7 @@ if __name__ == "__main__":
                             # Solve single sample with Benders decomposition
                             # sample = 1 # solution = Obj: 2374.99
                             # compact = False
-                            # Solving a subproblem
+                            # Solving with Benders decomposition
                             upper_bound, lower_bound, benders_cuts_all, investments_all, obj_val_subproblems_all, iterations = solver.solve_with_benders(gep_data, benders_args['benders_compact'], sample)
 
                             iter_df = pd.DataFrame({
@@ -1858,8 +1857,6 @@ if __name__ == "__main__":
                             print(f"Iterations: {iterations}")
                             print(f"Total time master: {solver.total_time_master}, Total time subproblem_exact: {solver.total_time_subproblem_exact}, Total time subproblem_pdl: {solver.total_time_subproblem_pdl}")
                             print(f"Total time: {solver.total_time_master + solver.total_time_subproblem_exact + solver.total_time_subproblem_pdl}")
-
-                            #obj_val_master, investments_iter_k, inference_time_master = solver.solve_master_problem(gep_data,False,sample,investments_all,None,benders_cuts_all, investment=y[:gep_data.num_g])
 
                             # Store results in a dict for this run
                             result = {
