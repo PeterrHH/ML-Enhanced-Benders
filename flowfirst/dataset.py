@@ -60,9 +60,22 @@ def resolve_config(args_path):
 
 
 def load_or_create(args_path=DEFAULT_CONFIG, seed=0):
-    """Return (data, args). Builds and pickles the dataset on first use."""
+    """Return (data, args). Builds and pickles the dataset on first use.
+
+    With ``ED_args.use_direct_data`` the instances are not sampled at all: the
+    pickle at ``ED_args.direct_data_path`` (relative to the repo root) is loaded
+    as is. That is how the Benders-harvested sets from ``gen_GEP/`` enter, whose
+    capacities are the investments exact Benders actually visits rather than
+    draws from the node-budget sampler. The same key drives ``main.py``.
+    """
     with open(resolve_config(args_path)) as f:
         args = json.load(f)
+    if args["ED_args"].get("use_direct_data"):
+        direct = Path(args["ED_args"]["direct_data_path"])
+        direct = direct if direct.is_absolute() else REPO_ROOT / direct
+        assert direct.exists(), f"direct_data_path not found: {direct}"
+        with open(direct, "rb") as f:
+            return pickle.load(f), args
     path = dataset_path(args)
     if not os.path.exists(path):
         np.random.seed(seed)

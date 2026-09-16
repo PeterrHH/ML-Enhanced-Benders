@@ -86,3 +86,48 @@ FLOWFIRST_GPU=A100 .venv/bin/modal run --detach flowfirst/modal/train.py --jobs 
 `--device cuda` is added automatically; the GPU type is `FLOWFIRST_GPU`
 (default A10G; use A100, the training is float64). Always `modal run --detach`.
 Only the `flowfirst-gnn` variant runs on CUDA.
+
+## Training on Benders-harvested instances
+
+Every dataset behind F1 to F32 comes from the node-budget capacity sampler. In deployment
+the capacities are whatever the master proposes, starting at `u = 0` (IDEAS I9). With
+`ED_args.use_direct_data` — the same key `main.py` uses — `dataset.py` samples nothing and
+loads `direct_data_path` as is, which is how the `gen_GEP/` harvests enter: 81 perturbed
+3-node GEP instances solved by exact Benders, the master's investment trajectory paired with
+representative hours, deduplicated to 48k Gurobi-labelled ED states.
+
+```
+.venv/bin/python -m flowfirst.dataset flowfirst/configs/config-3node-harvest.json
+.venv/bin/python -m flowfirst.train --variant flowfirst       --config flowfirst/configs/config-3node-harvest.json --epochs 250 --tag harvest
+.venv/bin/python -m flowfirst.train --variant old-prioritized --config flowfirst/configs/config-3node-harvest.json --epochs 250 --tag harvest
+```
+
+Defaults throughout, matching `runs/flowfirst-3` and `runs/old-prioritized`, so the dataset
+is the only variable. `compare_harvest.ipynb` compares them: curves, per-instance gaps,
+the dispatch/VOLL split, the polish ladder and the certificate.
+
+Validation (4800 instances, seed 0, one run each), flow-first first: ratio of totals 0.00895
+against 0.00877, median gap 0.0188 against 0.0145, within 1 % 0.431 against 0.454, trimmed
+mean 0.62 against 0.58. The two are within 3 % of each other on every metric and the thesis
+primal is marginally ahead — the separation of F17 is gone, as F1 predicts at two generators
+per node.
+
+Ignore the mean per-instance gap here (1.86 against 2.62, the one metric flow-first leads).
+The harvest's optima span 2.7 to 1.9e6, so F5's denominator problem is extreme: mean absolute
+error is ~650 for both models, which is 2 % of a median optimum and 250x the cheapest one.
+Ten instances out of 4800 make up half the mean, the top 1 % make up two thirds, and that is
+what the jagged curve in the notebook's second panel is tracking. Read the ratio of totals,
+the median and the share within 1 %.
+
+The level is well below F17/F18 (43 % within 1 %) on a harder distribution: 23 % of instances
+short, every one with a saturated line. One polish sweep divides the mean gap by 70 to 75 and takes the median to
+zero, against 8 to 15 in F32 — on Benders states the network routes and the exact local
+moves supply nearly all the precision. The warm start saves little (2.24 augmentations
+against 2.81 cold), but three nodes leave almost nothing to route.
+
+This does not yet say whether harvest-training beats sampler-training for deployment: the
+harvest is a different 3-node system from `config-3node.json` (GER Gas/SunPV, FRA
+Nuclear/SunPV, two cost ties), so neither model can be scored on the other's data. The 2x2
+needs a sampler dataset on the harvest's own system; notebook section 7 has the recipe and a
+`cross_evaluate` that asserts on mismatched generators instead of returning a meaningless
+number.
