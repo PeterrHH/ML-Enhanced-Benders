@@ -155,19 +155,76 @@ def make_stress_bin_groups(data, sample, K):
     return groups, labels, stress
 
 
-def make_kmeans_dual_groups(dual_vals, K, random_state=0):
+def compute_investment_duals(data, dual_vals, ineq_cm_np):
     """
-    Adaptive grouping: cluster timesteps by their current subproblem dual vectors.
-    Used by cut_selection="kmeans_dynamic" (recomputed every Benders iteration).
-    Returns a list of timestep-index groups.
+    Per-timestep dual of the investment decision, i.e. lambda_s in Law & Mallapragada
+    (Eq. 2d): the Benders cut slope w.r.t. u.
+
+    In the non-compact formulation u enters only via  p_{g,t} - A_{g,t} Pmax_g u_g <= 0,
+    so  lambda_{g,t} = mu^ub_{g,t} * A_{g,t} Pmax_g.
+    Same quantity that find_benders_cut_batch_for_group sums into the cut LHS.
+
+    Returns array of shape (T, G).
     """
+    G = data.num_g
     duals = np.asarray(dual_vals)
     T = duals.shape[0]
+    num_rows_per_t_ineq = 2 * (G + data.num_l + data.num_n)
+
+    g_arr = np.arange(G)
+    row_idx = 2 * G + np.arange(T)[:, None] * num_rows_per_t_ineq + g_arr[None, :]
+    A_coeffs = ineq_cm_np[row_idx, g_arr[None, :]]          # (T, G) = -A_{g,t} Pmax_g
+    return duals[:, G:2 * G] * -A_coeffs                     # (T, G)
+
+
+def compute_shadow_prices(data, dual_vals):
+    """
+    Per-timestep nodal shadow prices: the duals of the node-balance equalities.
+    Returns array of shape (T, N).
+    """
+    duals = np.asarray(dual_vals)
+    eq_dual_start = 2 * (data.num_g + data.num_l + data.num_n)
+    return duals[:, eq_dual_start:eq_dual_start + data.num_n]
+
+
+def compute_per_timestep_cuts(data, dual_vals, b_ineqs, b_eqs, ineq_cm_np):
+    """
+    Disaggregated Benders cut per timestep t, in the form
+        slope_t @ u - theta_t <= rhs_t
+    Summing (slope_t, rhs_t) over a group gives exactly find_benders_cut_batch_for_group.
+    Returns slopes (T, G) and rhs (T,).
+    """
+    G, L, N = data.num_g, data.num_l, data.num_n
+    duals = np.asarray(dual_vals)
+
+    slopes = compute_investment_duals(data, duals, ineq_cm_np)
+
+    constraint_nrs = np.concatenate([
+        2*G + np.arange(L),
+        2*G + L + np.arange(L),
+        2*G + 2*L + N + np.arange(N),
+    ])
+    rhs = -np.sum(duals[:, constraint_nrs] * b_ineqs[:, constraint_nrs], axis=1)
+
+    eq_dual_start = 2 * (G + L + N)
+    rhs -= np.sum(duals[:, eq_dual_start:eq_dual_start + N] * b_eqs, axis=1)
+
+    return slopes, rhs
+
+
+def make_kmeans_dual_groups(features, K, random_state=0):
+    """
+    Adaptive grouping: cluster timesteps on dual-based features, shape (T, d)
+    (nodal shadow prices or cut slopes). No per-column standardisation: columns share
+    units, so raw Euclidean distance is meaningful.
+    Returns a list of timestep-index groups.
+    """
+    X = np.asarray(features)
+    T = X.shape[0]
     K_eff = min(K, T)
     if K_eff <= 1:
         return [list(range(T))]
-    Xs = (duals - duals.mean(0)) / (duals.std(0) + 1e-8)
-    labels = KMeans(n_clusters=K_eff, n_init=300, random_state=random_state).fit_predict(Xs)
+    labels = KMeans(n_clusters=K_eff, n_init=300, random_state=random_state).fit_predict(X)
     return [np.where(labels == k)[0].tolist() for k in range(K_eff) if (labels == k).any()]
 
 
@@ -237,7 +294,8 @@ def make_cut_groups(data, sample, cut_selection="single", cut_selection_k=1, ran
 class BendersSolver():
     def __init__(self, gep_data, operational_data, sample, primal_net=None, dual_net=None, exact=True, 
                  exact_refinement=True, max_investment=100000, init_investment = "Zero", 
-                 cut_selection="single",cut_selection_k=1,parallel_subproblems = False, n_workers = None):
+                 cut_selection="single",cut_selection_k=1,parallel_subproblems = False, n_workers = None,
+                 dynamic_cluster_features="price"):
 
         self.gep_data = gep_data
         self.operational_data = operational_data
@@ -252,11 +310,23 @@ class BendersSolver():
         self.pWeight = self.gep_data.pWeight 
         self.max_investment = max_investment
         self.best_upper_bound = np.inf
+        self.best_lower_bound = -np.inf
 
         self.cut_selection = cut_selection
         self.cut_selection_k = cut_selection_k
         self.cut_groups = None
         self.cut_group_info = None
+        # Adaptive (dynamic) grouping, Law & Mallapragada (2026):
+        #   "kmeans_dynamic"        -> adapt-G-I: one theta per timestep, old grouped cuts kept as-is
+        #   "kmeans_dynamic_shared" -> adapt-G-S: one theta per group, all historical cuts
+        #                              re-aggregated under the new grouping every iteration
+        # dynamic_cluster_features: "price" (nodal shadow prices, (T, N)) or "slope" (cut slopes, (T, G))
+        if dynamic_cluster_features not in ("price", "slope"):
+            raise ValueError(f"Unknown dynamic_cluster_features={dynamic_cluster_features}. Choose 'price' or 'slope'.")
+        self.dynamic_cluster_features = dynamic_cluster_features
+        self._cut_hist_slopes = []    # adapt-G-S: per-iteration (T, G) disaggregated cut slopes
+        self._cut_hist_rhs = []       # adapt-G-S: per-iteration (T,) disaggregated cut rhs
+        self._cut_constrs = []        # handles of cut constraints in the persistent master
         self.parallel_subproblems = parallel_subproblems
         self.n_workers = n_workers
 
@@ -549,6 +619,9 @@ class BendersSolver():
         # recourse keeps grouped cuts valid across regroupings without rebuilding.
         if self.cut_selection == "single":
             num_alpha = 1
+        elif self.cut_selection == "kmeans_dynamic_shared":
+            # adapt-G-S: one theta per group (unused thetas stay at their lb of 0)
+            num_alpha = max(1, min(self.cut_selection_k, len(data.time_ranges[sample])))
         else:
             num_alpha = len(data.time_ranges[sample])
 
@@ -579,11 +652,19 @@ class BendersSolver():
         self.master_u = u
         self.master_alpha = alpha
         self._num_cuts_in_master = 0
+        self._cut_constrs = []
 
 
     def _add_new_cuts_to_master(self, all_cuts):
-        """Only push cuts that aren't already in the model."""
-        new_cuts = all_cuts[self._num_cuts_in_master:]
+        """Only push cuts that aren't already in the model.
+        adapt-G-S rebuilds every cut under the new grouping, so its cuts are replaced wholesale."""
+        if self.cut_selection == "kmeans_dynamic_shared":
+            if self._cut_constrs:
+                self.master_model.remove(self._cut_constrs)
+            self._cut_constrs = []
+            new_cuts = all_cuts
+        else:
+            new_cuts = all_cuts[self._num_cuts_in_master:]
         if not new_cuts:
             return
 
@@ -595,9 +676,9 @@ class BendersSolver():
             row = np.asarray(cut_lhs).reshape(-1)
             u_coeffs = row[:num_g]
             alpha_coeffs = row[num_g:]
-            self.master_model.addConstr(
+            self._cut_constrs.append(self.master_model.addConstr(
                 u_coeffs @ u + alpha_coeffs @ alpha <= float(cut_rhs)
-            )
+            ))
 
         # Gurobi batches lazily; optimize() triggers the update.
         self._num_cuts_in_master = len(all_cuts)
@@ -935,12 +1016,41 @@ class BendersSolver():
             return [cut]
 
         # Grouping policy:
-        #   kmeans_dynamic -> recluster on the current subproblem duals EVERY iteration
-        #   everything else -> cluster once (cached in self.cut_groups)
-        if self.cut_selection == "kmeans_dynamic":
-            self.cut_groups = make_kmeans_dual_groups(
-                np.asarray(dual_vals), self.cut_selection_k)
-        elif self.cut_groups is None:
+        #   kmeans_dynamic(_shared) -> recluster on the current duals EVERY iteration
+        #   everything else         -> cluster once (cached in self.cut_groups)
+        if self.cut_selection in ("kmeans_dynamic", "kmeans_dynamic_shared"):
+            if self.dynamic_cluster_features == "price":
+                features = compute_shadow_prices(data, dual_vals)
+            else:
+                features = compute_investment_duals(data, dual_vals, ineq_cm_np)
+            self.cut_groups = make_kmeans_dual_groups(features, self.cut_selection_k)
+
+        if self.cut_selection == "kmeans_dynamic_shared":
+            # adapt-G-S: store this iteration's disaggregated cuts, then rebuild ALL historical
+            # cuts under the current grouping with one theta per group. The returned list
+            # replaces every cut in the master.
+            slopes, rhs = compute_per_timestep_cuts(data, dual_vals, b_ineqs, b_eqs, ineq_cm_np)
+            self._cut_hist_slopes.append(slopes)
+            self._cut_hist_rhs.append(rhs)
+            hist_slopes = np.stack(self._cut_hist_slopes)    # (I, T, G)
+            hist_rhs = np.stack(self._cut_hist_rhs)          # (I, T)
+
+            G = data.num_g
+            # Must match _ensure_master_model (the master is not built yet at iteration 0)
+            num_alpha = max(1, min(self.cut_selection_k, len(data.time_ranges[sample])))
+            cuts = []
+            for k, group in enumerate(self.cut_groups):
+                group = np.asarray(group, dtype=int)
+                group_slopes = hist_slopes[:, group, :].sum(axis=1)   # (I, G)
+                group_rhs = hist_rhs[:, group].sum(axis=1)            # (I,)
+                for it in range(hist_slopes.shape[0]):
+                    cut_lhs = np.zeros((1, G + num_alpha))
+                    cut_lhs[0, :G] = group_slopes[it]
+                    cut_lhs[0, G + k] = -1.0
+                    cuts.append((cut_lhs, float(group_rhs[it])))
+            return cuts
+
+        if self.cut_selection != "kmeans_dynamic" and self.cut_groups is None:
             self.cut_groups, self.cut_group_info = make_cut_groups(
                 data=data, sample=sample,
                 cut_selection=self.cut_selection,
@@ -1291,6 +1401,30 @@ class BendersSolver():
 
 
 
+    def _update_cut_list(self, benders_cut_all, benders_cuts):
+        # adapt-G-S returns the full rebuilt cut set; every other mode returns only new cuts.
+        if self.cut_selection == "kmeans_dynamic_shared":
+            benders_cut_all[:] = benders_cuts
+        else:
+            benders_cut_all.extend(benders_cuts)
+
+    def _investment_repeated(self, investments_iter_k, investments_all):
+        # adapt-G-S rebuilds the master under a new grouping every iteration, so it can cycle
+        # through several investments; treat a return to ANY earlier investment as stalled.
+        # All other modes keep the original check against the previous iteration only.
+        inv = investments_iter_k.to(torch.float64)
+        previous = investments_all if self.cut_selection == "kmeans_dynamic_shared" else investments_all[-1:]
+        return any(torch.allclose(inv, p.to(torch.float64), atol=1e-6) for p in previous)
+
+    def _lower_bound(self, obj_val_master):
+        lower_bound = obj_val_master[0] + obj_val_master[1]
+        if self.cut_selection == "kmeans_dynamic_shared":
+            # adapt-G-S master objective is a valid but non-monotone lower bound
+            # (a new grouping can be coarser than the last); report the best one found.
+            self.best_lower_bound = max(self.best_lower_bound, lower_bound)
+            return self.best_lower_bound
+        return lower_bound
+
     def solve_with_benders(self, data, compact, sample):
 
         # Create lists for algorithm
@@ -1340,14 +1474,14 @@ class BendersSolver():
 
             self.inv_hist.append(investments_iter_k.detach().cpu().numpy().tolist())
 
-            if self.exact == False and i > 0 and torch.allclose(investments_iter_k.to(torch.float64), investments_all[-1].to(torch.float64), atol=1e-6):
+            if self.exact == False and i > 0 and self._investment_repeated(investments_iter_k, investments_all):
                 print("!! Investments are the same as last iteration")
                 if self.exact_refinement:
                     self.exact = True
                 else:
                     print("Stopping Benders decomposition because exact refinement is not used.")
                     print("Upper bound:", self.best_upper_bound) #! Return the best upper bound found so far if exact refinement is not used
-                    lower_bound = obj_val_master[0] + obj_val_master[1]
+                    lower_bound = self._lower_bound(obj_val_master)
                     print("Lower bound:", lower_bound)
                     print(f"Duality gap: {(self.best_upper_bound - lower_bound)/np.abs(self.best_upper_bound)}")
                     break
@@ -1393,7 +1527,7 @@ class BendersSolver():
             obj_val_subproblems_all.append(primal_obj_val_total)
 
             # Check for optimality
-            lower_bound = obj_val_master[0] + obj_val_master[1]
+            lower_bound = self._lower_bound(obj_val_master)
             upper_bound = obj_val_master[0] + primal_obj_val_total
             print(f"UB={upper_bound:.4f}, LB={lower_bound:.4f}, ")
             # --- LOG UB/LB PER ITERATION ---
@@ -1457,12 +1591,12 @@ class BendersSolver():
                 else:
                     # Add Benders cut of current iteration to list
                     # benders_cut_all.append(benders_cut)
-                    benders_cut_all.extend(benders_cuts)
+                    self._update_cut_list(benders_cut_all, benders_cuts)
                     print(f"Subproblems solved. Added {len(benders_cuts)} Benders cuts.")
                     # print('Subproblems solved. Benders_cut:',benders_cut)
             else:
                     # Add Benders cut of current iteration to list
-                    benders_cut_all.extend(benders_cuts)
+                    self._update_cut_list(benders_cut_all, benders_cuts)
                     print(f"Subproblems solved. Added {len(benders_cuts)} Benders cuts.")
             self.wall_master_hist.append(
                             float(inference_time_master) if i > 0 else 0.0
@@ -1769,7 +1903,8 @@ if __name__ == "__main__":
                                                     cut_selection=benders_args["cut_selection"],
                                                     cut_selection_k=benders_args["cut_selection_k"],
                                                     parallel_subproblems=benders_args["parallel_subproblems"],
-                                                    n_workers=benders_args["n_workers"])
+                                                    n_workers=benders_args["n_workers"],
+                                                    dynamic_cluster_features=benders_args.get("dynamic_cluster_features", "price"))
                             start_time_direct = time.time()
                             y, obj = solver.solve_matrix_problem(gep_data, sample, inv_decision=None)
                             total_time_direct = time.time() - start_time_direct
@@ -1804,7 +1939,8 @@ if __name__ == "__main__":
                                                     cut_selection=benders_args["cut_selection"],
                                                     cut_selection_k=benders_args["cut_selection_k"],
                                                     parallel_subproblems=benders_args["parallel_subproblems"],
-                                                    n_workers=benders_args["n_workers"])
+                                                    n_workers=benders_args["n_workers"],
+                                                    dynamic_cluster_features=benders_args.get("dynamic_cluster_features", "price"))
         
                             # Solve for the ground truth
                             y, obj = solver.solve_matrix_problem(gep_data, sample) # solution = Obj: 2374.99
