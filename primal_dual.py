@@ -3,7 +3,7 @@ import os
 import time
 import torch
 from torch.utils.data import TensorDataset, DataLoader
-from logger import TensorBoardLogger
+from logger import Logger
 import numpy as np
 import pandas as pd
 from mtadam import MTAdam
@@ -66,6 +66,10 @@ class PrimalDualTrainer():
             self.DTYPE = torch.float32
             self.DEVICE = torch.device("mps")
             self.data.to_mps()
+        elif self.args["device"] == "cuda":
+            self.DTYPE = torch.float32
+            self.DEVICE = torch.device("cuda")
+            self.data.to(self.DEVICE)
         else:
             self.DTYPE = torch.float64
             self.DEVICE = torch.device("cpu")
@@ -232,7 +236,7 @@ class PrimalDualTrainer():
         self.lamb_targets_valid = self.lamb_targets_all[self.valid_indices]
 
         if self.log == True:
-            self.logger = TensorBoardLogger(args, data, self.X, self.total_demands, self.train_indices, self.valid_indices, save_dir, args["opt_targets"])
+            self.logger = Logger(args, data, self.X, self.total_demands, self.train_indices, self.valid_indices, save_dir, args["opt_targets"])
         else:
             self.logger = None
 
@@ -322,6 +326,10 @@ class PrimalDualTrainer():
         print(self.dual_net)
 
         self.primal_net.to(self.DTYPE).to(self.DEVICE)
+
+        if self.logger:
+            self.logger.watch(self.primal_net, self.dual_net)
+
         self.primal_optim = torch.optim.Adam(self.primal_net.parameters(), lr=self.primal_lr)
         self.dual_optim = torch.optim.Adam(self.dual_net.parameters(), lr=self.dual_lr)
 
@@ -556,6 +564,13 @@ class PrimalDualTrainer():
 
 
     def train_PDL(self, optuna_trial=None):
+        try:
+            return self._train_PDL(optuna_trial)
+        finally:
+            if self.logger:
+                self.logger.finish()
+
+    def _train_PDL(self, optuna_trial=None):
         print("Starting Primal-Dual Learning inside the train_PDL function")
         prev_v_k = 0
         for k in range(self.outer_iterations):

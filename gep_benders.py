@@ -18,6 +18,7 @@ from gep_problem_operational import GEPOperationalProblemSet
 from create_gep_dataset import create_gep_ed_dataset
 from gep_config_parser import *
 from networks import DualClassificationNetEndToEnd, DualNet, DualNetEndToEnd, PrimalNetEndToEnd
+from paths import add_path_args, ensure_dir, resolve_roots, under_repo, under_root
 
 import os
 import threading
@@ -212,6 +213,24 @@ def compute_per_timestep_cuts(data, dual_vals, b_ineqs, b_eqs, ineq_cm_np):
     return slopes, rhs
 
 
+def compute_installed_capacity_features(demand_features, capacity_potential_features, investments, scale=None):
+    """
+    Primal, investment-dependent features: [D_{n,t}, A_{g,t} Pmax_g u_g].
+    Same space as the static features, with each generator column scaled by how much of it is built.
+    Generators that are not built drop out; heavily built ones dominate, which is what decides
+    whether hour t is capacity constrained at the current investment.
+
+    Columns are in MW on both sides, so no scaling is applied by default. Any `scale` passed here
+    must be investment-independent: standardising the columns would divide generator g by u_g
+    and cancel the weighting.
+    """
+    X = np.concatenate([demand_features,
+                        capacity_potential_features * np.asarray(investments, dtype=float)[None, :]], axis=1)
+    if scale is not None:
+        X = X / scale[None, :]
+    return X
+
+
 def make_kmeans_dual_groups(features, K, random_state=0):
     """
     Adaptive grouping: cluster timesteps on dual-based features, shape (T, d)
@@ -320,10 +339,15 @@ class BendersSolver():
         #   "kmeans_dynamic"        -> adapt-G-I: one theta per timestep, old grouped cuts kept as-is
         #   "kmeans_dynamic_shared" -> adapt-G-S: one theta per group, all historical cuts
         #                              re-aggregated under the new grouping every iteration
-        # dynamic_cluster_features: "price" (nodal shadow prices, (T, N)) or "slope" (cut slopes, (T, G))
-        if dynamic_cluster_features not in ("price", "slope"):
-            raise ValueError(f"Unknown dynamic_cluster_features={dynamic_cluster_features}. Choose 'price' or 'slope'.")
+        # dynamic_cluster_features:
+        #   "price"    -> nodal shadow prices, (T, N)
+        #   "slope"    -> cut slopes / investment duals lambda_s, (T, G)
+        #   "capacity" -> primal [D, A*Pmax*u] at the current investment, (T, N+G)
+        if dynamic_cluster_features not in ("price", "slope", "capacity"):
+            raise ValueError(f"Unknown dynamic_cluster_features={dynamic_cluster_features}. "
+                             "Choose 'price', 'slope' or 'capacity'.")
         self.dynamic_cluster_features = dynamic_cluster_features
+        self._cd_features = None      # cached (demand, capacity potential) blocks for "capacity" features
         self._cut_hist_slopes = []    # adapt-G-S: per-iteration (T, G) disaggregated cut slopes
         self._cut_hist_rhs = []       # adapt-G-S: per-iteration (T,) disaggregated cut rhs
         self._cut_constrs = []        # handles of cut constraints in the persistent master
@@ -994,6 +1018,18 @@ class BendersSolver():
 
         return benders_cut_lhs, benders_cut_rhs
 
+    def _capacity_features(self, data, sample, investments):
+        """[D, A*Pmax*u] in physical units (cached per sample).
+
+        Demand and installed available capacity are both in MW, so no scaling is applied:
+        distances are then differences in MW. Standardising the columns would divide
+        generator g by u_g and cancel the investment weighting entirely."""
+        if self._cd_features is None:
+            _, demand, capacity = build_capacity_demand_features(data, sample)
+            self._cd_features = (demand, capacity)
+        demand, capacity = self._cd_features
+        return compute_installed_capacity_features(demand, capacity, investments)
+
     def find_benders_cuts_grouped_batch(
         self,
         data,
@@ -1002,7 +1038,8 @@ class BendersSolver():
         dual_vals,
         b_ineqs,
         b_eqs,
-        ineq_cm_np=None, 
+        ineq_cm_np=None,
+        investments=None,
     ):
         # Lazy fallback if caller didn't provide it
         if ineq_cm_np is None:
@@ -1021,6 +1058,8 @@ class BendersSolver():
         if self.cut_selection in ("kmeans_dynamic", "kmeans_dynamic_shared"):
             if self.dynamic_cluster_features == "price":
                 features = compute_shadow_prices(data, dual_vals)
+            elif self.dynamic_cluster_features == "capacity":
+                features = self._capacity_features(data, sample, investments)
             else:
                 features = compute_investment_duals(data, dual_vals, ineq_cm_np)
             self.cut_groups = make_kmeans_dual_groups(features, self.cut_selection_k)
@@ -1205,6 +1244,7 @@ class BendersSolver():
             data=data, compact=compact, sample=sample,
             dual_vals=np.array(dual_vals), b_ineqs=b_ineqs_np, b_eqs=b_eqs_np,
             ineq_cm_np=ineq_cm_np,   # <-- new kwarg
+            investments=np.asarray(investments, dtype=float),
         )
         t_cuts = time.time() - t0
 
@@ -1698,34 +1738,67 @@ if __name__ == "__main__":
         "-c", "--config",
         type=str,
         default="configs/config.json",
-        help="Path to run config JSON file, e.g. configs/config.json"
+        help="Path to run config JSON file, e.g. configs/config.json. "
+             "Relative paths resolve against the repository, not the working directory."
     )
+
+    #! --home-path / --data-root / --output-root
+    add_path_args(parser)
+
+    #! The trained nets are inputs here, produced by an earlier main.py run.
+    #! They stay config-driven; these override them for cluster runs.
+    parser.add_argument(
+        "--primal-net-dir", "--primal_net_dir",
+        dest="primal_net_dir",
+        default=None,
+        help="Override Benders_args.primal_net_directory.",
+    )
+    parser.add_argument(
+        "--dual-net-dir", "--dual_net_dir",
+        dest="dual_net_dir",
+        default=None,
+        help="Override Benders_args.dual_net_directory.",
+    )
+
     args_cli = parser.parse_args()
 
 
 
     print("Parsing the config file")
-    RUN_CONFIG_FILE = args_cli.config
-    NumNode = None
-    if RUN_CONFIG_FILE == "configs/config.json":
-        NumNode = 3
-    elif RUN_CONFIG_FILE == "configs/config-4node.json":
-        NumNode = 4
-    elif RUN_CONFIG_FILE == "configs/config-5node.json":
-        NumNode = 5
-    elif RUN_CONFIG_FILE == "configs/config-6node.json":
-        NumNode = 6
-    else:
-        raise ValueError("Invalid config file name.")
+    #! Repo-anchored, so any spelling of the path works and the file is found
+    #! whatever the working directory is.
+    RUN_CONFIG_FILE = under_repo(args_cli.config)
 
-    data = parse_config(CONFIG_FILE_NAME)
+    data = parse_config(under_repo(CONFIG_FILE_NAME))
     experiment = data["experiment"]
     outputs_config = data["outputs_config"]
 
 
     with open(RUN_CONFIG_FILE, "r") as file:
         args = json.load(file)
-    
+
+    #! Derived from the config itself rather than from its filename, so an
+    #! absolute or ./-prefixed --config no longer fails.
+    NumNode = len(args["Benders_args"]["N"])
+
+    roots = resolve_roots(args, args_cli)
+    data_root = roots["data_root"]
+    output_root = roots["output_root"]
+
+    print(f"Run config:   {RUN_CONFIG_FILE}  ({NumNode} nodes)")
+    print(f"Dataset root: {data_root}")
+    print(f"Output root:  {output_root}")
+
+    #! Surfaced at startup rather than only when the summary CSV is written at
+    #! the very end of a run. configs/config-6node.json trips this.
+    _exp_dir = args["Benders_args"].get("exp_save_directory") or ""
+    if _exp_dir and os.path.basename(_exp_dir.rstrip("/")) != f"{NumNode}Node":
+        print(
+            f"[paths] WARNING: exp_save_directory '{_exp_dir}' does not match the "
+            f"{NumNode}-node config. Summary CSVs go there anyway, alongside another "
+            f"node count's results; iteration logs go to outputs/Benders/{NumNode}Node/."
+        )
+
     print(args)
 
 
@@ -1758,13 +1831,19 @@ if __name__ == "__main__":
             lines_str = f"L{len(benders_args['L'])}"
 
             # Create a shortened filename
-            ed_data_save_path = (f"data/ED_data/ED_N{nodes_str}_G{gens_str}_{lines_str}"
-                            f"_c{int(benders_args['benders_compact'])}"
-                            f"_s{int(benders_args['scale_problem'])}"
-                            f"_p{int(benders_args['perturb_operating_costs'])}"
-                            f"_smp{benders_args['2n_synthetic_samples']}.pkl")
+            ed_data_save_path = under_root(
+                (f"data/ED_data/ED_N{nodes_str}_G{gens_str}_{lines_str}"
+                 f"_c{int(benders_args['benders_compact'])}"
+                 f"_s{int(benders_args['scale_problem'])}"
+                 f"_p{int(benders_args['perturb_operating_costs'])}"
+                 f"_smp{benders_args['2n_synthetic_samples']}.pkl"),
+                data_root,
+            )
 
-            gep_data_save_path = f"data/GEP_data/sample_duration:{benders_args['sample_duration']}_N:{nodes_str}_G:{gens_str}_L:{lines_str}.pkl"
+            gep_data_save_path = under_root(
+                f"data/GEP_data/sample_duration:{benders_args['sample_duration']}_N:{nodes_str}_G:{gens_str}_L:{lines_str}.pkl",
+                data_root,
+            )
             # Prep problem data:
             # Prep problem data:
             if args_cli.solve_direct:
@@ -1827,14 +1906,20 @@ if __name__ == "__main__":
             # primal_net_directory = "outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
             # dual_net_directory = "outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
             if not args_cli.solve_direct:
-                if "primal_net_directory" in args["Benders_args"]:
-                    primal_net_directory = args["Benders_args"]["primal_net_directory"]
+                if args_cli.primal_net_dir or "primal_net_directory" in args["Benders_args"]:
+                    primal_net_directory = under_root(
+                        args_cli.primal_net_dir or args["Benders_args"]["primal_net_directory"],
+                        output_root,
+                    )
                 else:
                     raise ValueError("Please provide a directory for the primal net in the config file under Benders_args with key 'primal_net_directory'")
                     primal_net_directory = "outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
                 
-                if "dual_net_directory" in args["Benders_args"]:
-                    dual_net_directory = args["Benders_args"]["dual_net_directory"]
+                if args_cli.dual_net_dir or "dual_net_directory" in args["Benders_args"]:
+                    dual_net_directory = under_root(
+                        args_cli.dual_net_dir or args["Benders_args"]["dual_net_directory"],
+                        output_root,
+                    )
                 else:
                     raise ValueError("Please provide a directory for the dual net in the config file under Benders_args with key 'dual_net_directory'")
                     dual_net_directory = "outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
@@ -1976,9 +2061,12 @@ if __name__ == "__main__":
                             # if samples == 1:
                             #     out_dir = f"outputs/Benders/{NumNode}Node/Full_Time/iter_logs_{benders_setup_str}_{specific_name}"
                             # else:
-                            out_dir = f"outputs/Benders/{NumNode}Node/Sample_{benders_args['sample_duration']}/iter_logs_{benders_setup_str}_{specific_name}"
+                            out_dir = under_root(
+                                f"outputs/Benders/{NumNode}Node/Sample_{benders_args['sample_duration']}/iter_logs_{benders_setup_str}_{specific_name}",
+                                output_root,
+                            )
 
-                            os.makedirs(out_dir, exist_ok=True)
+                            ensure_dir(out_dir)
                             iter_df.to_csv(
                                 os.path.join(out_dir, f"iterlog_sample{sample}_start_exact{start_exact}_ref{exact_refinement}.csv"),
                                 index=False
@@ -2022,23 +2110,31 @@ if __name__ == "__main__":
                 #! Set to True if saving data.
                 if True:
                     experiment_data_df = pd.DataFrame(all_results)
-                    if not os.path.exists(args["Benders_args"]["exp_save_directory"]):
-                        os.makedirs(args["Benders_args"]["exp_save_directory"])
-                    
+
+                    exp_save_directory = under_root(
+                        args["Benders_args"].get("exp_save_directory") or f"outputs/Benders/{NumNode}Node",
+                        output_root,
+                    )
+
+                    #! The Sample_<duration> level has to be created here. It used
+                    #! to exist only as a side effect of the iter_logs makedirs
+                    #! above, which shared the same literal prefix by coincidence.
+                    sample_dir = ensure_dir(
+                        os.path.join(exp_save_directory, f"Sample_{str(benders_args['sample_duration'])}")
+                    )
+
                     if args_cli.solve_direct:
                         specific_name = "direct_exact"
-                        out_dir = f"outputs/Benders/{NumNode}Node/Sample_{benders_args['sample_duration']}"
-                        os.makedirs(out_dir, exist_ok=True)
-                        data_save_path = os.path.join(args["Benders_args"]["exp_save_directory"], f"Sample_{str(benders_args['sample_duration'])}", f"Gurobi_Solution.csv")
-                
+                        data_save_path = os.path.join(sample_dir, f"Gurobi_Solution.csv")
+
                     else:
                         specific_name = args["Benders_args"].get("specific_name", "")
-                        
+
                         if samples == 1:
-                            data_save_path = os.path.join(args["Benders_args"]["exp_save_directory"], f"Sample_{str(benders_args['sample_duration'])}",f"experiment_data_full_time_sample_duration:{benders_args['sample_duration']}_start_exact:{start_exact}_exact_refinement:{exact_refinement}_{specific_name}.csv")
+                            data_save_path = os.path.join(sample_dir, f"experiment_data_full_time_sample_duration:{benders_args['sample_duration']}_start_exact:{start_exact}_exact_refinement:{exact_refinement}_{specific_name}.csv")
                         else:
-                            data_save_path = os.path.join(args["Benders_args"]["exp_save_directory"], f"Sample_{str(benders_args['sample_duration'])}", f"experiment_data_sample_duration:{benders_args['sample_duration']}_start_exact:{start_exact}_exact_refinement:{exact_refinement}_{specific_name}.csv")
-                        
+                            data_save_path = os.path.join(sample_dir, f"experiment_data_sample_duration:{benders_args['sample_duration']}_start_exact:{start_exact}_exact_refinement:{exact_refinement}_{specific_name}.csv")
+
                     experiment_data_df.to_csv(data_save_path, index=False)
 
 

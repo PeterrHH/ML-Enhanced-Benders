@@ -87,7 +87,8 @@ Each JSON file has three main sections:
 
 ### What it does
 
-1. Reads the JSON config specified by `ARGS_FILE_NAME` at the top of the file.
+1. Reads the JSON config given by `-c/--config` (default: the `ARGS_FILE_NAME`
+   constant at the top of the file).
 2. Builds (or loads) the ED/GEP/QP dataset and saves it under `data/`.
 3. Trains the primal network and dual network using the Primal-Dual Learning
    (PDL) algorithm.
@@ -104,19 +105,38 @@ outputs/PDL/<problem_type>/<run_name>/repeat:<n>/
 
 ### How to run
 
-**Step 1.** Open [main.py](main.py) and set `ARGS_FILE_NAME` near the top to
-the config file you want:
-
-```python
-# main.py, line ~20
-ARGS_FILE_NAME = "configs/config.json"        # 3-node  (default)
-```
-
-**Step 2.** Run from the repository root:
+**Step 1.** Pick the config with `-c/--config` (it defaults to the 3-node
+`configs/config.json`):
 
 ```bash
-python main.py
+python main.py                                 # 3-node (default)
+python main.py -c configs/config-5node.json    # 5-node
 ```
+
+**Step 2.** Choose where data and outputs live. With no flags both default to
+the current directory, which reproduces the historical behavior:
+
+```bash
+python main.py                                 # ./data and ./outputs
+python main.py --home-path "$SCRATCH/thesis"   # both under scratch
+python main.py --data-root . \
+               --output-root "$SCRATCH/runs/$SLURM_JOB_ID"   # shared data, per-job outputs
+```
+
+Config files (`configs/`) and input CSVs (`inputs/`) always resolve against the
+repository, so these commands work from any working directory — a SLURM script
+does not need to `cd` first.
+
+On a compute node without outbound network, log W&B offline and sync later:
+
+```bash
+python main.py --home-path "$SCRATCH/thesis" --wandb-mode offline \
+               --wandb-group "$SLURM_JOB_ID"
+# then, from a login node:
+wandb sync "$SCRATCH/thesis/wandb/offline-run-"*
+```
+
+Run `python main.py --help` for the full flag list.
 
 If the dataset for the chosen configuration does not yet exist, `main.py`
 generates it automatically before training begins (this can take several
@@ -181,15 +201,27 @@ ignored for `single` and `full`.
 
 ```bash
 # Benders decomposition — uses model paths from Benders_args in the JSON
-python gep_benders.py --config config.json
-python gep_benders.py --config config-4node.json
-python gep_benders.py --config config-6node.json
+python gep_benders.py --config configs/config.json
+python gep_benders.py --config configs/config-4node.json
+python gep_benders.py --config configs/config-6node.json
 
 # Solve the full GEP as a single MIP (no Benders, no neural net needed)
-python gep_benders.py --config config.json -s
+python gep_benders.py --config configs/config.json -s
 ```
 
-All commands must be run from the **repository root**.
+It takes the same `--home-path` / `--data-root` / `--output-root` flags as
+`main.py`, plus overrides for the trained nets it loads:
+
+```bash
+python gep_benders.py -c configs/config.json \
+  --home-path      "$SCRATCH/thesis" \
+  --primal-net-dir "$SCRATCH/runs/12345/outputs/PDL/ED/<run>/repeat:0" \
+  --dual-net-dir   "$SCRATCH/runs/12345/outputs/PDL/ED/<run>/repeat:0"
+```
+
+Without those two flags the directories come from `Benders_args` in the JSON,
+resolved under the output root. The node count is derived from the config's
+`Benders_args.N`, so any spelling of the config path works.
 
 ### Outputs
 
@@ -284,8 +316,7 @@ conda activate {env_name}
 pip install -r requirements.txt
 
 # 2. Train the PDL models (generates dataset if needed, then trains)
-#    ARGS_FILE_NAME = "config.json" must be set in main.py
-python main.py
+python main.py -c configs/config.json
 
 # 3. Find the run folder (printed at the start of training)
 #    e.g. outputs/PDL/ED/learn_primal:True_.../repeat:0/
@@ -295,10 +326,10 @@ python main.py
 #    "dual_net_directory":   "outputs/PDL/ED/learn_primal:True_.../repeat:0"
 
 # 5. Run Benders (Inexact with exact refinement, as set in config.json)
-python gep_benders.py --config config.json
+python gep_benders.py --config configs/config.json
 
 # 6. Or run the exact Gurobi baseline
-python gep_benders.py --config config.json --solve-direct
+python gep_benders.py --config configs/config.json --solve-direct
 ```
 
 ---
@@ -409,11 +440,15 @@ Stage 1.
 
 ## Notes
 
-- Always run commands from the **repository root**: several scripts use
-  relative paths to `data/`, `outputs/`, and `inputs/`.
-- `main.py` selects its config via the `ARGS_FILE_NAME` constant (not a
-  CLI argument). Edit the constant directly before running.
-- `gep_benders.py` selects its config via `--config` on the command line.
+- `main.py` and `gep_benders.py` can be run from any working directory:
+  `configs/` and `inputs/` are resolved against the repository. Other scripts
+  in this repo still use relative paths and expect the **repository root**.
+- Both entry points select their config with `-c/--config`, and place `data/`
+  and `outputs/` with `--home-path` (or the finer `--data-root` /
+  `--output-root`). With no flags both roots are the current directory.
+- Root resolution order, highest first: `--data-root`/`--output-root`,
+  `--home-path`, the config's `data_root`/`output_root`, `$DATA_ROOT`/
+  `$OUTPUT_ROOT`, the config's `home_path`, `$PDL_HOME`, then `.`.
 - Dataset and model filenames encode experiment settings and can be long; this
   is intentional so that different configurations do not overwrite each other.
 - Model weights from different node counts are **not interchangeable**: a
