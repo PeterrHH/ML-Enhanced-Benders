@@ -228,3 +228,4 @@ experiment-output/
 GraphMethod-Exploration/
 note.md
 wandb/*
+requiremenets_*.txt
