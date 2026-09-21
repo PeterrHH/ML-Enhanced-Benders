@@ -1,4 +1,4 @@
-import argparse, os, glob, pickle, copy, time
+import argparse, os, glob, pickle, copy, re, time
 import numpy as np
 import torch
 import json
@@ -13,6 +13,7 @@ from gep_problem_operational import GEPOperationalProblemSet
 from paths import (
     add_path_args,
     ensure_dir,
+    harvest_path,
     resolve_roots,
     topology_tag,
     under_repo,
@@ -67,15 +68,33 @@ else:
     #! No match: fall back to the default name so the error below can print it.
     DIR = _candidates[0] if _candidates else f"{_stem}_H{HORIZON}"
 
-#! Taken from the config rather than a constant of our own, so that what this
-#! stage WRITES is by construction what main.py later READS. With a hardcoded
-#! filename a 20-node harvest silently overwrote the 3-node one.
-ED_OUT = under_root(args["ED_args"]["direct_data_path"], data_root)
+#! The horizon we are actually reading, taken from the directory name rather
+#! than assumed, so the harvest is labelled with the horizon that produced it.
+_match = re.search(r"_H(\d+)$", os.path.basename(DIR))
+HORIZON = int(_match.group(1)) if _match else HORIZON
+
+#! Name derived from topology + horizon so harvests never collide.
+RELATIVE_OUT = harvest_path(args, HORIZON)
+ED_OUT = under_root(RELATIVE_OUT, data_root)
 ensure_dir(os.path.dirname(ED_OUT))
 
 print(f"Run config: {under_repo(cli_args.config)}")
 print(f"Instances:  {DIR}")
-print(f"Harvest to: {ED_OUT}   (ED_args.direct_data_path)")
+print(f"Harvest to: {ED_OUT}")
+
+#! main.py reads ED_args.direct_data_path. If it does not name the file we are
+#! about to write, training would load something else entirely -- say so now
+#! rather than let it be discovered three stages later.
+_configured = args["ED_args"].get("direct_data_path")
+if _configured and os.path.normpath(_configured) != os.path.normpath(RELATIVE_OUT):
+    print(
+        f"[warn] this config's ED_args.direct_data_path is\n"
+        f"           {_configured}\n"
+        f"       but this harvest will be written to\n"
+        f"           {RELATIVE_OUT}\n"
+        f"       main.py reads the former, so set it to the latter "
+        f"(or re-run stage 1 at horizon {args['Benders_args']['sample_duration']})."
+    )
 
 SPLIT_SEED = 42   # near your other knobs at the top, for reproducibility
 N_HOUR_CLUSTERS   = 20    # representative hour-groups per instance

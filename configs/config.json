@@ -44,7 +44,7 @@
         "heuristic_lambda_tier2_confidence": 0.10,
 
         "use_direct_data": true,
-        "direct_data_path": "data/ED_data_gen/harvested_training_data_perturb_mix.pkl"
+        "direct_data_path": "data/ED_data_gen/GEP_train_data_N3_G6_L3_H219.pkl"
     },
 
     "Benders_args": {

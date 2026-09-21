@@ -70,6 +70,21 @@ def topology_tag(args, section="Benders_args"):
     return f"N{len(topology['N'])}_G{len(topology['G'])}_L{len(topology['L'])}"
 
 
+def harvest_path(args, horizon=None, section="Benders_args"):
+    """Where the harvested ED training set for this config belongs.
+
+    'data/ED_data_gen/GEP_train_data_N3_G6_L3_H219.pkl' -- topology and horizon
+    in the name, so harvests from different experiments never collide and you
+    can tell what a file holds without opening it.
+
+    `horizon` defaults to the config's own Benders_args.sample_duration, which
+    is what stage 1 uses unless you override it with --horizon.
+    """
+    if horizon is None:
+        horizon = args[section]["sample_duration"]
+    return f"data/ED_data_gen/GEP_train_data_{topology_tag(args, section)}_H{horizon}.pkl"
+
+
 def add_path_args(parser):
     """Register --home-path / --data-root / --output-root on an ArgumentParser."""
     parser.add_argument(
