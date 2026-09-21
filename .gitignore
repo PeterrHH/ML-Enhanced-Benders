@@ -230,3 +230,4 @@ note.md
 wandb/*
 requiremenets_*.txt
 tests/*
+GurobiKey/*

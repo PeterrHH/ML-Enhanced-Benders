@@ -397,6 +397,9 @@ class BendersSolver():
         self.investment_init_method = init_investment # Zero by Default, also option: "HalfMax"
         self.env = gp.Env(empty=True)
         self.env.setParam("OutputFlag", 0)
+        lic = os.environ.get("GRB_LICENSE_FILE")
+        if lic and os.path.exists(lic):
+            self.env.setParam("LicenseFile", lic)
         self.env.start()
 
 
