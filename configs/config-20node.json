@@ -1,0 +1,1454 @@
+{
+    "problem_type": "ED",
+    "QP_args": {
+        "type": [
+            "simple",
+            "row",
+            "column",
+            "random",
+            "obj"
+        ],
+        "var": 100,
+        "ineq": 50,
+        "eq": 50,
+        "num_samples": 10000,
+        "repeats": 5,
+        "random_hyperparams": false
+    },
+    "ED_args": {
+        "N": [
+            "AUS",
+            "BEL",
+            "BLK",
+            "BLT",
+            "CZE",
+            "DEN",
+            "FIN",
+            "FRA",
+            "GER",
+            "IRE",
+            "ITA",
+            "NED",
+            "NOR",
+            "POL",
+            "POR",
+            "SKO",
+            "SPA",
+            "SWE",
+            "SWI",
+            "UKI"
+        ],
+        "G": [
+            [
+                "AUS",
+                "Gas"
+            ],
+            [
+                "AUS",
+                "Oil"
+            ],
+            [
+                "AUS",
+                "SunPV"
+            ],
+            [
+                "AUS",
+                "WindOff"
+            ],
+            [
+                "AUS",
+                "WindOn"
+            ],
+            [
+                "BEL",
+                "Gas"
+            ],
+            [
+                "BEL",
+                "Oil"
+            ],
+            [
+                "BEL",
+                "SunPV"
+            ],
+            [
+                "BEL",
+                "WindOff"
+            ],
+            [
+                "BEL",
+                "WindOn"
+            ],
+            [
+                "BLK",
+                "Coal"
+            ],
+            [
+                "BLK",
+                "Gas"
+            ],
+            [
+                "BLK",
+                "Lignite"
+            ],
+            [
+                "BLK",
+                "Nuclear"
+            ],
+            [
+                "BLK",
+                "Oil"
+            ],
+            [
+                "BLK",
+                "SunPV"
+            ],
+            [
+                "BLK",
+                "WindOff"
+            ],
+            [
+                "BLK",
+                "WindOn"
+            ],
+            [
+                "BLT",
+                "Gas"
+            ],
+            [
+                "BLT",
+                "Oil"
+            ],
+            [
+                "BLT",
+                "SunPV"
+            ],
+            [
+                "BLT",
+                "WindOff"
+            ],
+            [
+                "BLT",
+                "WindOn"
+            ],
+            [
+                "CZE",
+                "Coal"
+            ],
+            [
+                "CZE",
+                "Gas"
+            ],
+            [
+                "CZE",
+                "Lignite"
+            ],
+            [
+                "CZE",
+                "Nuclear"
+            ],
+            [
+                "CZE",
+                "SunPV"
+            ],
+            [
+                "CZE",
+                "WindOff"
+            ],
+            [
+                "CZE",
+                "WindOn"
+            ],
+            [
+                "DEN",
+                "Gas"
+            ],
+            [
+                "DEN",
+                "Oil"
+            ],
+            [
+                "DEN",
+                "SunPV"
+            ],
+            [
+                "DEN",
+                "WindOff"
+            ],
+            [
+                "DEN",
+                "WindOn"
+            ],
+            [
+                "FIN",
+                "Gas"
+            ],
+            [
+                "FIN",
+                "Nuclear"
+            ],
+            [
+                "FIN",
+                "SunPV"
+            ],
+            [
+                "FIN",
+                "WindOff"
+            ],
+            [
+                "FIN",
+                "WindOn"
+            ],
+            [
+                "FRA",
+                "Gas"
+            ],
+            [
+                "FRA",
+                "Nuclear"
+            ],
+            [
+                "FRA",
+                "Oil"
+            ],
+            [
+                "FRA",
+                "SunPV"
+            ],
+            [
+                "FRA",
+                "WindOff"
+            ],
+            [
+                "FRA",
+                "WindOn"
+            ],
+            [
+                "GER",
+                "Coal"
+            ],
+            [
+                "GER",
+                "Gas"
+            ],
+            [
+                "GER",
+                "Lignite"
+            ],
+            [
+                "GER",
+                "Oil"
+            ],
+            [
+                "GER",
+                "SunPV"
+            ],
+            [
+                "GER",
+                "WindOff"
+            ],
+            [
+                "GER",
+                "WindOn"
+            ],
+            [
+                "IRE",
+                "Coal"
+            ],
+            [
+                "IRE",
+                "Gas"
+            ],
+            [
+                "IRE",
+                "Oil"
+            ],
+            [
+                "IRE",
+                "SunPV"
+            ],
+            [
+                "IRE",
+                "WindOff"
+            ],
+            [
+                "IRE",
+                "WindOn"
+            ],
+            [
+                "ITA",
+                "Gas"
+            ],
+            [
+                "ITA",
+                "SunPV"
+            ],
+            [
+                "ITA",
+                "WindOff"
+            ],
+            [
+                "ITA",
+                "WindOn"
+            ],
+            [
+                "NED",
+                "SunPV"
+            ],
+            [
+                "NED",
+                "WindOff"
+            ],
+            [
+                "NED",
+                "WindOn"
+            ],
+            [
+                "NOR",
+                "SunPV"
+            ],
+            [
+                "NOR",
+                "WindOff"
+            ],
+            [
+                "NOR",
+                "WindOn"
+            ],
+            [
+                "POL",
+                "Coal"
+            ],
+            [
+                "POL",
+                "Gas"
+            ],
+            [
+                "POL",
+                "Lignite"
+            ],
+            [
+                "POL",
+                "SunPV"
+            ],
+            [
+                "POL",
+                "WindOff"
+            ],
+            [
+                "POL",
+                "WindOn"
+            ],
+            [
+                "POR",
+                "Gas"
+            ],
+            [
+                "POR",
+                "SunPV"
+            ],
+            [
+                "POR",
+                "WindOff"
+            ],
+            [
+                "POR",
+                "WindOn"
+            ],
+            [
+                "SKO",
+                "Coal"
+            ],
+            [
+                "SKO",
+                "Gas"
+            ],
+            [
+                "SKO",
+                "Lignite"
+            ],
+            [
+                "SKO",
+                "Nuclear"
+            ],
+            [
+                "SKO",
+                "Oil"
+            ],
+            [
+                "SKO",
+                "SunPV"
+            ],
+            [
+                "SKO",
+                "WindOff"
+            ],
+            [
+                "SKO",
+                "WindOn"
+            ],
+            [
+                "SPA",
+                "Gas"
+            ],
+            [
+                "SPA",
+                "Nuclear"
+            ],
+            [
+                "SPA",
+                "SunPV"
+            ],
+            [
+                "SPA",
+                "WindOff"
+            ],
+            [
+                "SPA",
+                "WindOn"
+            ],
+            [
+                "SWE",
+                "Gas"
+            ],
+            [
+                "SWE",
+                "Nuclear"
+            ],
+            [
+                "SWE",
+                "SunPV"
+            ],
+            [
+                "SWE",
+                "WindOff"
+            ],
+            [
+                "SWE",
+                "WindOn"
+            ],
+            [
+                "SWI",
+                "Nuclear"
+            ],
+            [
+                "SWI",
+                "SunPV"
+            ],
+            [
+                "SWI",
+                "WindOff"
+            ],
+            [
+                "SWI",
+                "WindOn"
+            ],
+            [
+                "UKI",
+                "Gas"
+            ],
+            [
+                "UKI",
+                "Nuclear"
+            ],
+            [
+                "UKI",
+                "Oil"
+            ],
+            [
+                "UKI",
+                "SunPV"
+            ],
+            [
+                "UKI",
+                "WindOff"
+            ],
+            [
+                "UKI",
+                "WindOn"
+            ]
+        ],
+        "L": [
+            [
+                "AUS",
+                "BLK"
+            ],
+            [
+                "AUS",
+                "CZE"
+            ],
+            [
+                "AUS",
+                "GER"
+            ],
+            [
+                "AUS",
+                "ITA"
+            ],
+            [
+                "AUS",
+                "SWI"
+            ],
+            [
+                "BEL",
+                "FRA"
+            ],
+            [
+                "BEL",
+                "NED"
+            ],
+            [
+                "BLK",
+                "SKO"
+            ],
+            [
+                "BLK",
+                "ITA"
+            ],
+            [
+                "CZE",
+                "GER"
+            ],
+            [
+                "CZE",
+                "SKO"
+            ],
+            [
+                "DEN",
+                "SWE"
+            ],
+            [
+                "FIN",
+                "SWE"
+            ],
+            [
+                "FRA",
+                "ITA"
+            ],
+            [
+                "GER",
+                "DEN"
+            ],
+            [
+                "GER",
+                "FRA"
+            ],
+            [
+                "GER",
+                "NED"
+            ],
+            [
+                "POL",
+                "CZE"
+            ],
+            [
+                "POL",
+                "GER"
+            ],
+            [
+                "POL",
+                "SKO"
+            ],
+            [
+                "SPA",
+                "FRA"
+            ],
+            [
+                "SPA",
+                "POR"
+            ],
+            [
+                "SWE",
+                "NOR"
+            ],
+            [
+                "SWI",
+                "FRA"
+            ],
+            [
+                "SWI",
+                "GER"
+            ],
+            [
+                "SWI",
+                "ITA"
+            ],
+            [
+                "UKI",
+                "IRE"
+            ],
+            [
+                "BEL",
+                "GER"
+            ],
+            [
+                "BEL",
+                "UKI"
+            ],
+            [
+                "BLT",
+                "FIN"
+            ],
+            [
+                "BLT",
+                "POL"
+            ],
+            [
+                "BLT",
+                "SWE"
+            ],
+            [
+                "GER",
+                "UKI"
+            ],
+            [
+                "GER",
+                "NOR"
+            ],
+            [
+                "GER",
+                "SWE"
+            ],
+            [
+                "DEN",
+                "NOR"
+            ],
+            [
+                "DEN",
+                "UKI"
+            ],
+            [
+                "DEN",
+                "NED"
+            ],
+            [
+                "FRA",
+                "UKI"
+            ],
+            [
+                "FRA",
+                "IRE"
+            ],
+            [
+                "NED",
+                "UKI"
+            ],
+            [
+                "NED",
+                "NOR"
+            ],
+            [
+                "NOR",
+                "UKI"
+            ],
+            [
+                "POL",
+                "SWE"
+            ]
+        ],
+        "benders_compact": false,
+        "scale_problem": false,
+        "scale_input": false,
+        "perturb_operating_costs": false,
+        "sample_duration": 1,
+        "max_investment": 1000,
+        "2n_synthetic_samples": 15,
+        "synthetic_demand_capacity": false,
+        "normalize_input": true,
+        "repeats": 2,
+        "device": "auto",
+        "gen_data_constraint": false,
+        "gen_data_constraint_lb": false,
+        "gen_data_constraint_lb_alpha": 0.1,
+        "gen_data_constraint_lb_renewable_zero": true,
+        "gen_data_constraint_ub_renewable_max_inv": true,
+        "_comment": "renewable max inv means for renewabels UB is set to max investment if True, if False, UB is set to min(production capacity, max investment)",
+        "gen_data_renew_availability": 100,
+        "_GenAvailablity_comment": "if = 100, availability is the max(availablity) for the renewable, if < 100, availability is set to the specified percentile of availability in the original data",
+        "specific_name": "20Node_x8",
+        "gen_data_node_constraint": false,
+        "generate_capacity_sobol": false,
+        "capacity_sobol_use_hard_cap": false,
+        "precompute_heuristic_lambda_labels": true,
+        "heuristic_lambda_main_mass": 0.99,
+        "heuristic_lambda_unmet_safety_mass": 0.02,
+        "heuristic_lambda_tier2_confidence": 0.1,
+        "use_direct_data": true,
+        "direct_data_path": "data/ED_data_gen/harvested_training_data_20node.pkl"
+    },
+    "Benders_args": {
+        "N": [
+            "AUS",
+            "BEL",
+            "BLK",
+            "BLT",
+            "CZE",
+            "DEN",
+            "FIN",
+            "FRA",
+            "GER",
+            "IRE",
+            "ITA",
+            "NED",
+            "NOR",
+            "POL",
+            "POR",
+            "SKO",
+            "SPA",
+            "SWE",
+            "SWI",
+            "UKI"
+        ],
+        "G": [
+            [
+                "AUS",
+                "Gas"
+            ],
+            [
+                "AUS",
+                "Oil"
+            ],
+            [
+                "AUS",
+                "SunPV"
+            ],
+            [
+                "AUS",
+                "WindOff"
+            ],
+            [
+                "AUS",
+                "WindOn"
+            ],
+            [
+                "BEL",
+                "Gas"
+            ],
+            [
+                "BEL",
+                "Oil"
+            ],
+            [
+                "BEL",
+                "SunPV"
+            ],
+            [
+                "BEL",
+                "WindOff"
+            ],
+            [
+                "BEL",
+                "WindOn"
+            ],
+            [
+                "BLK",
+                "Coal"
+            ],
+            [
+                "BLK",
+                "Gas"
+            ],
+            [
+                "BLK",
+                "Lignite"
+            ],
+            [
+                "BLK",
+                "Nuclear"
+            ],
+            [
+                "BLK",
+                "Oil"
+            ],
+            [
+                "BLK",
+                "SunPV"
+            ],
+            [
+                "BLK",
+                "WindOff"
+            ],
+            [
+                "BLK",
+                "WindOn"
+            ],
+            [
+                "BLT",
+                "Gas"
+            ],
+            [
+                "BLT",
+                "Oil"
+            ],
+            [
+                "BLT",
+                "SunPV"
+            ],
+            [
+                "BLT",
+                "WindOff"
+            ],
+            [
+                "BLT",
+                "WindOn"
+            ],
+            [
+                "CZE",
+                "Coal"
+            ],
+            [
+                "CZE",
+                "Gas"
+            ],
+            [
+                "CZE",
+                "Lignite"
+            ],
+            [
+                "CZE",
+                "Nuclear"
+            ],
+            [
+                "CZE",
+                "SunPV"
+            ],
+            [
+                "CZE",
+                "WindOff"
+            ],
+            [
+                "CZE",
+                "WindOn"
+            ],
+            [
+                "DEN",
+                "Gas"
+            ],
+            [
+                "DEN",
+                "Oil"
+            ],
+            [
+                "DEN",
+                "SunPV"
+            ],
+            [
+                "DEN",
+                "WindOff"
+            ],
+            [
+                "DEN",
+                "WindOn"
+            ],
+            [
+                "FIN",
+                "Gas"
+            ],
+            [
+                "FIN",
+                "Nuclear"
+            ],
+            [
+                "FIN",
+                "SunPV"
+            ],
+            [
+                "FIN",
+                "WindOff"
+            ],
+            [
+                "FIN",
+                "WindOn"
+            ],
+            [
+                "FRA",
+                "Gas"
+            ],
+            [
+                "FRA",
+                "Nuclear"
+            ],
+            [
+                "FRA",
+                "Oil"
+            ],
+            [
+                "FRA",
+                "SunPV"
+            ],
+            [
+                "FRA",
+                "WindOff"
+            ],
+            [
+                "FRA",
+                "WindOn"
+            ],
+            [
+                "GER",
+                "Coal"
+            ],
+            [
+                "GER",
+                "Gas"
+            ],
+            [
+                "GER",
+                "Lignite"
+            ],
+            [
+                "GER",
+                "Oil"
+            ],
+            [
+                "GER",
+                "SunPV"
+            ],
+            [
+                "GER",
+                "WindOff"
+            ],
+            [
+                "GER",
+                "WindOn"
+            ],
+            [
+                "IRE",
+                "Coal"
+            ],
+            [
+                "IRE",
+                "Gas"
+            ],
+            [
+                "IRE",
+                "Oil"
+            ],
+            [
+                "IRE",
+                "SunPV"
+            ],
+            [
+                "IRE",
+                "WindOff"
+            ],
+            [
+                "IRE",
+                "WindOn"
+            ],
+            [
+                "ITA",
+                "Gas"
+            ],
+            [
+                "ITA",
+                "SunPV"
+            ],
+            [
+                "ITA",
+                "WindOff"
+            ],
+            [
+                "ITA",
+                "WindOn"
+            ],
+            [
+                "NED",
+                "SunPV"
+            ],
+            [
+                "NED",
+                "WindOff"
+            ],
+            [
+                "NED",
+                "WindOn"
+            ],
+            [
+                "NOR",
+                "SunPV"
+            ],
+            [
+                "NOR",
+                "WindOff"
+            ],
+            [
+                "NOR",
+                "WindOn"
+            ],
+            [
+                "POL",
+                "Coal"
+            ],
+            [
+                "POL",
+                "Gas"
+            ],
+            [
+                "POL",
+                "Lignite"
+            ],
+            [
+                "POL",
+                "SunPV"
+            ],
+            [
+                "POL",
+                "WindOff"
+            ],
+            [
+                "POL",
+                "WindOn"
+            ],
+            [
+                "POR",
+                "Gas"
+            ],
+            [
+                "POR",
+                "SunPV"
+            ],
+            [
+                "POR",
+                "WindOff"
+            ],
+            [
+                "POR",
+                "WindOn"
+            ],
+            [
+                "SKO",
+                "Coal"
+            ],
+            [
+                "SKO",
+                "Gas"
+            ],
+            [
+                "SKO",
+                "Lignite"
+            ],
+            [
+                "SKO",
+                "Nuclear"
+            ],
+            [
+                "SKO",
+                "Oil"
+            ],
+            [
+                "SKO",
+                "SunPV"
+            ],
+            [
+                "SKO",
+                "WindOff"
+            ],
+            [
+                "SKO",
+                "WindOn"
+            ],
+            [
+                "SPA",
+                "Gas"
+            ],
+            [
+                "SPA",
+                "Nuclear"
+            ],
+            [
+                "SPA",
+                "SunPV"
+            ],
+            [
+                "SPA",
+                "WindOff"
+            ],
+            [
+                "SPA",
+                "WindOn"
+            ],
+            [
+                "SWE",
+                "Gas"
+            ],
+            [
+                "SWE",
+                "Nuclear"
+            ],
+            [
+                "SWE",
+                "SunPV"
+            ],
+            [
+                "SWE",
+                "WindOff"
+            ],
+            [
+                "SWE",
+                "WindOn"
+            ],
+            [
+                "SWI",
+                "Nuclear"
+            ],
+            [
+                "SWI",
+                "SunPV"
+            ],
+            [
+                "SWI",
+                "WindOff"
+            ],
+            [
+                "SWI",
+                "WindOn"
+            ],
+            [
+                "UKI",
+                "Gas"
+            ],
+            [
+                "UKI",
+                "Nuclear"
+            ],
+            [
+                "UKI",
+                "Oil"
+            ],
+            [
+                "UKI",
+                "SunPV"
+            ],
+            [
+                "UKI",
+                "WindOff"
+            ],
+            [
+                "UKI",
+                "WindOn"
+            ]
+        ],
+        "L": [
+            [
+                "AUS",
+                "BLK"
+            ],
+            [
+                "AUS",
+                "CZE"
+            ],
+            [
+                "AUS",
+                "GER"
+            ],
+            [
+                "AUS",
+                "ITA"
+            ],
+            [
+                "AUS",
+                "SWI"
+            ],
+            [
+                "BEL",
+                "FRA"
+            ],
+            [
+                "BEL",
+                "NED"
+            ],
+            [
+                "BLK",
+                "SKO"
+            ],
+            [
+                "BLK",
+                "ITA"
+            ],
+            [
+                "CZE",
+                "GER"
+            ],
+            [
+                "CZE",
+                "SKO"
+            ],
+            [
+                "DEN",
+                "SWE"
+            ],
+            [
+                "FIN",
+                "SWE"
+            ],
+            [
+                "FRA",
+                "ITA"
+            ],
+            [
+                "GER",
+                "DEN"
+            ],
+            [
+                "GER",
+                "FRA"
+            ],
+            [
+                "GER",
+                "NED"
+            ],
+            [
+                "POL",
+                "CZE"
+            ],
+            [
+                "POL",
+                "GER"
+            ],
+            [
+                "POL",
+                "SKO"
+            ],
+            [
+                "SPA",
+                "FRA"
+            ],
+            [
+                "SPA",
+                "POR"
+            ],
+            [
+                "SWE",
+                "NOR"
+            ],
+            [
+                "SWI",
+                "FRA"
+            ],
+            [
+                "SWI",
+                "GER"
+            ],
+            [
+                "SWI",
+                "ITA"
+            ],
+            [
+                "UKI",
+                "IRE"
+            ],
+            [
+                "BEL",
+                "GER"
+            ],
+            [
+                "BEL",
+                "UKI"
+            ],
+            [
+                "BLT",
+                "FIN"
+            ],
+            [
+                "BLT",
+                "POL"
+            ],
+            [
+                "BLT",
+                "SWE"
+            ],
+            [
+                "GER",
+                "UKI"
+            ],
+            [
+                "GER",
+                "NOR"
+            ],
+            [
+                "GER",
+                "SWE"
+            ],
+            [
+                "DEN",
+                "NOR"
+            ],
+            [
+                "DEN",
+                "UKI"
+            ],
+            [
+                "DEN",
+                "NED"
+            ],
+            [
+                "FRA",
+                "UKI"
+            ],
+            [
+                "FRA",
+                "IRE"
+            ],
+            [
+                "NED",
+                "UKI"
+            ],
+            [
+                "NED",
+                "NOR"
+            ],
+            [
+                "NOR",
+                "UKI"
+            ],
+            [
+                "POL",
+                "SWE"
+            ]
+        ],
+        "benders_compact": false,
+        "scale_problem": false,
+        "scale_input": false,
+        "perturb_operating_costs": false,
+        "sample_duration": 219,
+        "_comment_sample_duration": "Max sample duration is 8760",
+        "max_investment": 100000,
+        "2n_synthetic_samples": 15,
+        "synthetic_demand_capacity": false,
+        "normalize_input": false,
+        "repeats": 1,
+        "device": "cpu",
+        "primal_net_directory": "outputs/PDL/ED/20Node/REPLACE_WITH_YOUR_RUN/repeat:0",
+        "dual_net_directory": "outputs/PDL/ED/20Node/REPLACE_WITH_YOUR_RUN/repeat:0",
+        "exp_save_directory": "outputs/Benders/20Node",
+        "specific_name": "20Node_x8",
+        "benders_setup": "Exact",
+        "_Comment_benders_setup": "Benders setup options: [Exact, Inexact, Inexact_Refine, All], All is when all three are run",
+        "init_investment": "Zero",
+        "_Comment_init_investment": "Options for initial investment solution for Benders: Zero, HalfMax",
+        "cut_selection": "kmeans_dynamic_shared",
+        "cut_selection_k": 10,
+        "bound_alpha_by_0": true,
+        "_cut_selection_comment": "Options are: single, kmeans, stress, full, kmeans_dynamic (adapt-G-I, per-timestep recourse), kmeans_dynamic_shared (adapt-G-S, per-group recourse)",
+        "dynamic_cluster_features": "capacity",
+        "_dynamic_cluster_features_comment": "Features for kmeans_dynamic(_shared): price (nodal shadow prices), slope (cut slopes) or capacity ([D, A*Pmax*u] at the current investment)",
+        "parallel_subproblems": false,
+        "n_workers": null
+    },
+    "Optuna_args": {
+        "optuna": false,
+        "optuna_trials": 50,
+        "batch_size": [
+            2048,
+            4096
+        ],
+        "primal_lr": [
+            1e-05,
+            0.001
+        ],
+        "dual_lr": [
+            1e-05,
+            0.001
+        ],
+        "decay": [
+            0.98,
+            0.999
+        ],
+        "patience": [
+            5,
+            20
+        ],
+        "hidden_size_factor": [
+            2,
+            50
+        ],
+        "n_layers": [
+            2,
+            8
+        ]
+    },
+    "device": "auto",
+    "tau": 0.8,
+    "rho": 0.5,
+    "rho_max": 5000,
+    "penalty": "Single",
+    "_comment_penalty": "Penalty option: Single (penalize only primal violation), Per_Const (individual penalty with a rho value per constraint)",
+    "use_primal_penalty": false,
+    "use_blend_repair": false,
+    "alpha": 10,
+    "outer_iterations": 200,
+    "inner_iterations": 10,
+    "batch_size": 2000,
+    "primal_lr": 0.0001,
+    "dual_lr": 0.0001,
+    "decay": 0.99,
+    "patience": 10,
+    "hidden_size": 500,
+    "hidden_size_factor": false,
+    "n_layers": 2,
+    "train": 0.8,
+    "valid": 0.1,
+    "test": 0.1,
+    "learn_primal": true,
+    "learn_dual": true,
+    "dual_alternate_loss": true,
+    "dual_completion": true,
+    "snap_lambda_dual_completion": false,
+    "dual_classification": false,
+    "normalize_by_gt": false,
+    "loss_option": "Original",
+    "_Comments": "loss option: Original, Norm_GT (Normalize by ground truth obj), Norm_Obj (Normalize by obj), Duality_Gap, Log",
+    "flow_scale_by_prod": false,
+    "_Flow_scale_by_prod_Comment": "If true, scale line flow repair bounds based on production capacity at nodes. (More restrictive.)",
+    "scale_sigmoid": false,
+    "shifted_sigmoid_scale": false,
+    "repair_scaler": "Sigmoid",
+    "_Comment": "RepairLayer Scaler Option: Sigmoid, ScaledSigmoid , ShiftedScaledSigmoid, SoftPlus",
+    "k": 100.0,
+    "soft_plus_k": 10.0,
+    "opt_targets": true,
+    "clip_gradients_norm": 0,
+    "log": true,
+    "log_frequency": 10,
+    "use_tensorboard": true,
+    "use_wandb": true,
+    "wandb_project": "MLBenders",
+    "wandb_entity": null,
+    "wandb_mode": "online",
+    "wandb_group": null,
+    "_comment_wandb_group": "optional label to cluster related runs on one chart, e.g. dual-cls-ablation",
+    "wandb_watch_freq": 100,
+    "layernorm": true,
+    "repair": true,
+    "repair_bounds": true,
+    "repair_completion": true,
+    "repair_power_balance": true,
+    "max_violation_save_thresholds": [],
+    "early_stopping_patience": 0,
+    "dual_regularization": "NA",
+    "_comment_dual_reg": "Option: [NA, S3L, S3L-complete-only]",
+    "mu_barrier_init": 1.0,
+    "mu_barrier_decay": 0.95,
+    "mu_barrier_min": 0.0001,
+    "clamp_lambda": false,
+    "dual_gumbel": false,
+    "gumbel_tau_init": 0.8,
+    "gumbel_tau_decay": 0.9,
+    "gumbel_tau_min": 0.3,
+    "use_prod_surplus_input": false,
+    "SeperatePredicationHead": false,
+    "oracle_loss_weight": false,
+    "oracle_weight_alpha": 5.0,
+    "oracle_supervised_dual": false,
+    "entropy_in_loss": false,
+    "entropy_weight": 10.0,
+    "use_difficulty_weighting": false,
+    "difficulty_weight_scale": 1.0,
+    "difficulty_weight_clamp_min": 0.3,
+    "difficulty_weight_clamp_max": 3.0,
+    "use_topology_features": false,
+    "use_heuristic_lambda_loss": false,
+    "heuristic_lambda_weight": 10.0,
+    "train_count": 26142
+}

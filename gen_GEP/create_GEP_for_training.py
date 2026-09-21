@@ -1,25 +1,23 @@
-import copy, pickle, os, sys, json
+import argparse, copy, pickle, os, sys, json
 import numpy as np
 import pandas as pd
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from create_gep_dataset import create_gep_ed_dataset
 from gep_config_parser import parse_config
+from paths import add_path_args, ensure_dir, resolve_roots, under_repo, under_root
 
 # ======================================================================
 # 5. Driver config
 # ======================================================================
-COUNTRIES   = ["BEL", "GER", "FRA"]
 HORIZON     = 219
 N_INSTANCES = 80
 MASTER_SEED = 42
 OUT_DIR     = "data/GEP_for_training_perturb_mix"
-POOL_TIMES  = None            # <-- Could be used to restrict the pool of hours for sampling 
+POOL_TIMES  = None            # <-- Could be used to restrict the pool of hours for sampling
 
 USE_CLASS_MIXTURE = True       # True: renewable-heavy/high-demand/middle mixture
                                # False: original pure-random perturbation
 RENEWABLE_FRAC    = 0.4        # (class mixture only) share of renewable-heavy instances
-
-os.makedirs(OUT_DIR, exist_ok=True)
 
 # ======================================================================
 # 1. Pool
@@ -168,9 +166,42 @@ def sample_perturbation_mixture(rng, renewable_frac=0.4):
 # ======================================================================
 # Run
 # ======================================================================
-with open("configs/config.json", "r") as file:
+parser = argparse.ArgumentParser(
+    description="Build perturbed GEP instances for PDL training data harvesting."
+)
+add_path_args(parser)                       # --home-path / --data-root / --output-root
+parser.add_argument(
+    "-c", "--config",
+    default="configs/config.json",
+    help="Run config JSON. Relative paths resolve against the repository. "
+         "The topology (N/G/L) is read from its Benders_args.",
+)
+parser.add_argument(
+    "--toml-config", "--toml_config",
+    dest="toml_config",
+    default="configs/config.toml",
+    help="Input-data TOML config.",
+)
+cli_args = parser.parse_args()
+
+with open(under_repo(cli_args.config), "r") as file:
     args = json.load(file)
-input_data = parse_config("configs/config.toml")
+
+roots = resolve_roots(args, cli_args)
+data_root = roots["data_root"]
+OUT_DIR = ensure_dir(under_root(OUT_DIR, data_root))
+
+#! Derived from the config, not hardcoded: with a hardcoded 3-country list a
+#! 20-node config would silently pool only BEL/GER/FRA and build instances
+#! whose demand and availability do not match their own topology.
+COUNTRIES = list(dict.fromkeys(args["Benders_args"]["N"]))
+
+print(f"Run config: {under_repo(cli_args.config)}")
+print(f"Countries ({len(COUNTRIES)}): {COUNTRIES}")
+print(f"Generators: {len(args['Benders_args']['G'])}  Lines: {len(args['Benders_args']['L'])}")
+print(f"Output dir: {OUT_DIR}")
+
+input_data = parse_config(under_repo(cli_args.toml_config))
 gep_ed_data = input_data["experiment"]["experiments"][0]
 pool = precompute_pool(gep_ed_data, COUNTRIES, pool_times=POOL_TIMES)
 
