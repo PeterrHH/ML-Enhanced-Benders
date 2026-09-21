@@ -117,7 +117,8 @@ def build_operational_companion(gep_data, args):
         gep_data.pUnitCap, gep_data.pExpCap, gep_data.pImpCap,
         pUnitInvestment_Input=dummy_inv)
 
-def solve_and_harvest(instance_path, args, cut_selection="single", cut_selection_k=1):
+def solve_and_harvest(instance_path, args, cut_selection="single", cut_selection_k=1,
+                      check_licence=False):
     with open(instance_path, "rb") as f:
         gep_data = pickle.load(f)
     op = build_operational_companion(gep_data, args)
@@ -127,6 +128,8 @@ def solve_and_harvest(instance_path, args, cut_selection="single", cut_selection
         max_investment=args["Benders_args"]["max_investment"], init_investment="Zero",
         cut_selection=cut_selection, cut_selection_k=cut_selection_k,
         parallel_subproblems=False, n_workers=None)
+    if check_licence:
+        solver.check_licence(gep_data, label=f"{topology_tag(args)}, H{HORIZON}")
     t0 = time.time()
     y_direct, obj_direct = solver.solve_matrix_problem(gep_data, 0)
     ub, lb, cuts, inv_all, subobjs, iters = solver.solve_with_benders(gep_data, False, 0)
@@ -229,9 +232,11 @@ if not paths:
         f"-c {cli_args.config} --home-path {roots['home_path']}"
     )
 harvest = []
-for p in paths:
+for i, p in enumerate(paths):
     print(f"\n===== solving {os.path.basename(p)} =====")
-    h = solve_and_harvest(p, args, CUT_SELECTION, 1)
+    #! Only on the first instance: if the licence cannot take a model this
+    #! size it never will, and every instance here is the same shape.
+    h = solve_and_harvest(p, args, CUT_SELECTION, 1, check_licence=(i == 0))
     harvest.append(h)
     print(f"  iters={h['iterations']}  traj_pts={h['n_traj_points']}  "
           f"gap={h['gap_rel']:.2e}  wall={h['wall_sec']:.1f}s")

@@ -32,13 +32,69 @@ from concurrent.futures import ThreadPoolExecutor
 
 _thread_local = threading.local()
 
+#! Licence limits of the size-limited environment bundled with the pip
+#! gurobipy wheel. Anything past these needs a real licence.
+RESTRICTED_LICENCE_VARS = 2000
+RESTRICTED_LICENCE_CONSTRS = 2000
+
+
+def make_env(quiet=True):
+    """Start a Gurobi Env, honouring GRB_LICENSE_FILE.
+
+    Single place for this, so the per-thread worker envs and the solver's own
+    env cannot drift apart: the worker path used to skip the licence file
+    entirely, which only showed up once parallel_subproblems was enabled.
+    """
+    env = gp.Env(empty=True)
+    if quiet:
+        env.setParam("OutputFlag", 0)
+
+    lic = os.environ.get("GRB_LICENSE_FILE")
+    if lic:
+        if os.path.exists(lic):
+            env.setParam("LicenseFile", lic)
+        else:
+            #! gurobipy reads GRB_LICENSE_FILE itself at start() and refuses
+            #! outright when it names a missing file, so this is not a silent
+            #! fallback -- the point is to name the path plainly before the
+            #! GurobiError, which is easy to misread as "no licence at all".
+            print(
+                f"[gurobi] WARNING: GRB_LICENSE_FILE is set to '{lic}' but no such "
+                f"file exists. Gurobi will refuse to start. Unset the variable to "
+                f"use the default licence search, or point it at a real licence."
+            )
+    env.start()
+    return env
+
+
+_shared_env = None
+
+
+def get_shared_env():
+    """One Env reused across solvers on the main thread.
+
+    Callers that build many BendersSolvers in a loop -- gen_GEP/solve_for_train.py
+    makes one per GEP instance -- otherwise start one Env per instance and never
+    dispose of it. That is merely wasteful with a node-locked licence, but a WLS
+    licence authenticates over the network at start() and each live Env holds a
+    session, so 80 instances can exhaust the concurrent-session limit partway
+    through a run.
+    """
+    global _shared_env
+    if _shared_env is None:
+        _shared_env = make_env()
+    return _shared_env
+
+
 def _get_worker_env():
-    """One Gurobi Env per thread — created lazily, reused across LPs on that thread."""
+    """One Gurobi Env per thread — created lazily, reused across LPs on that thread.
+
+    Deliberately NOT the shared env: Gurobi Env objects are not safe to use
+    concurrently from several threads.
+    """
     env = getattr(_thread_local, "env", None)
     if env is None:
-        env = gp.Env(empty=True)
-        env.setParam("OutputFlag", 0)
-        env.start()
+        env = make_env()
         _thread_local.env = env
     return env
 
@@ -315,7 +371,7 @@ class BendersSolver():
     def __init__(self, gep_data, operational_data, sample, primal_net=None, dual_net=None, exact=True, 
                  exact_refinement=True, max_investment=100000, init_investment = "Zero", 
                  cut_selection="single",cut_selection_k=1,parallel_subproblems = False, n_workers = None,
-                 dynamic_cluster_features="price"):
+                 dynamic_cluster_features="price", env=None):
 
         self.gep_data = gep_data
         self.operational_data = operational_data
@@ -395,13 +451,43 @@ class BendersSolver():
 
         self.inv_hist = []  # list[list[float]] length = #iters
         self.investment_init_method = init_investment # Zero by Default, also option: "HalfMax"
-        self.env = gp.Env(empty=True)
-        self.env.setParam("OutputFlag", 0)
-        lic = os.environ.get("GRB_LICENSE_FILE")
-        if lic and os.path.exists(lic):
-            self.env.setParam("LicenseFile", lic)
-        self.env.start()
+        #! Shared by default, so building many solvers in a loop does not open
+        #! one Gurobi environment (and, under WLS, one licence session) each.
+        self.env = env if env is not None else get_shared_env()
 
+    def check_licence(self, data, label=""):
+        """Fail now if the licence cannot take a model this size.
+
+        Without this the first refusal arrives from m.optimize() after the
+        instance has been unpickled and the model built -- minutes into a
+        cluster job at 20 nodes, with an error naming neither the model size
+        nor the licence limit.
+        """
+        n_vars = int(data.ydim)
+        n_constrs = int(data.nineq + data.neq)
+
+        probe = gp.Model("licence_probe", env=self.env)
+        probe.setParam("OutputFlag", 0)
+        probe.addMVar(shape=n_vars, lb=-GRB.INFINITY)
+        try:
+            probe.update()
+        except gp.GurobiError as exc:
+            lic = os.environ.get("GRB_LICENSE_FILE") or "<unset>"
+            raise SystemExit(
+                f"\nGurobi licence cannot handle this model.\n"
+                f"  model:   {n_vars:,} variables, {n_constrs:,} constraints"
+                f"{f'   ({label})' if label else ''}\n"
+                f"  licence: refused at this size -- almost certainly the "
+                f"size-limited licence bundled with the pip gurobipy wheel "
+                f"({RESTRICTED_LICENCE_VARS:,} vars / {RESTRICTED_LICENCE_CONSTRS:,} constraints)\n"
+                f"  GRB_LICENSE_FILE: {lic}\n"
+                f"  gurobi error: {exc}\n\n"
+                f"A named-user academic licence is node-locked and will not work on a\n"
+                f"compute node. Load a site licence module, or point GRB_LICENSE_FILE at\n"
+                f"a floating (TOKENSERVER) or WLS licence.\n"
+            ) from exc
+        finally:
+            probe.dispose()
 
     @property
     def X(self):
