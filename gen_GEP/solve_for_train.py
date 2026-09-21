@@ -10,10 +10,19 @@ sys.path.insert(
 )
 from gep_benders import BendersSolver
 from gep_problem_operational import GEPOperationalProblemSet
-from paths import add_path_args, ensure_dir, resolve_roots, under_repo, under_root
+from paths import (
+    add_path_args,
+    ensure_dir,
+    resolve_roots,
+    topology_tag,
+    under_repo,
+    under_root,
+)
 
-DIR    = "data/GEP_for_training_perturb_mix"
-ED_OUT = "data/ED_data_gen/harvested_training_data_perturb_mix.pkl"
+#! Must match create_GEP_for_training.py. Both build the directory name from
+#! the same config through topology_tag, so they cannot drift apart.
+IN_PREFIX = "data/GEP_perturb_mix"
+HORIZON   = 219
 
 parser = argparse.ArgumentParser(
     description="Solve GEP instances with exact Benders and harvest ED training data."
@@ -30,13 +39,18 @@ args = json.load(open(under_repo(cli_args.config), "r"))
 
 roots = resolve_roots(args, cli_args)
 data_root = roots["data_root"]
-DIR    = under_root(DIR, data_root)
-ED_OUT = under_root(ED_OUT, data_root)
+
+DIR = under_root(f"{IN_PREFIX}_{topology_tag(args)}_H{HORIZON}", data_root)
+
+#! Taken from the config rather than a constant of our own, so that what this
+#! stage WRITES is by construction what main.py later READS. With a hardcoded
+#! filename a 20-node harvest silently overwrote the 3-node one.
+ED_OUT = under_root(args["ED_args"]["direct_data_path"], data_root)
 ensure_dir(os.path.dirname(ED_OUT))
 
 print(f"Run config: {under_repo(cli_args.config)}")
 print(f"Instances:  {DIR}")
-print(f"Harvest to: {ED_OUT}")
+print(f"Harvest to: {ED_OUT}   (ED_args.direct_data_path)")
 
 SPLIT_SEED = 42   # near your other knobs at the top, for reproducibility
 N_HOUR_CLUSTERS   = 20    # representative hour-groups per instance
@@ -161,6 +175,15 @@ def build_instance_X(h, args, n_hour_clusters, hours_per_cluster):
 paths = sorted(glob.glob(os.path.join(DIR, "gep_instance_*.pkl")))
 print(f"DIR PATH: {DIR}")
 print(len(paths), "GEP instances found for training data harvest")
+
+#! Say so here rather than crashing further down on an empty harvest list.
+if not paths:
+    raise SystemExit(
+        f"No gep_instance_*.pkl in {DIR}\n"
+        f"Run stage 1 first, with the same config and the same --home-path:\n"
+        f"    python gen_GEP/create_GEP_for_training.py "
+        f"-c {cli_args.config} --home-path {roots['home_path']}"
+    )
 harvest = []
 for p in paths:
     print(f"\n===== solving {os.path.basename(p)} =====")

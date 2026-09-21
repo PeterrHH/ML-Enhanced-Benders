@@ -4,7 +4,14 @@ import pandas as pd
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from create_gep_dataset import create_gep_ed_dataset
 from gep_config_parser import parse_config
-from paths import add_path_args, ensure_dir, resolve_roots, under_repo, under_root
+from paths import (
+    add_path_args,
+    ensure_dir,
+    resolve_roots,
+    topology_tag,
+    under_repo,
+    under_root,
+)
 
 # ======================================================================
 # 5. Driver config
@@ -12,8 +19,11 @@ from paths import add_path_args, ensure_dir, resolve_roots, under_repo, under_ro
 HORIZON     = 219
 N_INSTANCES = 80
 MASTER_SEED = 42
-OUT_DIR     = "data/GEP_for_training_perturb_mix"
-POOL_TIMES  = None            # <-- Could be used to restrict the pool of hours for sampling
+#! Directory name is built from the config's topology further down, so a
+#! 3-node and a 20-node run cannot overwrite each other and you can tell which
+#! is which from the name alone. This is only the prefix.
+OUT_PREFIX  = "data/GEP_perturb_mix"
+POOL_TIMES  = None            # <sque-- Could be used to restrict the pool of hours for sampling
 
 USE_CLASS_MIXTURE = True       # True: renewable-heavy/high-demand/middle mixture
                                # False: original pure-random perturbation
@@ -189,7 +199,13 @@ with open(under_repo(cli_args.config), "r") as file:
 
 roots = resolve_roots(args, cli_args)
 data_root = roots["data_root"]
-OUT_DIR = ensure_dir(under_root(OUT_DIR, data_root))
+
+#! e.g. data/GEP_perturb_mix_N20_G107_L44_H219 -- the topology and horizon are
+#! in the name, so runs of different sizes coexist instead of overwriting one
+#! another. solve_for_train.py rebuilds this exact name from the same config.
+OUT_DIR = ensure_dir(under_root(
+    f"{OUT_PREFIX}_{topology_tag(args)}_H{HORIZON}", data_root
+))
 
 #! Derived from the config, not hardcoded: with a hardcoded 3-country list a
 #! 20-node config would silently pool only BEL/GER/FRA and build instances

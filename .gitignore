@@ -229,3 +229,4 @@ GraphMethod-Exploration/
 note.md
 wandb/*
 requiremenets_*.txt
+tests/*

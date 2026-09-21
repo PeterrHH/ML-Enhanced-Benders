@@ -55,6 +55,21 @@ def ensure_dir(path):
     return path
 
 
+def topology_tag(args, section="Benders_args"):
+    """Short, self-describing signature of a config's topology: 'N20_G107_L44'.
+
+    Counts rather than name lists. The older naming in data/ spells the
+    topology out per country (ED_NB-G-F_GB2-G2-F2_L3), which is unreadable at
+    20 nodes and 107 generators; counts stay short and are what you actually
+    compare between runs.
+
+    Used by both gen_GEP stages so they derive the same directory name and
+    cannot drift apart.
+    """
+    topology = args[section]
+    return f"N{len(topology['N'])}_G{len(topology['G'])}_L{len(topology['L'])}"
+
+
 def add_path_args(parser):
     """Register --home-path / --data-root / --output-root on an ArgumentParser."""
     parser.add_argument(

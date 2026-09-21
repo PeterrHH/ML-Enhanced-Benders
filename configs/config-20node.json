@@ -674,7 +674,7 @@
         "heuristic_lambda_unmet_safety_mass": 0.02,
         "heuristic_lambda_tier2_confidence": 0.1,
         "use_direct_data": true,
-        "direct_data_path": "data/ED_data_gen/harvested_training_data_20node.pkl"
+        "direct_data_path": "data/ED_data_gen/harvested_N20_G107_L44.pkl"
     },
     "Benders_args": {
         "N": [
