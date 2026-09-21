@@ -9,6 +9,7 @@ import argparse
 
 from primal_dual import PrimalDualTrainer
 from create_gep_dataset import create_gep_ed_dataset
+from devices import KNOWN_DEVICES, resolve_device_name
 from paths import (
     add_path_args,
     ensure_dir,
@@ -53,6 +54,16 @@ def parse_cli_args():
         help=f"Path to the input-data TOML config. Default: {CONFIG_FILE_NAME}",
     )
 
+    parser.add_argument(
+        "--device",
+        dest="device",
+        choices=list(KNOWN_DEVICES),
+        default=None,
+        help="Override the config's device. 'auto' picks CUDA when present and "
+             "CPU otherwise; MPS is never auto-selected because it forces "
+             "float32. Unavailable devices raise instead of falling back.",
+    )
+
     #! W&B overrides, so a job script does not have to edit the JSON configs.
     #! All default to None, which leaves the config file's values in force.
     parser.add_argument(
@@ -81,14 +92,20 @@ def parse_cli_args():
     return parser.parse_args()
 
 
-def apply_wandb_overrides(args, cli_args):
+def apply_cli_overrides(args, cli_args):
     """CLI beats the config file; an unset flag leaves the config value alone."""
     if cli_args.no_wandb:
         args["use_wandb"] = False
-    for key in ("wandb_mode", "wandb_project", "wandb_entity", "wandb_group"):
+    for key in ("device", "wandb_mode", "wandb_project", "wandb_entity", "wandb_group"):
         value = getattr(cli_args, key, None)
         if value:
             args[key] = value
+
+    #! Resolve "auto" once, here, and write the concrete name back. Every
+    #! downstream resolve_device() reads this same dict, so one resolution
+    #! propagates; and args.json then records the device actually used rather
+    #! than the word "auto", which is what Benders later reads back.
+    args["device"] = resolve_device_name(args.get("device"))
 
 
 def get_data_root(args, cli_data_root=None):
@@ -218,11 +235,12 @@ if __name__ == "__main__":
     data_root = roots["data_root"]
     output_root = roots["output_root"]
 
-    apply_wandb_overrides(args, cli_args)
+    apply_cli_overrides(args, cli_args)
 
     print(f"Run config:  {run_config_file}")
     print(f"Dataset root: {data_root}")
     print(f"Output root:  {output_root}")
+    print(f"Device:       {args['device']}")
 
     QP_args = args["QP_args"]
 

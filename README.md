@@ -113,7 +113,7 @@ python main.py                                 # 3-node (default)
 python main.py -c configs/config-5node.json    # 5-node
 ```
 
-**Step 2.** Choose where data and outputs live. With no flags both default to
+**Step 2.** Choose where data and outputs is. With no flags both default to
 the current directory, which reproduces the historical behavior:
 
 ```bash
@@ -126,6 +126,30 @@ python main.py --data-root . \
 Config files (`configs/`) and input CSVs (`inputs/`) always resolve against the
 repository, so these commands work from any working directory — a SLURM script
 does not need to `cd` first.
+
+**Step 3.** Pick the device. The configs ship with `"device": "auto"`, which
+needs no change between machines:
+
+| Machine | `auto` resolves to | Precision |
+|---|---|---|
+| Laptop (no CUDA) | `cpu` | float64 |
+| GPU node | `cuda` | float64 |
+| CPU-only cluster node | `cpu` | float64 |
+
+`auto` picks CUDA when present and CPU otherwise. **It never selects MPS**, even
+on an Apple machine where MPS works: Metal has no float64, so auto-selecting it
+would silently drop the precision every other path uses. Ask for it by name when
+you want it:
+
+```bash
+python main.py --device mps      # Apple GPU, float32
+python main.py --device cpu      # force CPU
+python main.py --device cuda     # force CUDA; errors if no GPU is present
+```
+
+A device that is unavailable raises immediately rather than falling back to the
+CPU — a silent fallback would let a GPU job hold its allocation while running on
+the CPU. `args.json` records the device actually used, never the word `auto`.
 
 On a compute node without outbound network, log W&B offline and sync later:
 
@@ -222,6 +246,10 @@ python gep_benders.py -c configs/config.json \
 Without those two flags the directories come from `Benders_args` in the JSON,
 resolved under the output root. The node count is derived from the config's
 `Benders_args.N`, so any spelling of the config path works.
+
+It also takes `--device`. The nets are only run for inference here, so the
+device is chosen independently of whatever device they were trained on — a
+checkpoint whose `args.json` says `cuda` still runs on a CPU node.
 
 ### Outputs
 
@@ -446,6 +474,9 @@ Stage 1.
 - Both entry points select their config with `-c/--config`, and place `data/`
   and `outputs/` with `--home-path` (or the finer `--data-root` /
   `--output-root`). With no flags both roots are the current directory.
+- Device comes from `"device"` in the config (`auto` by default) and can be
+  overridden with `--device {auto,cpu,cuda,mps}`. `auto` means CUDA-or-CPU;
+  MPS is never auto-selected because it forces float32.
 - Root resolution order, highest first: `--data-root`/`--output-root`,
   `--home-path`, the config's `data_root`/`output_root`, `$DATA_ROOT`/
   `$OUTPUT_ROOT`, the config's `home_path`, `$PDL_HOME`, then `.`.

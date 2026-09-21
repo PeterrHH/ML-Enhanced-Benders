@@ -23,7 +23,7 @@
         "synthetic_demand_capacity": false,
         "normalize_input": true,
         "repeats": 2,
-        "device": "cpu",
+        "device": "auto",
         "gen_data_constraint": false,
         "gen_data_constraint_lb": false,
         "gen_data_constraint_lb_alpha": 0.1,
@@ -93,7 +93,7 @@
         "hidden_size_factor": [2, 50],
         "n_layers": [2, 8]
     },
-    "device": "cpu",
+    "device": "auto",
     "tau": 0.8,
     "rho": 0.5,
     "rho_max": 5000,

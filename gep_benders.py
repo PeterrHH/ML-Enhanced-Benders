@@ -18,6 +18,7 @@ from gep_problem_operational import GEPOperationalProblemSet
 from create_gep_dataset import create_gep_ed_dataset
 from gep_config_parser import *
 from networks import DualClassificationNetEndToEnd, DualNet, DualNetEndToEnd, PrimalNetEndToEnd
+from devices import KNOWN_DEVICES, resolve_device_name
 from paths import add_path_args, ensure_dir, resolve_roots, under_repo, under_root
 
 import os
@@ -1759,6 +1760,14 @@ if __name__ == "__main__":
         default=None,
         help="Override Benders_args.dual_net_directory.",
     )
+    parser.add_argument(
+        "--device",
+        dest="device",
+        choices=list(KNOWN_DEVICES),
+        default=None,
+        help="Device for net inference. Defaults to 'auto' (CUDA when present, "
+             "else CPU), independently of whatever device the nets were trained on.",
+    )
 
     args_cli = parser.parse_args()
 
@@ -1788,6 +1797,11 @@ if __name__ == "__main__":
     print(f"Run config:   {RUN_CONFIG_FILE}  ({NumNode} nodes)")
     print(f"Dataset root: {data_root}")
     print(f"Output root:  {output_root}")
+
+    #! Inference device for the loaded nets, independent of the device they
+    #! were trained on. CLI beats the config; "auto" is the fallback.
+    BENDERS_DEVICE = resolve_device_name(args_cli.device or args.get("device") or "auto")
+    print(f"Device:       {BENDERS_DEVICE}")
 
     #! Surfaced at startup rather than only when the summary CSV is written at
     #! the very end of a run. configs/config-6node.json trips this.
@@ -1927,7 +1941,13 @@ if __name__ == "__main__":
                 print(f"Dual Net Directory: {dual_net_directory}")
                 primal_model_args = json.load(open(os.path.join(primal_net_directory, "args.json")))
                 dual_model_args = json.load(open(os.path.join(dual_net_directory, "args.json")))
-                
+
+                #! args.json records the device the nets were TRAINED on. Without
+                #! this override a GPU-trained checkpoint would demand a GPU here,
+                #! where we only run inference. Use this run's own device instead.
+                primal_model_args["device"] = BENDERS_DEVICE
+                dual_model_args["device"] = BENDERS_DEVICE
+
                 best_args = {'primal_lr': 0.0006785456069117277, 'hidden_size_factor': 28, 'n_layers': 2, 'decay': 0.9989743016070536, 'batch_size': 2048}  #! Temporary, for primal net
                 primal_model_args["primal_lr"] = best_args["primal_lr"]
                 primal_model_args["hidden_size_factor"] = best_args["hidden_size_factor"]
