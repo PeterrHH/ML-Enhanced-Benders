@@ -1,4 +1,4 @@
-import argparse, copy, pickle, os, sys, json
+import argparse, copy, glob, pickle, os, sys, json
 import numpy as np
 import pandas as pd
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -192,7 +192,33 @@ parser.add_argument(
     default="configs/config.toml",
     help="Input-data TOML config.",
 )
+parser.add_argument(
+    "-n", "--n-instances", "--n_instances",
+    dest="n_instances",
+    type=int,
+    default=N_INSTANCES,
+    help=f"How many GEP instances to build (default {N_INSTANCES}). Larger "
+         f"topologies cost far more to solve in stage 2, so fewer instances "
+         f"are usually the right trade.",
+)
+parser.add_argument(
+    "--horizon",
+    type=int,
+    default=HORIZON,
+    help=f"Hours per instance (default {HORIZON}). Appears in the output "
+         f"directory name, so different horizons never mix.",
+)
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=MASTER_SEED,
+    help=f"Master seed for the perturbation sampler (default {MASTER_SEED}).",
+)
 cli_args = parser.parse_args()
+
+N_INSTANCES = cli_args.n_instances
+HORIZON     = cli_args.horizon
+MASTER_SEED = cli_args.seed
 
 with open(under_repo(cli_args.config), "r") as file:
     args = json.load(file)
@@ -207,6 +233,18 @@ OUT_DIR = ensure_dir(under_root(
     f"{OUT_PREFIX}_{topology_tag(args)}_H{HORIZON}", data_root
 ))
 
+#! Instance count is NOT in the directory name, so re-running with fewer
+#! instances leaves the higher-numbered files from a previous run behind and
+#! stage 2 would solve those too. Say so rather than let it pass silently.
+_existing = len(glob.glob(os.path.join(OUT_DIR, "gep_instance_*.pkl")))
+if _existing > N_INSTANCES:
+    print(
+        f"[warn] {OUT_DIR} already holds {_existing} instances but only "
+        f"{N_INSTANCES} will be written. The remaining {_existing - N_INSTANCES} "
+        f"are from an earlier run and stage 2 would solve them too. "
+        f"Delete the directory first if that is not what you want."
+    )
+
 #! Derived from the config, not hardcoded: with a hardcoded 3-country list a
 #! 20-node config would silently pool only BEL/GER/FRA and build instances
 #! whose demand and availability do not match their own topology.
@@ -215,6 +253,7 @@ COUNTRIES = list(dict.fromkeys(args["Benders_args"]["N"]))
 print(f"Run config: {under_repo(cli_args.config)}")
 print(f"Countries ({len(COUNTRIES)}): {COUNTRIES}")
 print(f"Generators: {len(args['Benders_args']['G'])}  Lines: {len(args['Benders_args']['L'])}")
+print(f"Instances:  {N_INSTANCES}  Horizon: {HORIZON}h  Seed: {MASTER_SEED}")
 print(f"Output dir: {OUT_DIR}")
 
 input_data = parse_config(under_repo(cli_args.toml_config))

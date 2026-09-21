@@ -33,6 +33,14 @@ parser.add_argument(
     default="configs/config.json",
     help="Run config JSON. Relative paths resolve against the repository.",
 )
+parser.add_argument(
+    "--horizon",
+    type=int,
+    default=None,
+    help="Hours per instance, i.e. which stage 1 output to read. Left unset, "
+         "the directory is discovered automatically; pass it only when several "
+         "horizons exist for this topology.",
+)
 cli_args = parser.parse_args()
 
 args = json.load(open(under_repo(cli_args.config), "r"))
@@ -40,7 +48,24 @@ args = json.load(open(under_repo(cli_args.config), "r"))
 roots = resolve_roots(args, cli_args)
 data_root = roots["data_root"]
 
-DIR = under_root(f"{IN_PREFIX}_{topology_tag(args)}_H{HORIZON}", data_root)
+#! Stage 1's horizon is a flag now, so rather than assume a value, find the
+#! directory it actually produced for this topology. Only ask for --horizon
+#! when the answer is genuinely ambiguous.
+_stem = under_root(f"{IN_PREFIX}_{topology_tag(args)}", data_root)
+if cli_args.horizon is not None:
+    DIR = f"{_stem}_H{cli_args.horizon}"
+else:
+    _candidates = sorted(
+        d for d in glob.glob(f"{_stem}_H*") if glob.glob(os.path.join(d, "gep_instance_*.pkl"))
+    )
+    if len(_candidates) > 1:
+        raise SystemExit(
+            "Several horizons exist for this topology:\n  "
+            + "\n  ".join(os.path.basename(d) for d in _candidates)
+            + "\nPick one with --horizon <hours>."
+        )
+    #! No match: fall back to the default name so the error below can print it.
+    DIR = _candidates[0] if _candidates else f"{_stem}_H{HORIZON}"
 
 #! Taken from the config rather than a constant of our own, so that what this
 #! stage WRITES is by construction what main.py later READS. With a hardcoded
