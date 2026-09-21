@@ -150,7 +150,10 @@ class GEPOperationalProblemSet():
             self.X = self.build_X()
         
         if self.ED_args["normalize_input"]:
-            self.total_demands = self.X[:, :self.data.num_n].sum(dim=1).unsqueeze(1)
+            #! self.num_n, not self.data.num_n -- this class has no .data
+            #! attribute, so the old spelling raised AttributeError on every
+            #! config with normalize_input enabled.
+            self.total_demands = self.X[:, :self.num_n].sum(dim=1).unsqueeze(1)
             self.X /= self.total_demands
         else:
             self.total_demands = torch.ones((self.X.shape[0], 1))
