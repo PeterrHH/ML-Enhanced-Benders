@@ -15,12 +15,12 @@ import torch
 
 KNOWN_DEVICES = ("auto", "cpu", "cuda", "mps")
 
-#! Each device's precision. CUDA keeps float64 so GPU results stay numerically
-#! comparable with the CPU results every experiment so far has produced. MPS
-#! has no choice: Metal does not support float64 at all.
+#! Each device's precision. The GPU paths run float32: fp64 throughput is a
+#! small fraction of fp32 on most NVIDIA cards, and Metal has no fp64 at all.
+#! The CPU path stays float64, so GPU and CPU results are NOT bit-comparable.
 DEVICE_DTYPES = {
     "cpu": torch.float64,
-    "cuda": torch.float64,
+    "cuda": torch.float32,
     "mps": torch.float32,
 }
 
@@ -42,10 +42,11 @@ def available_devices():
 def detect_device():
     """Pick a device automatically: CUDA when present, otherwise CPU.
 
-    MPS is deliberately NOT auto-selected even on a Mac that supports it.
-    Metal forces float32, so choosing it here would silently change results
-    away from the float64 the CPU and CUDA paths use. Ask for it explicitly
-    (--device mps) when you want it.
+    MPS is deliberately NOT auto-selected even on a Mac that supports it: it
+    would silently drop a local run from the CPU path's float64 to float32.
+    Ask for it explicitly (--device mps) when you want it. CUDA is auto-
+    selected despite also being float32, because a GPU node is only ever
+    allocated on purpose.
     """
     return "cuda" if is_available("cuda") else "cpu"
 

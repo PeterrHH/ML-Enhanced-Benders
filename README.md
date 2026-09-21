@@ -133,13 +133,16 @@ needs no change between machines:
 | Machine | `auto` resolves to | Precision |
 |---|---|---|
 | Laptop (no CUDA) | `cpu` | float64 |
-| GPU node | `cuda` | float64 |
+| GPU node | `cuda` | float32 |
 | CPU-only cluster node | `cpu` | float64 |
 
+The GPU paths run float32; the CPU path runs float64. **GPU and CPU results are
+therefore not bit-comparable** — expect small differences in constraint
+violations and optimality gaps between a CUDA run and a CPU run.
+
 `auto` picks CUDA when present and CPU otherwise. **It never selects MPS**, even
-on an Apple machine where MPS works: Metal has no float64, so auto-selecting it
-would silently drop the precision every other path uses. Ask for it by name when
-you want it:
+on an Apple machine where MPS works, because that would silently drop a local
+run to float32 without you asking. Ask for it by name when you want it:
 
 ```bash
 python main.py --device mps      # Apple GPU, float32
@@ -476,7 +479,8 @@ Stage 1.
   `--output-root`). With no flags both roots are the current directory.
 - Device comes from `"device"` in the config (`auto` by default) and can be
   overridden with `--device {auto,cpu,cuda,mps}`. `auto` means CUDA-or-CPU;
-  MPS is never auto-selected because it forces float32.
+  MPS is never auto-selected because it would silently drop a local run to
+  float32; CUDA is auto-selected because a GPU node is allocated on purpose.
 - Root resolution order, highest first: `--data-root`/`--output-root`,
   `--home-path`, the config's `data_root`/`output_root`, `$DATA_ROOT`/
   `$OUTPUT_ROOT`, the config's `home_path`, `$PDL_HOME`, then `.`.
