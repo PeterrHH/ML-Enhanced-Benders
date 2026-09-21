@@ -39,33 +39,29 @@ RESTRICTED_LICENCE_CONSTRS = 2000
 
 
 def make_env(quiet=True):
-    """Start a Gurobi Env, honouring GRB_LICENSE_FILE.
-
-    Single place for this, so the per-thread worker envs and the solver's own
-    env cannot drift apart: the worker path used to skip the licence file
-    entirely, which only showed up once parallel_subproblems was enabled.
-    """
     env = gp.Env(empty=True)
     if quiet:
         env.setParam("OutputFlag", 0)
 
-    lic = os.environ.get("GRB_LICENSE_FILE")
-    if lic:
-        if os.path.exists(lic):
-            env.setParam("LicenseFile", lic)
-        else:
-            #! gurobipy reads GRB_LICENSE_FILE itself at start() and refuses
-            #! outright when it names a missing file, so this is not a silent
-            #! fallback -- the point is to name the path plainly before the
-            #! GurobiError, which is easy to misread as "no licence at all".
-            print(
-                f"[gurobi] WARNING: GRB_LICENSE_FILE is set to '{lic}' but no such "
-                f"file exists. Gurobi will refuse to start. Unset the variable to "
-                f"use the default licence search, or point it at a real licence."
-            )
+    # lic = os.environ.get("GRB_LICENSE_FILE")
+    lic = os.environ.get("GRB_LICENSE_FILE") or os.path.expanduser("~/gurobi.lic")
+    print(f"[make_env] GRB_LICENSE_FILE={lic}, exists={os.path.exists(lic) if lic else False}", flush=True)
+    if lic and os.path.exists(lic):
+        with open(lic) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key, val = key.strip().upper(), val.strip()
+                if key == "WLSACCESSID":
+                    env.setParam("WLSACCESSID", val); print("[make_env] set WLSACCESSID", flush=True)
+                elif key == "WLSSECRET":
+                    env.setParam("WLSSECRET", val); print("[make_env] set WLSSECRET", flush=True)
+                elif key == "LICENSEID":
+                    env.setParam("LICENSEID", int(val)); print(f"[make_env] set LICENSEID={val}", flush=True)
     env.start()
     return env
-
 
 _shared_env = None
 

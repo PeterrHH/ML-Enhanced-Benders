@@ -1629,8 +1629,8 @@ def solve_matrix_problem_simple(obj_coeff, eq_cm, ineq_cm, eq_rhs, ineq_rhs, ver
     import gurobipy as gp
     from gurobipy import GRB
 
-    # Create a new model
-    m = gp.Model("matrix_problem")
+    from gep_benders import get_shared_env
+    m = gp.Model("Matrix problem", env=get_shared_env())
     
     # Important: Set method to dual simplex to get dual values
     m.setParam('Method', 1)  # Use dual simplex
