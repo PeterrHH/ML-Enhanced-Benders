@@ -4,6 +4,7 @@ import time
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
+from devices import resolve_device
 from paths import ensure_dir
 
 try:
@@ -110,12 +111,7 @@ class Logger():
         self.is_qp_simple = self.problem_type == "QP" and args["QP_args"]["type"] == "simple"
         self.is_qp_not_simple = self.problem_type == "QP" and args["QP_args"]["type"] != "simple"
 
-        if args["device"] == "mps":
-            self.DTYPE = torch.float32
-            self.DEVICE = torch.device("mps")
-        else:
-            self.DTYPE = torch.float64
-            self.DEVICE = torch.device("cpu")
+        self.DTYPE, self.DEVICE = resolve_device(args)
 
         self.X_train = X[train_indices].to(self.DTYPE).to(self.DEVICE)
         self.X_valid = X[valid_indices].to(self.DTYPE).to(self.DEVICE)

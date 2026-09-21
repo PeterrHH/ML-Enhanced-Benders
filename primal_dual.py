@@ -3,6 +3,7 @@ import os
 import time
 import torch
 from torch.utils.data import TensorDataset, DataLoader
+from devices import resolve_device
 from logger import Logger
 import numpy as np
 import pandas as pd
@@ -62,17 +63,18 @@ class PrimalDualTrainer():
         self.log = args["log"]
         self.log_frequency = args["log_frequency"]
         
-        if self.args["device"] == "mps":
-            self.DTYPE = torch.float32
-            self.DEVICE = torch.device("mps")
-            self.data.to_mps()
-        elif self.args["device"] == "cuda":
-            self.DTYPE = torch.float32
-            self.DEVICE = torch.device("cuda")
-            self.data.to(self.DEVICE)
-        else:
-            self.DTYPE = torch.float64
-            self.DEVICE = torch.device("cpu")
+        self.DTYPE, self.DEVICE = resolve_device(self.args)
+
+        #! The dataset is always built and pickled on the CPU, so move it onto
+        #! the training device here. Problem sets that predate this (QP) have
+        #! no to(), so say that plainly instead of raising AttributeError.
+        if self.DEVICE.type != "cpu":
+            if not hasattr(self.data, "to"):
+                raise NotImplementedError(
+                    f'{type(self.data).__name__} cannot move to {self.DEVICE}: it has no to(). '
+                    f'Run this problem type with "device": "cpu".'
+                )
+            self.data.to(self.DEVICE, self.DTYPE)
 
         torch.set_default_dtype(self.DTYPE)
         torch.set_default_device(self.DEVICE)

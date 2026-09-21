@@ -1,4 +1,6 @@
 import torch
+
+from devices import resolve_device
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.preprocessing import StandardScaler
@@ -52,12 +54,7 @@ class DualNet(nn.Module):
         self.mu_size = self.data.nineq
         self.lamb_size = self.data.neq
 
-        if args["device"] == "mps":
-            self.DTYPE = torch.float32
-            self.DEVICE = torch.device("mps")
-        else:
-            self.DTYPE = torch.float64
-            self.DEVICE = torch.device("cpu")
+        self.DTYPE, self.DEVICE = resolve_device(args)
 
         torch.set_default_dtype(self.DTYPE)
         torch.set_default_device(self.DEVICE)
@@ -158,12 +155,7 @@ class FeedForwardNet(nn.Module):
         self.hidden_sizes = hidden_sizes
         self.output_dim = output_dim
 
-        if args["device"] == "mps":
-            self.DTYPE = torch.float32
-            self.DEVICE = torch.device("mps")
-        else:
-            self.DTYPE = torch.float64
-            self.DEVICE = torch.device("cpu")
+        self.DTYPE, self.DEVICE = resolve_device(args)
 
         torch.set_default_dtype(self.DTYPE)
         torch.set_default_device(self.DEVICE)
@@ -220,12 +212,7 @@ class FeedForwardNetSeparateHead(nn.Module):
         self.n_heads = n_heads
         self.n_classes = n_classes
 
-        if args["device"] == "mps":
-            self.DTYPE = torch.float32
-            self.DEVICE = torch.device("mps")
-        else:
-            self.DTYPE = torch.float64
-            self.DEVICE = torch.device("cpu")
+        self.DTYPE, self.DEVICE = resolve_device(args)
 
         torch.set_default_dtype(self.DTYPE)
         torch.set_default_device(self.DEVICE)
@@ -392,12 +379,7 @@ class PrimalNetEndToEnd(nn.Module):
             # Bound repairs need layernorm to prevent gradient saturation in sigmoids.
             assert self.args["layernorm"], "Bounds repair requires layernorm."
 
-        if self.args["device"] == "mps":
-                self.DTYPE = torch.float32
-                self.DEVICE = torch.device("mps")
-        else:
-            self.DTYPE = torch.float64
-            self.DEVICE = torch.device("cpu")
+        self.DTYPE, self.DEVICE = resolve_device(self.args)
 
         torch.set_default_dtype(self.DTYPE)
         torch.set_default_device(self.DEVICE)
@@ -704,12 +686,7 @@ class DualNetEndToEnd(nn.Module):
         else:
             self.out_dim = data.neq
 
-        if args["device"] == "mps":
-            self.DTYPE = torch.float32
-            self.DEVICE = torch.device("mps")
-        else:
-            self.DTYPE = torch.float64
-            self.DEVICE = torch.device("cpu")
+        self.DTYPE, self.DEVICE = resolve_device(args)
 
         self.normalize = args.get("normalize_input", None)
         if self.normalize == "z_score":
@@ -722,7 +699,13 @@ class DualNetEndToEnd(nn.Module):
             self.register_buffer("p_mean", torch.zeros(G, dtype=self.DTYPE))
             self.register_buffer("p_std",  torch.ones(G, dtype=self.DTYPE))
 
-        self.classes = -1 * torch.concat([self.data.cost_vec.unique(), torch.tensor([self.data.pVOLL])])
+        #! Plain attribute, so .to(device) on this module will not move it.
+        #! Place it explicitly rather than registering it as a buffer, which
+        #! would add a state_dict key and break existing checkpoints.
+        self.classes = -1 * torch.concat([
+            self.data.cost_vec.unique().to(device=self.DEVICE, dtype=self.DTYPE),
+            torch.tensor([self.data.pVOLL], device=self.DEVICE, dtype=self.DTYPE),
+        ])
 
         #! Only predict lambda, we infer mu from it.
         self.feed_forward = FeedForwardNet(args, data.xdim, self.hidden_sizes, output_dim=self.out_dim, layernorm=True).to(self.DTYPE).to(self.DEVICE)
@@ -935,20 +918,23 @@ class DualClassificationNetEndToEnd(nn.Module):
         self.args = args
         self.ED_args = args["ED_args"]
 
+        #! Resolved before self.classes below, which needs DTYPE/DEVICE.
+        self.DTYPE, self.DEVICE = resolve_device(args)
+
         # Objective coefficients contain all costs for all generators and unmet demand.
-        self.classes = -1 * torch.concat([self.data.cost_vec.unique(), torch.tensor([self.data.pVOLL])])
+        #! classes is a plain attribute, not a buffer, so .to(device) on this
+        #! module will not move it. Place it explicitly instead. It stays a
+        #! plain attribute deliberately: registering it would add a state_dict
+        #! key and break loading existing checkpoints.
+        self.classes = -1 * torch.concat([
+            self.data.cost_vec.unique().to(device=self.DEVICE, dtype=self.DTYPE),
+            torch.tensor([self.data.pVOLL], device=self.DEVICE, dtype=self.DTYPE),
+        ])
         self.n_classes = self.classes.numel()
         self.n_dual_vars = data.neq
-        
+
         #! For each dual variable, We now predict probabilities for each class
         self.out_dim = self.n_classes * self.n_dual_vars
-
-        if args["device"] == "mps":
-            self.DTYPE = torch.float32
-            self.DEVICE = torch.device("mps")
-        else:
-            self.DTYPE = torch.float64
-            self.DEVICE = torch.device("cpu")
 
         self.normalize = args.get("normalize", None)
         if self.normalize == "z_score":

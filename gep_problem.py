@@ -3,10 +3,14 @@ import torch
 import pickle
 import matplotlib.pyplot as plt
 
+from devices import move_attrs
+
 
 class GEPProblemSet():
 
     def __init__(self, args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap):
+        #! Built on the CPU regardless of the training device; this object is
+        #! pickled, and device storages in a .pkl are not portable. Use to().
         self.DTYPE = torch.float64
         self.DEVICE = torch.device("cpu")
         torch.set_default_dtype(self.DTYPE)
@@ -118,6 +122,20 @@ class GEPProblemSet():
     
     @property
     def opt_targets(self): return self._opt_targets
+
+    def to(self, device=None, dtype=None):
+        """Move every tensor attribute onto `device`, in place.
+
+        Mirrors GEPOperationalProblemSet.to; integer tensors keep their dtype.
+        """
+        device = torch.device(device) if device is not None else self.DEVICE
+        dtype = dtype if dtype is not None else self.DTYPE
+        print(f"Moving problem data to {device} ({dtype})")
+
+        move_attrs(self, device, dtype)
+        self.DEVICE = device
+        self.DTYPE = dtype
+        return self
 
     def build_rhs_only(self):
         eq_rhss = []
