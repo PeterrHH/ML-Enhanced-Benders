@@ -8,7 +8,7 @@ labels, and nothing here touches the PDL trainer.
 | Path | Purpose |
 |---|---|
 | `dataset.py` | build or load the labelled ED dataset (`python -m flowfirst.dataset`) |
-| `fill.py` | merit-order fill: production and unmet demand from the flows, plus explicit nodal prices |
+| `fill.py` | re-export only: the merit-order fill and the flow-first networks now live in `networks.py`, next to the thesis primal, so `gep_benders.py` can import them |
 | `train.py` | primal-only training of the four variants with TensorBoard logging |
 | `dual.py` | `PrimalDual`: input to primal, nodal prices, box multipliers and certificate in one call (`exact=True` finishes with the min-cost flow); `GraphedPrimalDual` replays the non-exact pipeline as one CUDA graph at a fixed batch; `DualRecovery`, `Polish`, `PathPolish`, `cast_net`, `load_run` |
 | `dual_analysis.py` | prints the tables of F26 to F29 for a saved run |
@@ -18,6 +18,7 @@ labels, and nothing here touches the PDL trainer.
 | `modal/train.py`, `modal/sync.sh` | run a jobs file on Modal GPUs, one container per job; pull the run directories back while they run |
 | `modal/bench.py` | times the deployed pipeline of a saved run on a Modal GPU: eager, CUDA graph, compiled network, both, per precision (float64, TF32, network in float32 or half precision with the rest in float64; `--precisions`), batch 1024 and 8192, with the accuracy of each precision against the Gurobi labels (`--stages` adds the per-stage table) |
 | `tests/` | checks of the fill, the dual, the certificate and the polish against Gurobi (`pytest flowfirst`) |
+| `docs/OVERVIEW.md` | what flowfirst does and why: the major method changes, each with the finding behind it, and how they map onto the main pipeline — start here |
 | `docs/BENCHMARKING.md` | how to make the Gurobi baseline in the Benders benchmark realistic (handoff note for Peter) |
 | `docs/FINDINGS.md` | numbered findings with evidence tables |
 | `docs/IDEAS.md` | prioritized backlog of training and architecture changes |
@@ -70,6 +71,28 @@ merit order once the production head saturates the cheap unit, so the old
 architecture and flow-first compute the same function. With three units the
 rescale splits the remainder across two unsaturated units by headroom, not by
 cost, and the production head has to learn the residual itself.
+
+## Running on a cluster
+
+`train.py` and `dataset.py` take the same root flags as `main.py`
+(`--home-path`, or `--data-root` / `--output-root` separately; `PDL_HOME`,
+`DATA_ROOT` and `OUTPUT_ROOT` work too). With a root, the dataset goes to
+`<data-root>/data/flowfirst/` and the run directories to
+`<output-root>/outputs/FlowFirst/ED/N<nodes>_G<generators>/`, beside the PDL
+runs. Without one, everything stays inside the package as before.
+
+Run from the repo root, inside your usual sbatch script:
+
+```
+python -m flowfirst.dataset flowfirst/configs/config-6node-x8.json --home-path $SCRATCH/<project>
+python -m flowfirst.train --variant flowfirst-gnn --config flowfirst/configs/config-6node-x8.json \
+    --gnn-hidden 96 --gnn-rounds 4 --batch-size 128 --lr-schedule step --lr-decay 0.7 --clip-grad 8000 \
+    --epochs 250 --home-path $SCRATCH/<project> --device auto
+```
+
+`--device auto` picks CUDA when the node has one and the CPU otherwise. Only
+the `flowfirst-gnn` variant runs on CUDA. For several jobs at once,
+`PYTHON=python flowfirst/run_jobs.sh flowfirst/jobs/<file>.txt`.
 
 ## Running on Modal GPUs
 

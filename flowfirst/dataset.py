@@ -23,6 +23,7 @@ import torch
 
 from create_gep_dataset import create_gep_ed_dataset
 from gep_config_parser import parse_config
+from paths import resolve_roots, under_root
 
 PKG_DIR = Path(__file__).resolve().parent
 REPO_ROOT = PKG_DIR.parent
@@ -31,9 +32,30 @@ CONFIG_DIR = PKG_DIR / "configs"
 DEFAULT_CONFIG = str(CONFIG_DIR / "config-3node.json")
 
 
-def dataset_path(args):
+def roots_from_cli(cli):
+    """(data_root, output_root), or (None, None) when no root was asked for.
+
+    Without a --data-root / --output-root / --home-path flag or the matching
+    environment variable, flowfirst keeps writing inside the package as it
+    always has. On a cluster the roots move the dataset and the run
+    directories under $SCRATCH, exactly as they do for main.py.
+    """
+    asked = any([getattr(cli, "home_path", None), getattr(cli, "data_root", None),
+                 getattr(cli, "output_root", None),
+                 os.environ.get("PDL_HOME"), os.environ.get("DATA_ROOT"), os.environ.get("OUTPUT_ROOT")])
+    if not asked:
+        return None, None
+    roots = resolve_roots(cli=cli)
+    return roots["data_root"], roots["output_root"]
+
+
+def dataset_path(args, data_root=None):
+    """Where this config's labelled pickle lives: in the package, or under the data root."""
     ed = args["ED_args"]
-    return str(PKG_DIR / "datasets" / f"{ed['specific_name']}_smp{ed['2n_synthetic_samples']}.pkl")
+    name = f"{ed['specific_name']}_smp{ed['2n_synthetic_samples']}.pkl"
+    if data_root is None:
+        return str(PKG_DIR / "datasets" / name)
+    return under_root(os.path.join("data", "flowfirst", name), data_root)
 
 
 def apply_cost_overrides(inputs, overrides):
@@ -59,24 +81,26 @@ def resolve_config(args_path):
     return path if path.exists() else CONFIG_DIR / path.name
 
 
-def load_or_create(args_path=DEFAULT_CONFIG, seed=0):
+def load_or_create(args_path=DEFAULT_CONFIG, seed=0, data_root=None):
     """Return (data, args). Builds and pickles the dataset on first use.
 
     With ``ED_args.use_direct_data`` the instances are not sampled at all: the
-    pickle at ``ED_args.direct_data_path`` (relative to the repo root) is loaded
-    as is. That is how the Benders-harvested sets from ``gen_GEP/`` enter, whose
-    capacities are the investments exact Benders actually visits rather than
-    draws from the node-budget sampler. The same key drives ``main.py``.
+    pickle at ``ED_args.direct_data_path`` (relative to the repo root, or to
+    ``data_root`` when one is given) is loaded as is. That is how the
+    Benders-harvested sets from ``gen_GEP/`` enter, whose capacities are the
+    investments exact Benders actually visits rather than draws from the
+    node-budget sampler. The same key drives ``main.py``.
     """
     with open(resolve_config(args_path)) as f:
         args = json.load(f)
     if args["ED_args"].get("use_direct_data"):
-        direct = Path(args["ED_args"]["direct_data_path"])
+        raw = args["ED_args"]["direct_data_path"]
+        direct = Path(under_root(raw, data_root) if data_root else raw)
         direct = direct if direct.is_absolute() else REPO_ROOT / direct
         assert direct.exists(), f"direct_data_path not found: {direct}"
         with open(direct, "rb") as f:
             return pickle.load(f), args
-    path = dataset_path(args)
+    path = dataset_path(args, data_root)
     if not os.path.exists(path):
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -138,6 +162,13 @@ def summarize(data):
 
 
 if __name__ == "__main__":
-    args_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_CONFIG
-    data, _ = load_or_create(args_path)
+    import argparse
+
+    from paths import add_path_args
+
+    ap = add_path_args(argparse.ArgumentParser())
+    ap.add_argument("config", nargs="?", default=DEFAULT_CONFIG)
+    cli = ap.parse_args()
+    data_root, _ = roots_from_cli(cli)
+    data, _ = load_or_create(cli.config, data_root=data_root)
     summarize(data)

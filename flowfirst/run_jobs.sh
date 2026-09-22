@@ -16,7 +16,8 @@ while IFS= read -r line || [ -n "$line" ]; do
   n=$((n + 1))
   tag=$(sed -n 's/.*--tag[= ]\([^ ]*\).*/\1/p' <<< "$line"); [ -z "$tag" ] && tag="job$n"
   # shellcheck disable=SC2086
-  .venv/bin/python -m flowfirst.train $line 2>&1 | sed -u "s/^/[$tag] /" &
+  # PYTHON=... to point at the interpreter, e.g. a cluster module's python instead of the local .venv
+  "${PYTHON:-.venv/bin/python}" -m flowfirst.train $line 2>&1 | sed -u "s/^/[$tag] /" &
   pids+=($!)
 done < "$jobs_file"
 

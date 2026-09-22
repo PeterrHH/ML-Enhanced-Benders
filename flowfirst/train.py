@@ -53,6 +53,7 @@ import argparse
 import copy
 import csv
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -61,9 +62,11 @@ import torch
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 
-from flowfirst.dataset import DEFAULT_CONFIG, load_or_create
-from flowfirst.fill import MeritOrderFill
-from networks import BoundRepairLayer, FeedForwardNet, PrimalNetEndToEnd
+from devices import KNOWN_DEVICES, resolve_device_name
+from flowfirst.dataset import DEFAULT_CONFIG, load_or_create, roots_from_cli
+from networks import (BoundRepairLayer, FlowFirst, FlowFirstGNN, MeritOrderFill, PrimalNetEndToEnd,
+                      hidden_sizes, line_bounds, make_body, make_scaler, split_inputs)
+from paths import add_path_args, under_root
 
 torch.set_default_dtype(torch.float64)
 RUNS_DIR = Path(__file__).resolve().parent / "runs"
@@ -73,111 +76,8 @@ SAT_TOL = 1e-3    # a flow within this fraction of its range from a bound counts
 
 
 # ----------------------------------------------------------------------------
-# problem helpers
-# ----------------------------------------------------------------------------
-def line_bounds(data):
-    """Lower and upper flow limit per line in the default dtype (the limits may be integers in the data)."""
-    device, dtype = data.cost_vec.device, torch.get_default_dtype()
-    lb = torch.tensor([-data.pImpCap[l] for l in data.L], device=device, dtype=dtype)
-    ub = torch.tensor([data.pExpCap[l] for l in data.L], device=device, dtype=dtype)
-    return lb, ub
-
-
-def split_inputs(data, X):
-    N, G = data.num_n, data.num_g
-    return X[:, :N], X[:, N:N + G]
-
-
-def hidden_sizes(args, data):
-    return [int(args["hidden_size_factor"] * data.xdim)] * args["n_layers"]
-
-
-class Scale(nn.Module):
-    """Divide the inputs by a fixed constant."""
-
-    def __init__(self, constant):
-        super().__init__()
-        self.constant = float(constant)
-
-    def forward(self, x):
-        return x / self.constant
-
-
-class Standardize(nn.Module):
-    """Per-feature (x - mean) / std with training-set statistics kept as buffers."""
-
-    def __init__(self, mean, std):
-        super().__init__()
-        self.register_buffer("mean", mean.clone())
-        self.register_buffer("std", std.clone())
-
-    def forward(self, x):
-        return (x - self.mean) / self.std
-
-
-def make_scaler(kind, X_train):
-    """None for LayerNorm inside the body, else the input-scaling module."""
-    if kind == "layernorm":
-        return None
-    if kind == "fixed":
-        return Scale(X_train.max().item())
-    if kind == "zscore":
-        return Standardize(X_train.mean(dim=0), X_train.std(dim=0).clamp_min(1e-8))
-    raise ValueError(kind)
-
-
-class ResidualBody(nn.Module):
-    """Input projection, then residual blocks of two linear layers, then the output layer.
-
-    A plain deep ReLU stack without skip connections trains poorly beyond three or
-    four layers; the skip connections keep the gradient path short. ``n_blocks``
-    blocks give 2 * n_blocks hidden linear layers.
-    """
-
-    def __init__(self, in_dim, width, n_blocks, out_dim):
-        super().__init__()
-        self.inp = nn.Linear(in_dim, width)
-        self.blocks = nn.ModuleList([nn.Sequential(nn.ReLU(), nn.Linear(width, width), nn.ReLU(), nn.Linear(width, width))
-                                     for _ in range(n_blocks)])
-        self.out = nn.Sequential(nn.ReLU(), nn.Linear(width, out_dim))
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight)
-        # small output scale: raw flows start near 0, i.e. mid-range after the sigmoid, with full gradient
-        nn.init.normal_(self.out[1].weight, std=1e-2)
-        nn.init.zeros_(self.out[1].bias)
-
-    def forward(self, x):
-        h = self.inp(x)
-        for block in self.blocks:
-            h = h + block(h)
-        return self.out(h)
-
-
-def make_body(args, data, out_dim, scaler):
-    """Feed-forward body: input LayerNorm (scaler None) or the given scaling module in front.
-
-    args["body"] "plain" is Peter's FeedForwardNet with args["n_layers"] hidden layers;
-    "residual" is ResidualBody with args["n_layers"] // 2 blocks (needs a scaler).
-    """
-    if args.get("body", "plain") == "residual":
-        assert scaler is not None, "the residual body needs --input-scale fixed or zscore"
-        width = int(args["hidden_size_factor"] * data.xdim)
-        return nn.Sequential(scaler, ResidualBody(data.xdim, width, max(1, args["n_layers"] // 2), out_dim))
-    if scaler is None:
-        body = FeedForwardNet(args, data.xdim, hidden_sizes(args, data), out_dim)
-    else:
-        body = nn.Sequential(scaler,
-                             FeedForwardNet(args, data.xdim, hidden_sizes(args, data), out_dim, layernorm=False))
-    if args.get("small_output_init", False):
-        last = (body if scaler is None else body[1]).net[-1]
-        nn.init.normal_(last.weight, std=1e-2)
-        nn.init.zeros_(last.bias)
-    return body
-
-
-# ----------------------------------------------------------------------------
-# the three networks. forward(X) -> (y, f_raw, f_repaired)
+# the baseline variants. forward(X) -> (y, f_raw, f_repaired)
+# (FlowFirst and FlowFirstGNN live in networks.py)
 # ----------------------------------------------------------------------------
 class OldPrioritized(nn.Module):
     """PrimalNetEndToEnd with bounds repair, prioritized rescale and completion."""
@@ -229,116 +129,6 @@ class OldNoCompletion(nn.Module):
         f = self.repair(f_raw, self.f_lb, self.f_ub)
         md = self.repair(md_raw, torch.zeros_like(D), D)
         return torch.cat([p, f, md], dim=1), f_raw, f
-
-
-class FlowFirst(nn.Module):
-    """f predicted and sigmoid-repaired; p and md from the merit-order fill."""
-
-    def __init__(self, args, data, scaler=None):
-        super().__init__()
-        self.data = data
-        self.body = make_body(args, data, data.num_l, scaler)
-        self.repair = BoundRepairLayer(repair_scaler="Sigmoid")
-        self.fill = MeritOrderFill(data)
-        f_lb, f_ub = line_bounds(data)
-        self.register_buffer("f_lb", f_lb)
-        self.register_buffer("f_ub", f_ub)
-
-    def forward(self, X):
-        D, cap = split_inputs(self.data, X)
-        f_raw = self.body(X)
-        f = self.repair(f_raw, self.f_lb, self.f_ub)
-        p, e, _ = self.fill(D, cap, f)
-        return torch.cat([p, f, e], dim=1), f_raw, f
-
-
-class FlowFirstGNN(nn.Module):
-    """Flow-first with a message-passing network over the grid graph.
-
-    Node features: demand and the node's units in merit order, capacity and
-    cost per slot, padded to the largest node with capacity 0 and cost VOLL.
-    Edge features: the line's export and import limits. A node encoder and an
-    edge encoder map these to hidden states; each of ``rounds`` rounds updates
-    every edge from its own state and its two end nodes, then every node from
-    its own state and the sums of its incoming and outgoing edge states
-    (residual updates). The edge readout gives the raw flow, sigmoid-repaired
-    into the line limits, and the merit-order fill dispatches. With a fixed
-    topology, learnable per-node and per-edge identity embeddings are appended
-    to the encoder inputs (``id_embed`` 0 disables them). Node features are
-    z-scored with training-set statistics shared across nodes; ``--input-scale``
-    does not apply to this variant.
-    """
-
-    def __init__(self, args, data, X_train, hidden=128, rounds=3, id_embed=8, layernorm=False, antisym=False):
-        super().__init__()
-        self.data, self.fill, self.rounds, self.id_dim, self.antisym = data, MeritOrderFill(data), rounds, id_embed, antisym
-        N, L = data.num_n, data.num_l
-        M, A = data.node_to_gen_mask, data.lineflow_mask                     # [N, G], [N, L] (-1 from, +1 to)
-        dev = M.device                                                       # everything is built on the data's device
-        K = int(M.sum(dim=1).max().item())
-        slot = torch.full((N, K), -1, dtype=torch.long, device=dev)
-        for n in range(N):
-            gens = torch.nonzero(M[n]).flatten()
-            slot[n, :len(gens)] = gens[torch.argsort(data.cost_vec[gens])]   # merit order
-        self.register_buffer("slot", slot.clamp(min=0))
-        self.register_buffer("slot_valid", (slot >= 0).to(torch.get_default_dtype()))
-        self.register_buffer("cost_slots", torch.where(slot >= 0, data.cost_vec[slot.clamp(min=0)],
-                                                       torch.full((N, K), float(data.pVOLL), device=dev)))
-        self.register_buffer("from_idx", torch.nonzero(A.T == -1)[:, 1])   # node index per line, in line order
-        self.register_buffer("to_idx", torch.nonzero(A.T == 1)[:, 1])
-        self.register_buffer("A_in", (A == 1).to(torch.get_default_dtype()))
-        self.register_buffer("A_out", (A == -1).to(torch.get_default_dtype()))
-        f_lb, f_ub = line_bounds(data)
-        self.register_buffer("f_lb", f_lb)
-        self.register_buffer("f_ub", f_ub)
-        self.register_buffer("edge_feat", torch.stack([f_ub, -f_lb], dim=1) / torch.maximum(f_ub, -f_lb).max())
-        with torch.no_grad():
-            flat = self.node_features(X_train).reshape(-1, 1 + 2 * K)
-        self.register_buffer("nf_mean", flat.mean(dim=0))
-        self.register_buffer("nf_std", flat.std(dim=0).clamp_min(1e-8))
-        if id_embed > 0:
-            self.node_id = nn.Parameter(0.1 * torch.randn(N, id_embed, device=dev))
-            self.edge_id = nn.Parameter(0.1 * torch.randn(L, id_embed, device=dev))
-
-        def mlp(i, o, norm=False):
-            # pre-LayerNorm residual block: normalize the block input, not the residual stream (keeps depth trainable)
-            layers = [nn.LayerNorm(i, device=dev)] if norm else []
-            return nn.Sequential(*layers, nn.Linear(i, hidden, device=dev), nn.ReLU(), nn.Linear(hidden, o, device=dev))
-        self.node_enc = mlp(1 + 2 * K + id_embed, hidden)
-        self.edge_enc = mlp(2 + id_embed, hidden)
-        self.edge_upd = nn.ModuleList([mlp(3 * hidden, hidden, layernorm) for _ in range(rounds)])
-        self.node_upd = nn.ModuleList([mlp(3 * hidden, hidden, layernorm) for _ in range(rounds)])
-        self.readout = mlp(3 * hidden, 1)
-
-    def node_features(self, X):
-        D, cap = split_inputs(self.data, X)
-        cap_slots = cap[:, self.slot] * self.slot_valid                        # [B, N, K]
-        return torch.cat([D.unsqueeze(-1), cap_slots, self.cost_slots.expand(X.shape[0], -1, -1)], dim=-1)
-
-    def forward(self, X):
-        B, dt = X.shape[0], self.readout[-1].weight.dtype
-        nf = (self.node_features(X) - self.nf_mean) / self.nf_std
-        ef = self.edge_feat.expand(B, -1, -1)
-        if self.id_dim > 0:
-            nf = torch.cat([nf, self.node_id.expand(B, -1, -1)], dim=-1)
-            ef = torch.cat([ef, self.edge_id.expand(B, -1, -1)], dim=-1)
-        # from here to the logit the network computes in its parameters' dtype (float64 when trained, cheaper after
-        # dual.cast_net); the standardized features are O(1) and the bounds below stay in the input's dtype
-        h, e = self.node_enc(nf.to(dt)), self.edge_enc(ef.to(dt))              # [B, N, H], [B, L, H]
-        for edge_upd, node_upd in zip(self.edge_upd, self.node_upd, strict=True):
-            e = e + edge_upd(torch.cat([e, h[:, self.from_idx], h[:, self.to_idx]], dim=-1))
-            agg_in = torch.einsum("nl,blh->bnh", self.A_in, e)
-            agg_out = torch.einsum("nl,blh->bnh", self.A_out, e)
-            h = h + node_upd(torch.cat([h, agg_in, agg_out], dim=-1))
-        hf, ht = h[:, self.from_idx], h[:, self.to_idx]
-        f_raw = self.readout(torch.cat([e, hf, ht], dim=-1)).squeeze(-1)
-        if self.antisym:
-            # potential-difference bias: swapping the end nodes flips the sign of the raw flow
-            f_raw = f_raw - self.readout(torch.cat([e, ht, hf], dim=-1)).squeeze(-1)
-        f = self.f_lb + (self.f_ub - self.f_lb) * torch.sigmoid(f_raw.to(X.dtype))
-        D, cap = split_inputs(self.data, X)
-        p, unmet, _ = self.fill(D, cap, f)
-        return torch.cat([p, f, unmet], dim=1), f_raw, f
 
 
 def build_net(variant, args, data, scaler=None, X_train=None, gnn_kwargs=None):
@@ -493,6 +283,16 @@ def gradient_census(net, data, fill, ref, f_lb, f_ub, penalty_weight, voll_price
 # ----------------------------------------------------------------------------
 # training
 # ----------------------------------------------------------------------------
+def resolve_runs_dir(runs_dir, output_root, args):
+    """--runs-dir wins; then the output root, grouped by problem size as main.py groups its runs; then the package."""
+    if runs_dir is not None:
+        return runs_dir
+    if output_root is None:
+        return RUNS_DIR
+    ed = args["ED_args"]
+    return under_root(os.path.join("outputs", "FlowFirst", "ED", f"N{len(ed['N'])}_G{len(ed['G'])}"), output_root)
+
+
 def make_run_dir(runs_dir, variant, tag):
     """runs/<variant>[-tag], with -2, -3, ... appended if taken. Safe for concurrent starts."""
     name = variant if not tag else f"{variant}-{tag}"
@@ -524,6 +324,9 @@ class Tee:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    #! --home-path / --data-root / --output-root, the same flags main.py takes: on a cluster they move the
+    #! dataset and the run directories under $SCRATCH. Without them nothing leaves the package (roots_from_cli).
+    add_path_args(ap)
     ap.add_argument("--variant", choices=VARIANTS, required=True)
     ap.add_argument("--config", default=DEFAULT_CONFIG)
     ap.add_argument("--epochs", type=int, default=250)
@@ -579,9 +382,10 @@ def main():
                     help="flowfirst-gnn: antisymmetric readout z = g(e, h_from, h_to) - g(e, h_to, h_from) (potential-difference bias)")
     ap.add_argument("--gnn-layernorm", action="store_true",
                     help="flowfirst-gnn: pre-LayerNorm inside every message-passing block (recommended from ~6 rounds)")
-    ap.add_argument("--device", default="cpu",
-                    help="cpu (float64), mps (Apple GPU, float32 only) or cuda (float64 by default, see --dtype). "
-                         "Only the flowfirst-gnn variant runs on cuda; Peter's networks know cpu and mps")
+    ap.add_argument("--device", default="cpu", choices=KNOWN_DEVICES,
+                    help="cpu (float64), mps (Apple GPU, float32 only), cuda (float64 by default, see --dtype), or "
+                         "auto (cuda when present, else cpu). Only the flowfirst-gnn variant runs on cuda; "
+                         "Peter's networks know cpu and mps")
     ap.add_argument("--dtype", choices=("float64", "float32"), default=None,
                     help="tensor precision; default float64 on cpu/cuda, float32 on mps (which has no float64)")
     ap.add_argument("--valid-size", type=int, default=None,
@@ -589,11 +393,16 @@ def main():
     ap.add_argument("--census-size", type=int, default=4096)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tag", default="")
-    ap.add_argument("--runs-dir", default=str(RUNS_DIR))
+    ap.add_argument("--runs-dir", default=None,
+                    help="where run directories go; default flowfirst/runs, or "
+                         "<output-root>/outputs/FlowFirst/ED/N<nodes>_G<generators> when a root is given")
     ap.add_argument("--log-every", type=int, default=10)
     cli = ap.parse_args()
+    #! Resolve "auto" once, here, so every later check reads a concrete device name, as main.py does.
+    cli.device = resolve_device_name(cli.device)
+    data_root, output_root = roots_from_cli(cli)
 
-    data, args = load_or_create(cli.config)
+    data, args = load_or_create(cli.config, data_root=data_root)
     if cli.device == "mps":
         assert torch.backends.mps.is_available(), "MPS is not available on this machine"
         assert cli.dtype in (None, "float32"), "MPS has no float64"
@@ -667,7 +476,7 @@ def main():
     LOSS_KEYS = ("loss/train_total", "loss/train_objective", "loss/train_cost", "loss/train_voll",
                  "loss/train_penalty", "loss/train_flowreg")
 
-    run_dir = make_run_dir(Path(cli.runs_dir), cli.variant, cli.tag)
+    run_dir = make_run_dir(Path(resolve_runs_dir(cli.runs_dir, output_root, args)), cli.variant, cli.tag)
     sys.stdout = Tee(run_dir / "train.log")
     print("command:", " ".join(sys.argv))
     writer = SummaryWriter(log_dir=str(run_dir))

@@ -1157,6 +1157,307 @@ class DualClassificationNetEndToEnd(nn.Module):
             return out_mu, out_lamb
     
          
+# ----------------------------------------------------------------------------
+# Flow-first networks (moved here from flowfirst/; see flowfirst/docs/OVERVIEW.md).
+# The network predicts the line flows only and the merit-order fill computes the
+# dispatch exactly, so these classes deliberately avoid torch.set_default_device.
+# ----------------------------------------------------------------------------
+
+
+# ---- problem helpers
+def line_bounds(data):
+    """Lower and upper flow limit per line in the default dtype (the limits may be integers in the data)."""
+    device, dtype = data.cost_vec.device, torch.get_default_dtype()
+    lb = torch.tensor([-data.pImpCap[l] for l in data.L], device=device, dtype=dtype)
+    ub = torch.tensor([data.pExpCap[l] for l in data.L], device=device, dtype=dtype)
+    return lb, ub
+
+
+def split_inputs(data, X):
+    N, G = data.num_n, data.num_g
+    return X[:, :N], X[:, N:N + G]
+
+
+def hidden_sizes(args, data):
+    return [int(args["hidden_size_factor"] * data.xdim)] * args["n_layers"]
+
+
+class Scale(nn.Module):
+    """Divide the inputs by a fixed constant."""
+
+    def __init__(self, constant):
+        super().__init__()
+        self.constant = float(constant)
+
+    def forward(self, x):
+        return x / self.constant
+
+
+class Standardize(nn.Module):
+    """Per-feature (x - mean) / std with training-set statistics kept as buffers."""
+
+    def __init__(self, mean, std):
+        super().__init__()
+        self.register_buffer("mean", mean.clone())
+        self.register_buffer("std", std.clone())
+
+    def forward(self, x):
+        return (x - self.mean) / self.std
+
+
+def make_scaler(kind, X_train):
+    """None for LayerNorm inside the body, else the input-scaling module."""
+    if kind == "layernorm":
+        return None
+    if kind == "fixed":
+        return Scale(X_train.max().item())
+    if kind == "zscore":
+        return Standardize(X_train.mean(dim=0), X_train.std(dim=0).clamp_min(1e-8))
+    raise ValueError(kind)
+
+
+class ResidualBody(nn.Module):
+    """Input projection, then residual blocks of two linear layers, then the output layer.
+
+    A plain deep ReLU stack without skip connections trains poorly beyond three or
+    four layers; the skip connections keep the gradient path short. ``n_blocks``
+    blocks give 2 * n_blocks hidden linear layers.
+    """
+
+    def __init__(self, in_dim, width, n_blocks, out_dim):
+        super().__init__()
+        self.inp = nn.Linear(in_dim, width)
+        self.blocks = nn.ModuleList([nn.Sequential(nn.ReLU(), nn.Linear(width, width), nn.ReLU(), nn.Linear(width, width))
+                                     for _ in range(n_blocks)])
+        self.out = nn.Sequential(nn.ReLU(), nn.Linear(width, out_dim))
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight)
+        # small output scale: raw flows start near 0, i.e. mid-range after the sigmoid, with full gradient
+        nn.init.normal_(self.out[1].weight, std=1e-2)
+        nn.init.zeros_(self.out[1].bias)
+
+    def forward(self, x):
+        h = self.inp(x)
+        for block in self.blocks:
+            h = h + block(h)
+        return self.out(h)
+
+
+def make_body(args, data, out_dim, scaler):
+    """Feed-forward body: input LayerNorm (scaler None) or the given scaling module in front.
+
+    args["body"] "plain" is Peter's FeedForwardNet with args["n_layers"] hidden layers;
+    "residual" is ResidualBody with args["n_layers"] // 2 blocks (needs a scaler).
+    """
+    if args.get("body", "plain") == "residual":
+        assert scaler is not None, "the residual body needs --input-scale fixed or zscore"
+        width = int(args["hidden_size_factor"] * data.xdim)
+        return nn.Sequential(scaler, ResidualBody(data.xdim, width, max(1, args["n_layers"] // 2), out_dim))
+    if scaler is None:
+        body = FeedForwardNet(args, data.xdim, hidden_sizes(args, data), out_dim)
+    else:
+        body = nn.Sequential(scaler,
+                             FeedForwardNet(args, data.xdim, hidden_sizes(args, data), out_dim, layernorm=False))
+    if args.get("small_output_init", False):
+        last = (body if scaler is None else body[1]).net[-1]
+        nn.init.normal_(last.weight, std=1e-2)
+        nn.init.zeros_(last.bias)
+    return body
+
+
+# ---- the merit-order fill
+# Merit-order fill: complete generation and unmet demand from the flows.
+#
+# Given flows f, the residual demand at node n is r_n = D_n - net inflow_n.
+# Each node's generators are dispatched in increasing cost order up to their
+# available capacity; whatever is left is unmet demand e_n, which is negative
+# when the node is over-supplied. This is the exact solution of the one-row
+# box LP at every node, so
+#
+#     U(f) = sum_g c_g p_g + VOLL * sum_n |e_n|
+#
+# is convex piecewise-linear in f and dU/df_l = price(from(l)) - price(to(l)),
+# where the price of a node is the cost of its marginal generator, VOLL when
+# it is short, and -VOLL when it is over-supplied. Autograd through the fill
+# produces exactly that gradient; ``price_interval`` gives it explicitly,
+# including the left/right pair at a kink.
+#
+# Cost ties within a node are broken by generator index. That is the place
+# where a deterministic cost perturbation would go later.
+class MeritOrderFill:
+    def __init__(self, data, voll=None):
+        """voll overrides the dataset's value of lost load, e.g. for a training-time penalty."""
+        self.cost = data.cost_vec.clone()                  # [G]
+        self.voll = float(data.pVOLL if voll is None else voll)
+        self.node_to_gen = data.node_to_gen_mask.clone()   # [N, G]
+        self.lineflow = data.lineflow_mask.clone()         # [N, L], -1 at from-node, +1 at to-node
+
+        same_node = (self.node_to_gen.T @ self.node_to_gen).bool()          # [G, G]
+        c, idx = self.cost, torch.arange(len(self.cost), device=self.cost.device)
+        precedes = (c[None, :] < c[:, None]) | ((c[None, :] == c[:, None]) & (idx[None, :] < idx[:, None]))
+        # [g, g'] = 1 if g' is dispatched before g at the same node
+        self.precedes_same_node = (same_node & precedes).to(self.cost.dtype)
+
+    # ---- pieces -----------------------------------------------------------
+    def residual(self, D, f):
+        """r_n = D_n - net inflow_n, shape [B, N]."""
+        return D - f @ self.lineflow.T
+
+    def dispatch(self, r, cap):
+        """Merit-order fill. r: [B, N], cap: [B, G]. Returns p [B, G], e [B, N]."""
+        r_g = r @ self.node_to_gen                       # residual of each generator's node
+        before = cap @ self.precedes_same_node.T         # capacity of cheaper units at that node
+        p = torch.minimum(torch.relu(r_g - before), cap)
+        e = r - p @ self.node_to_gen.T
+        return p, e
+
+    def cost_fn(self, p, e):
+        return p @ self.cost + self.voll * e.abs().sum(dim=1)
+
+    def __call__(self, D, cap, f):
+        """Returns p, e, U for flows f. Differentiable in f."""
+        p, e = self.dispatch(self.residual(D, f), cap)
+        return p, e, self.cost_fn(p, e)
+
+    # ---- explicit prices --------------------------------------------------
+    def price_interval(self, r, cap):
+        """Left and right derivative of the node cost in r, shape [B, N] each.
+
+        They coincide except at a kink, where r sits exactly on a capacity
+        breakpoint. Lo is the price just below r, hi the price just above.
+        """
+        r_g = r @ self.node_to_gen
+        before = cap @ self.precedes_same_node.T
+        after = before + cap
+        lo_mask = (before < r_g) & (r_g <= after)        # unique generator per node, or none
+        hi_mask = (before <= r_g) & (r_g < after)
+        cost = self.cost[None, :].expand_as(r_g)
+        lo_g = torch.where(lo_mask, cost, torch.zeros_like(cost)) @ self.node_to_gen.T
+        hi_g = torch.where(hi_mask, cost, torch.zeros_like(cost)) @ self.node_to_gen.T
+        has_lo = (lo_mask.to(cost.dtype) @ self.node_to_gen.T) > 0
+        has_hi = (hi_mask.to(cost.dtype) @ self.node_to_gen.T) > 0
+        voll = torch.full_like(r, self.voll)
+        lo = torch.where(has_lo, lo_g, torch.where(r <= 0, -voll, voll))
+        hi = torch.where(has_hi, hi_g, torch.where(r < 0, -voll, voll))
+        return lo, hi
+
+    def flow_gradient(self, lam):
+        """dU/df_l = lam_from - lam_to for nodal prices lam [B, N]. Shape [B, L]."""
+        return -(lam @ self.lineflow)
+
+
+# ---- the flow-first networks. forward(X) -> (y, f_raw, f_repaired)
+class FlowFirst(nn.Module):
+    """f predicted and sigmoid-repaired; p and md from the merit-order fill."""
+
+    def __init__(self, args, data, scaler=None):
+        super().__init__()
+        self.data = data
+        self.body = make_body(args, data, data.num_l, scaler)
+        self.repair = BoundRepairLayer(repair_scaler="Sigmoid")
+        self.fill = MeritOrderFill(data)
+        f_lb, f_ub = line_bounds(data)
+        self.register_buffer("f_lb", f_lb)
+        self.register_buffer("f_ub", f_ub)
+
+    def forward(self, X):
+        D, cap = split_inputs(self.data, X)
+        f_raw = self.body(X)
+        f = self.repair(f_raw, self.f_lb, self.f_ub)
+        p, e, _ = self.fill(D, cap, f)
+        return torch.cat([p, f, e], dim=1), f_raw, f
+
+
+class FlowFirstGNN(nn.Module):
+    """Flow-first with a message-passing network over the grid graph.
+
+    Node features: demand and the node's units in merit order, capacity and
+    cost per slot, padded to the largest node with capacity 0 and cost VOLL.
+    Edge features: the line's export and import limits. A node encoder and an
+    edge encoder map these to hidden states; each of ``rounds`` rounds updates
+    every edge from its own state and its two end nodes, then every node from
+    its own state and the sums of its incoming and outgoing edge states
+    (residual updates). The edge readout gives the raw flow, sigmoid-repaired
+    into the line limits, and the merit-order fill dispatches. With a fixed
+    topology, learnable per-node and per-edge identity embeddings are appended
+    to the encoder inputs (``id_embed`` 0 disables them). Node features are
+    z-scored with training-set statistics shared across nodes; ``--input-scale``
+    does not apply to this variant.
+    """
+
+    def __init__(self, args, data, X_train, hidden=128, rounds=3, id_embed=8, layernorm=False, antisym=False):
+        super().__init__()
+        self.data, self.fill, self.rounds, self.id_dim, self.antisym = data, MeritOrderFill(data), rounds, id_embed, antisym
+        N, L = data.num_n, data.num_l
+        M, A = data.node_to_gen_mask, data.lineflow_mask                     # [N, G], [N, L] (-1 from, +1 to)
+        dev = M.device                                                       # everything is built on the data's device
+        K = int(M.sum(dim=1).max().item())
+        slot = torch.full((N, K), -1, dtype=torch.long, device=dev)
+        for n in range(N):
+            gens = torch.nonzero(M[n]).flatten()
+            slot[n, :len(gens)] = gens[torch.argsort(data.cost_vec[gens])]   # merit order
+        self.register_buffer("slot", slot.clamp(min=0))
+        self.register_buffer("slot_valid", (slot >= 0).to(torch.get_default_dtype()))
+        self.register_buffer("cost_slots", torch.where(slot >= 0, data.cost_vec[slot.clamp(min=0)],
+                                                       torch.full((N, K), float(data.pVOLL), device=dev)))
+        self.register_buffer("from_idx", torch.nonzero(A.T == -1)[:, 1])   # node index per line, in line order
+        self.register_buffer("to_idx", torch.nonzero(A.T == 1)[:, 1])
+        self.register_buffer("A_in", (A == 1).to(torch.get_default_dtype()))
+        self.register_buffer("A_out", (A == -1).to(torch.get_default_dtype()))
+        f_lb, f_ub = line_bounds(data)
+        self.register_buffer("f_lb", f_lb)
+        self.register_buffer("f_ub", f_ub)
+        self.register_buffer("edge_feat", torch.stack([f_ub, -f_lb], dim=1) / torch.maximum(f_ub, -f_lb).max())
+        with torch.no_grad():
+            flat = self.node_features(X_train).reshape(-1, 1 + 2 * K)
+        self.register_buffer("nf_mean", flat.mean(dim=0))
+        self.register_buffer("nf_std", flat.std(dim=0).clamp_min(1e-8))
+        if id_embed > 0:
+            self.node_id = nn.Parameter(0.1 * torch.randn(N, id_embed, device=dev))
+            self.edge_id = nn.Parameter(0.1 * torch.randn(L, id_embed, device=dev))
+
+        def mlp(i, o, norm=False):
+            # pre-LayerNorm residual block: normalize the block input, not the residual stream (keeps depth trainable)
+            layers = [nn.LayerNorm(i, device=dev)] if norm else []
+            return nn.Sequential(*layers, nn.Linear(i, hidden, device=dev), nn.ReLU(), nn.Linear(hidden, o, device=dev))
+        self.node_enc = mlp(1 + 2 * K + id_embed, hidden)
+        self.edge_enc = mlp(2 + id_embed, hidden)
+        self.edge_upd = nn.ModuleList([mlp(3 * hidden, hidden, layernorm) for _ in range(rounds)])
+        self.node_upd = nn.ModuleList([mlp(3 * hidden, hidden, layernorm) for _ in range(rounds)])
+        self.readout = mlp(3 * hidden, 1)
+
+    def node_features(self, X):
+        D, cap = split_inputs(self.data, X)
+        cap_slots = cap[:, self.slot] * self.slot_valid                        # [B, N, K]
+        return torch.cat([D.unsqueeze(-1), cap_slots, self.cost_slots.expand(X.shape[0], -1, -1)], dim=-1)
+
+    def forward(self, X):
+        B, dt = X.shape[0], self.readout[-1].weight.dtype
+        nf = (self.node_features(X) - self.nf_mean) / self.nf_std
+        ef = self.edge_feat.expand(B, -1, -1)
+        if self.id_dim > 0:
+            nf = torch.cat([nf, self.node_id.expand(B, -1, -1)], dim=-1)
+            ef = torch.cat([ef, self.edge_id.expand(B, -1, -1)], dim=-1)
+        # from here to the logit the network computes in its parameters' dtype (float64 when trained, cheaper after
+        # dual.cast_net); the standardized features are O(1) and the bounds below stay in the input's dtype
+        h, e = self.node_enc(nf.to(dt)), self.edge_enc(ef.to(dt))              # [B, N, H], [B, L, H]
+        for edge_upd, node_upd in zip(self.edge_upd, self.node_upd, strict=True):
+            e = e + edge_upd(torch.cat([e, h[:, self.from_idx], h[:, self.to_idx]], dim=-1))
+            agg_in = torch.einsum("nl,blh->bnh", self.A_in, e)
+            agg_out = torch.einsum("nl,blh->bnh", self.A_out, e)
+            h = h + node_upd(torch.cat([h, agg_in, agg_out], dim=-1))
+        hf, ht = h[:, self.from_idx], h[:, self.to_idx]
+        f_raw = self.readout(torch.cat([e, hf, ht], dim=-1)).squeeze(-1)
+        if self.antisym:
+            # potential-difference bias: swapping the end nodes flips the sign of the raw flow
+            f_raw = f_raw - self.readout(torch.cat([e, ht, hf], dim=-1)).squeeze(-1)
+        f = self.f_lb + (self.f_ub - self.f_lb) * torch.sigmoid(f_raw.to(X.dtype))
+        D, cap = split_inputs(self.data, X)
+        p, unmet, _ = self.fill(D, cap, f)
+        return torch.cat([p, f, unmet], dim=1), f_raw, f
+
+
 def load(args, data, save_dir):
     primal_net = PrimalNetEndToEnd(args, data=data)
     primal_net.load_state_dict(torch.load(save_dir + '/primal_weights.pth', weights_only=True))
