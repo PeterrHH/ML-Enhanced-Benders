@@ -1872,6 +1872,31 @@ if __name__ == "__main__":
              "else CPU), independently of whatever device the nets were trained on.",
     )
 
+    parser.add_argument(
+        "--sample-duration", "--sample_duration",
+        dest="sample_duration",
+        type=int,
+        default=None,
+        help="Override Benders_args.sample_duration from the config. "
+             "Left unset, the config value is used.",
+    )
+
+    parser.add_argument(
+        "--cut-selection", "--cut_selection",
+        dest="cut_selection",
+        choices=["single", "full", "kmeans", "stress", "kmeans_dynamic", "kmeans_dynamic_shared"],
+        default=None,
+        help="Override Benders_args.cut_selection. Left unset, uses the config.",
+    )
+    parser.add_argument(
+        "--cut-selection-k", "--cut_selection_k",
+        dest="cut_selection_k",
+        type=int,
+        default=None,
+        help="Number of clusters/groups for kmeans/stress/kmeans_dynamic(_shared). "
+             "Ignored for 'single' and 'full'.",
+    )
+
     args_cli = parser.parse_args()
 
 
@@ -1888,6 +1913,29 @@ if __name__ == "__main__":
 
     with open(RUN_CONFIG_FILE, "r") as file:
         args = json.load(file)
+
+    if args_cli.sample_duration is not None:
+        args["Benders_args"]["sample_duration"] = args_cli.sample_duration
+        print(f"[override] sample_duration = {args_cli.sample_duration}")
+
+    if args_cli.cut_selection is not None:
+        args["Benders_args"]["cut_selection"] = args_cli.cut_selection
+        print(f"[override] cut_selection = {args_cli.cut_selection}")
+    if args_cli.cut_selection_k is not None:
+        args["Benders_args"]["cut_selection_k"] = args_cli.cut_selection_k
+        print(f"[override] cut_selection_k = {args_cli.cut_selection_k}")
+
+    # Coupling check: k-based strategies need a sensible k.
+    _cs = args["Benders_args"]["cut_selection"]
+    _k  = args["Benders_args"].get("cut_selection_k", 1)
+    _needs_k = _cs in ("kmeans", "stress", "kmeans_dynamic", "kmeans_dynamic_shared")
+    if _needs_k and (_k is None or _k < 1):
+        raise SystemExit(
+            f"cut_selection='{_cs}' needs --cut-selection-k >= 1 "
+            f"(got {_k}). Pass it, or set it in the config."
+        )
+    if not _needs_k and args_cli.cut_selection_k is not None:
+        print(f"[note] cut_selection='{_cs}' ignores k; --cut-selection-k={_k} has no effect.")
 
     #! Derived from the config itself rather than from its filename, so an
     #! absolute or ./-prefixed --config no longer fails.
@@ -1919,10 +1967,6 @@ if __name__ == "__main__":
     print(args)
 
 
-
-
-
-    # Train the model:
     for i, experiment_instance in enumerate(experiment["experiments"]):
         # Setup output dataframe
         df_res = pd.DataFrame(columns=["setup_time", "presolve_time", "barrier_time", "crossover_time", "restore_time", "objective_value"])
@@ -2018,10 +2062,6 @@ if __name__ == "__main__":
                         gep_data = pickle.load(file)
 
             # !Load primal and dual net
-            # primal_net_directory = "experiment-output/ch7/3nodes/primal_model"
-            # dual_net_directory = "experiment-output/ch7/3nodes/dual_model"
-            # primal_net_directory = "outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
-            # dual_net_directory = "outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
             if not args_cli.solve_direct:
                 if args_cli.primal_net_dir or "primal_net_directory" in args["Benders_args"]:
                     primal_net_directory = under_root(
