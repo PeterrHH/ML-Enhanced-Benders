@@ -108,6 +108,12 @@ def apply_cli_overrides(args, cli_args):
     args["device"] = resolve_device_name(args.get("device"))
 
 
+def save_args(directory, args):
+    """Write args.json into directory; numpy scalars are stored as plain values."""
+    with open(os.path.join(directory, "args.json"), "w") as f:
+        json.dump(args, f, indent=4, default=lambda o: o.item() if hasattr(o, "item") else str(o))
+
+
 def get_data_root(args, cli_data_root=None):
     """Deprecated: kept so older callers keep working. Use paths.resolve_roots."""
     return resolve_roots(args, argparse.Namespace(data_root=cli_data_root))["data_root"]
@@ -260,20 +266,19 @@ if __name__ == "__main__":
     #! Rooting save_dir roots every output: args.json, the repeat and Optuna
     #! subdirectories, the checkpoints and CSVs written by PrimalDualTrainer,
     #! and the TensorBoard event files, all of which join onto it.
-    save_dir = under_root(
-        os.path.join(
-            "outputs",
-            "PDL",
-            args["problem_type"],
-            run_name + "-" + str(time.time()).replace(".", "-"),
-        ),
-        output_root,
-    )
+    save_parts = ["outputs", "PDL", args["problem_type"]]
+    #! ED/GEP runs are grouped by problem size: N{|N|}_G{|G|}.
+    if args["problem_type"] != "QP":
+        save_parts.append(f"N{len(args['ED_args']['N'])}_G{len(args['ED_args']['G'])}")
+    save_parts.append(run_name + "-" + str(time.time()).replace(".", "-"))
+
+    save_dir = under_root(os.path.join(*save_parts), output_root)
 
     ensure_dir(save_dir)
 
-    with open(os.path.join(save_dir, "args.json"), "w") as f:
-        json.dump(args, f, indent=4)
+    #! Run-level copy, read by evaluate_filter.py and networks.py. Each repeat
+    #! folder also gets its own args.json with the final per-repeat args.
+    save_args(save_dir, args)
 
     if args["problem_type"] == "QP":
         from create_QP_dataset import (
@@ -392,6 +397,8 @@ if __name__ == "__main__":
                 args["repeat"] = repeat
                 if not args.get("wandb_group"):
                     args["wandb_group"] = os.path.basename(save_dir)
+
+                save_args(curr_repeat_save_dir, args)
 
                 trainer = PrimalDualTrainer(data, args, curr_repeat_save_dir)
                 primal_net, dual_net = trainer.train_PDL()
@@ -517,6 +524,7 @@ if __name__ == "__main__":
 
                 trial_save_dir = os.path.join(save_dir, f"optuna_trial:{trial.number}")
                 os.makedirs(trial_save_dir, exist_ok=True)
+                save_args(trial_save_dir, args)
 
                 trainer = PrimalDualTrainer(data, args, trial_save_dir)
                 primal_net, dual_net, primal_loss, dual_loss = trainer.train_PDL(trial)
@@ -568,6 +576,8 @@ if __name__ == "__main__":
                 args["repeat"] = repeat
                 if not args.get("wandb_group"):
                     args["wandb_group"] = os.path.basename(save_dir)
+
+                save_args(curr_repeat_save_dir, args)
 
                 # Run PDL
                 trainer = PrimalDualTrainer(data, args, curr_repeat_save_dir)
