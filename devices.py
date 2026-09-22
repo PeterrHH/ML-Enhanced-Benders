@@ -87,9 +87,17 @@ def resolve_device_name(name):
 
 
 def resolve_device(args):
-    """Map ``args["device"]`` to the ``(DTYPE, DEVICE)`` pair a run should use."""
+    """Map ``args["device"]`` to the ``(DTYPE, DEVICE)`` pair a run should use.
+
+    An explicit ``args["dtype"]`` ("float64", "float32" or a torch.dtype) wins over the
+    device's default. Only flowfirst sets it, because it runs float64 on CUDA; with the
+    key absent this is the plain device mapping the PDL runs have always used.
+    """
     name = resolve_device_name(args.get("device"))
-    return DEVICE_DTYPES[name], torch.device(name)
+    dtype = args.get("dtype")
+    if isinstance(dtype, str):
+        dtype = getattr(torch, dtype)
+    return (dtype or DEVICE_DTYPES[name]), torch.device(name)
 
 
 def move_value(value, device, dtype):

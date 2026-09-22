@@ -256,7 +256,10 @@ under-trained setting), `--lr 5e-4`, `--epochs 250`,
 
 **Inputs and precision:** `--input-scale zscore` for the MLP variants — **the
 GNN ignores it**, it z-scores its own node features. `--dtype` is float64 by
-default on CPU and CUDA, float32 forced on `mps`.
+default on CPU and CUDA, float32 forced on `mps`. The run's `--device` and
+`--dtype` also decide how the MLP variants' layers are built; the config's own
+`device` (the PDL configs say `auto`) is overridden, so a GPU login node cannot
+give float32 parameters to float64 data.
 
 **Logging:** `--eval-every`, `--log-every`, `--census-size`, `--seed`,
 `--tag`, `--runs-dir`, `--wandb` / `--no-wandb` / `--wandb-mode` /

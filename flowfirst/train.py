@@ -491,7 +491,12 @@ def main():
         data.opt_targets = {k: to(v) for k, v in data.opt_targets.items()}
         for name in ("node_to_gen_mask", "lineflow_mask", "cost_vec", "obj_coeff", "ineq_rhs", "ineq_cm", "eq_cm"):
             setattr(data, name, to(getattr(data, name)))
-        args["device"] = cli.device   # Peter's networks read this ("mps" -> float32 on the Apple GPU)
+    #! Peter's networks (FeedForwardNet, PrimalNetEndToEnd) build their parameters from args["device"] and
+    #! the dtype that device implies. Left at the config's value, a PDL config saying "auto" gives float32
+    #! CUDA parameters on a GPU node while flowfirst keeps float64 data here: "mat1 and mat2 must have the
+    #! same dtype". Both are written unconditionally, so the run's own choice is the only one in play.
+    args["device"] = cli.device
+    args["dtype"] = str(dtype).rsplit(".", 1)[-1]        # "float64" / "float32"; devices.resolve_device honours it
     args["hidden_size_factor"], args["n_layers"], args["body"] = cli.hidden_factor, cli.layers, cli.body
     args["small_output_init"] = cli.small_output_init
     penalty_weight = 0.0
