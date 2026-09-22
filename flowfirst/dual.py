@@ -450,7 +450,9 @@ def load_run(run_dir, device="cpu", dtype=None, data_root=None):
     # keys missing from older runs take the training script's defaults
     args.update(hidden_size_factor=a["hidden_factor"], n_layers=a["layers"], body=a.get("body", "plain"),
                 small_output_init=a.get("small_output_init", False))
-    n_valid_start = int(0.8 * data.X.shape[0])                       # the validation split starts here for every run
+    #! Where this run's validation rows begin. Runs made with --split pdl put them right after the
+    #! training rows instead of at 80 %, so read the recorded value; runs from before it fall back.
+    n_valid_start = a.get("valid_start", int(0.8 * data.X.shape[0]))
     X_train = data.X[:a.get("n_train", n_valid_start)]               # --train-size may have truncated the training set
     kw = dict(hidden=a.get("gnn_hidden", 128), rounds=a.get("gnn_rounds", 2), id_embed=0 if a.get("gnn_no_id_embed") else 8,
               layernorm=a.get("gnn_layernorm", False), antisym=a.get("gnn_antisym", False))

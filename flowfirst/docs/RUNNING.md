@@ -27,6 +27,15 @@ instead. With no root flag and no variable set, everything stays inside
 `flowfirst/` as it always has: datasets in `flowfirst/datasets/`, runs in
 `flowfirst/runs/`.
 
+**Weights & Biases.** The trainer reads the same keys as the PDL runs
+(`use_wandb`, `wandb_project`, `wandb_entity`, `wandb_mode`, `wandb_group`), so
+a run on a PDL config lands in the same project (`MLBenders`) next to them,
+tagged `flowfirst` and the variant. `--wandb` forces it on for a config without
+the key, `--no-wandb` off, and `--wandb-mode offline` is what compute nodes
+without outbound network need — sync afterwards with
+`wandb sync <output-root>/wandb/offline-run-*`. Everything that goes to
+TensorBoard is logged per epoch, and `summary.json` becomes the run summary.
+
 ## 2. Which dataset a config selects
 
 `--config` is the only dataset selector, the same role `-c` plays in
@@ -62,16 +71,59 @@ to `--config`** — no copy to keep in sync, and the dataset is guaranteed to be
 the one `main.py` trains on. The CLI overwrites `hidden_size_factor`,
 `n_layers` and `body`, so the config's PDL values never reach the network.
 
-Two things this does not make identical:
+Two things this does not make identical by itself:
 
-- **The split.** flowfirst always takes the first 80 % for training and the
-  next 10 % for validation, ignoring the config's `train` / `valid` and
-  `split_remainder_equally`. Same instances, not necessarily the same
-  validation rows.
+- **The rows.** By default flowfirst takes the first 80 % for training and the
+  next 10 % for validation, while PDL truncates training to `train_count` and
+  validates on the rows right after it. On the 48000-instance file that is
+  0–38400 / 38400–43200 against 0–26142 / 26142–37071: the same file, a
+  different experiment. `--split pdl --train-size 26142` makes them identical,
+  including the 37071–48000 rows neither trainer touches. The config's own
+  `train_count` is **ignored** (every config here carries 26142, which would
+  silently cut the 262k-instance runs); `train.log` prints a note when it is
+  present.
 - **What the comparison can show.** `configs/config.json` is three nodes with
   two generators per node, the F1 case where the thesis primal and flow-first
   provably compute the same function. Expect a tie; the six-node systems are
   where a difference appears.
+
+### What an epoch means here, and matching the PDL budget
+
+They are different units. `--epochs` is plain passes over the training set,
+one loop. `PrimalDualTrainer` is `outer_iterations × inner_iterations`, and
+**one inner iteration is a full pass** (`primal_dual.py`, the `train_loader`
+loop inside the inner loop), so `configs/config.json` (200 × 10) is 2000
+passes for the primal and 2000 more for the dual.
+
+On that dataset, with `--split pdl --train-size 26142`:
+
+| | PDL | flowfirst, 250 epochs |
+|---|---|---|
+| batch | 2000 | 128 |
+| steps per pass | 14 | 205 |
+| passes | 2000 primal + 2000 dual | 250 |
+| primal gradient steps | ~28,000 | ~51,000 |
+| instances seen | ~52M | ~6.5M |
+
+So flowfirst does more updates on fewer passes. 250 epochs is a time budget,
+not convergence: FINDINGS records flow-first still improving there, and F21
+measured 250 → 500 epochs taking the 6-node no-shortage total from 3.4 % to
+2.7 %. Matching PDL's 2000 passes costs about five minutes for the MLP at this
+size, so run both and say which budget a reported number used:
+
+```bash
+python -m flowfirst.train --variant flowfirst --config configs/config.json \
+  --split pdl --train-size 26142 --input-scale zscore --layers 3 \
+  --batch-size 128 --epochs 250 --eval-every 5 --tag pdlmatch-250
+
+# the same at PDL's 2000 passes
+python -m flowfirst.train --variant flowfirst --config configs/config.json \
+  --split pdl --train-size 26142 --input-scale zscore --layers 3 \
+  --batch-size 128 --epochs 2000 --eval-every 20 --tag pdlmatch-2000
+```
+
+Run each with `--variant old-prioritized` as well for the baseline on the same
+rows.
 
 ## 3. Building a sampled dataset
 
@@ -194,7 +246,7 @@ are in `jobs-x8.txt`, `jobs-6node.txt`, `jobs-6node-gnn-quick.txt`,
   `--gnn-antisym`.
 
 **Data:** `--config`, `--train-size N`, `--train-subset shortage|noshortage`,
-`--valid-size`.
+`--valid-size`, `--split flowfirst|pdl` (see §2).
 
 **Optimization:** `--batch-size 128` (the recipe; 2048 was the old
 under-trained setting), `--lr 5e-4`, `--epochs 250`,
@@ -207,7 +259,8 @@ GNN ignores it**, it z-scores its own node features. `--dtype` is float64 by
 default on CPU and CUDA, float32 forced on `mps`.
 
 **Logging:** `--eval-every`, `--log-every`, `--census-size`, `--seed`,
-`--tag`, `--runs-dir`.
+`--tag`, `--runs-dir`, `--wandb` / `--no-wandb` / `--wandb-mode` /
+`--wandb-project` / `--wandb-entity` / `--wandb-group`.
 
 ## 6. Reading the results
 
@@ -222,7 +275,13 @@ python -m flowfirst.polish_compare <run_dir> [<run_dir> …]     # raw against p
 
 Both analysis scripts take the root flags too, and otherwise read the run's
 own `data_root` from its `args.json`, so a run trained under `$SCRATCH` finds
-its dataset again instead of relabelling a fresh copy.
+its dataset again instead of relabelling a fresh copy. They also read
+`valid_start`, so a `--split pdl` run is scored on the rows it actually
+validated on; `test_range` in the same file is what neither trainer saw, for a
+final held-out table.
+
+With W&B on, the curves are in the project as well, and the run's summary
+carries the final and best validation gap.
 
 Read **`val/gap_total`** (the ratio of summed objectives) and
 `val/gap_total_noshortage` first, not the mean gap — F5 explains why the mean

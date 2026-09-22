@@ -62,11 +62,16 @@ import torch
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 
+try:
+    import wandb
+except Exception as exc:                       # the package is optional, as in logger.py
+    wandb, _WANDB_IMPORT_ERROR = None, exc
+
 from devices import KNOWN_DEVICES, resolve_device_name
 from flowfirst.dataset import DEFAULT_CONFIG, load_or_create, roots_from_cli
 from networks import (BoundRepairLayer, FlowFirst, FlowFirstGNN, MeritOrderFill, PrimalNetEndToEnd,
                       hidden_sizes, line_bounds, make_body, make_scaler, split_inputs)
-from paths import add_path_args, under_root
+from paths import add_path_args, ensure_dir, under_root
 
 torch.set_default_dtype(torch.float64)
 RUNS_DIR = Path(__file__).resolve().parent / "runs"
@@ -283,6 +288,63 @@ def gradient_census(net, data, fill, ref, f_lb, f_ub, penalty_weight, voll_price
 # ----------------------------------------------------------------------------
 # training
 # ----------------------------------------------------------------------------
+def init_wandb(cli, args, run_dir, output_root):
+    """Start a W&B run, or return None. Same config keys and project as the PDL runs (logger.py).
+
+    The config decides (`use_wandb`), the CLI overrides it, so a flowfirst run on a PDL config
+    lands beside that config's PDL runs without editing anything.
+    """
+    use = args.get("use_wandb", False)
+    if cli.no_wandb:
+        use = False
+    elif cli.wandb:
+        use = True
+    if not use:
+        return None
+    if wandb is None:
+        print(f"[wandb] requested but the package is unavailable ({_WANDB_IMPORT_ERROR}). Continuing without it.")
+        return None
+    return wandb.init(
+        project=cli.wandb_project or args.get("wandb_project") or "MLBenders",
+        entity=cli.wandb_entity or args.get("wandb_entity") or None,
+        mode=cli.wandb_mode or args.get("wandb_mode") or "online",
+        name=run_dir.name,
+        group=cli.wandb_group or args.get("wandb_group") or None,
+        tags=["flowfirst", cli.variant],
+        #! Under the output root, so a cluster run fills scratch rather than the home quota.
+        dir=ensure_dir(output_root or str(run_dir.parent)),
+        config={**vars(cli), "run_dir": str(run_dir)},
+    )
+
+
+def data_split(cli, args, n):
+    """(train_idx, valid_idx, (test_start, test_end)) for the chosen --split mode.
+
+    "flowfirst" is the split every run behind F17 to F32 used: the first 80 % of the
+    instances train, the next 10 % validate, and --train-size only shortens the
+    training set, leaving the validation window where it is.
+
+    "pdl" mirrors PrimalDualTrainer instead, so a flowfirst run can be compared with a
+    PDL run row for row: --train-size takes the role of the config's train_count, the
+    validation window starts immediately after the training rows, and what follows is
+    the held-out remainder both trainers leave untouched.
+
+    The config's own train_count is deliberately ignored in both modes: every config in
+    this repo carries 26142, which would silently cut the 262k-instance runs.
+    """
+    if cli.split == "pdl":
+        n_train = min(int(cli.train_size), n) if cli.train_size is not None else int(args["train"] * n)
+        remaining = n - n_train
+        n_valid = remaining // 2 if args.get("split_remainder_equally", True) else int(args["valid"] * n)
+    else:
+        n_train, n_valid = int(0.8 * n), int(0.1 * n)
+    train_idx = torch.arange(0, n_train)
+    valid_idx = torch.arange(n_train, n_train + n_valid)
+    if cli.split != "pdl" and cli.train_size is not None:
+        train_idx = train_idx[:cli.train_size]
+    return train_idx, valid_idx, (n_train + n_valid, n)
+
+
 def resolve_runs_dir(runs_dir, output_root, args):
     """--runs-dir wins; then the output root, grouped by problem size as main.py groups its runs; then the package."""
     if runs_dir is not None:
@@ -371,6 +433,11 @@ def main():
                     help="lost-load price in the training loss only (default: the dataset's VOLL)")
     ap.add_argument("--train-subset", choices=("all", "noshortage", "shortage"), default="all",
                     help="restrict training instances by whether Gurobi's optimum sheds load; validation stays complete")
+    ap.add_argument("--split", choices=("flowfirst", "pdl"), default="flowfirst",
+                    help="flowfirst: first 80 %% train, next 10 %% validate, as every run behind F17-F32. "
+                         "pdl: PrimalDualTrainer's split, so the rows match a PDL run trained on the same "
+                         "config (--train-size plays the role of train_count, validation follows the "
+                         "training rows, the remainder is left untouched by both).")
     ap.add_argument("--train-size", type=int, default=None,
                     help="use only the first N training instances (after --train-subset); for overfit tests")
     ap.add_argument("--eval-every", type=int, default=1,
@@ -397,6 +464,14 @@ def main():
                     help="where run directories go; default flowfirst/runs, or "
                          "<output-root>/outputs/FlowFirst/ED/N<nodes>_G<generators> when a root is given")
     ap.add_argument("--log-every", type=int, default=10)
+    #! W&B, same keys and project as the PDL runs; the config's use_wandb decides unless one of these is given.
+    ap.add_argument("--wandb", action="store_true", help="log to W&B even if the config does not set use_wandb")
+    ap.add_argument("--no-wandb", action="store_true", help="never log to W&B, whatever the config says")
+    ap.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default=None,
+                    help="'offline' on compute nodes without outbound network, then 'wandb sync <output-root>/wandb/offline-run-*'")
+    ap.add_argument("--wandb-project", default=None)
+    ap.add_argument("--wandb-entity", default=None)
+    ap.add_argument("--wandb-group", default=None, help="cluster related runs on one chart, e.g. the SLURM job id")
     cli = ap.parse_args()
     #! Resolve "auto" once, here, so every later check reads a concrete device name, as main.py does.
     cli.device = resolve_device_name(cli.device)
@@ -425,19 +500,15 @@ def main():
 
     torch.manual_seed(cli.seed)
     n = data.X.shape[0]
-    n_train, n_valid = int(0.8 * n), int(0.1 * n)
-    train_idx = torch.arange(0, n_train)
-    valid_idx = torch.arange(n_train, n_train + n_valid)
+    train_idx, valid_idx, test_range = data_split(cli, args, n)
     if cli.train_subset != "all":
         sheds = data.split_dec_vars_from_Y(data.opt_targets["y_operational"])[2].sum(dim=1) > 1e-6
         keep = sheds if cli.train_subset == "shortage" else ~sheds
         train_idx = train_idx[keep[train_idx]]
-    if cli.train_size is not None:
-        train_idx = train_idx[:cli.train_size]
     n_train = len(train_idx)
     if cli.valid_size is not None:
         valid_idx = valid_idx[:cli.valid_size]
-        n_valid = len(valid_idx)
+    n_valid = len(valid_idx)
     ref_valid = Reference(data, valid_idx)
     ref_census = Reference(data, valid_idx[:cli.census_size])
     ref_train_eval = Reference(data, train_idx[:n_valid])       # fit on the training instances themselves
@@ -480,17 +551,30 @@ def main():
     sys.stdout = Tee(run_dir / "train.log")
     print("command:", " ".join(sys.argv))
     writer = SummaryWriter(log_dir=str(run_dir))
+    wandb_run = init_wandb(cli, args, run_dir, output_root)
+    if wandb_run is not None:
+        #! .url is None (and warns) in offline mode, so report the name and let W&B print its own URL.
+        print(f"wandb run: {wandb_run.name}  mode: {wandb_run.settings.mode}")
     with open(run_dir / "args.json", "w") as fh:
         #! The resolved roots overwrite the raw CLI strings: --home-path leaves cli.data_root None, and
         #! load_run reads this key to find the dataset again from an analysis script.
         json.dump({**vars(cli), "data_root": data_root, "output_root": output_root,
                    "penalty_weight_used": penalty_weight, "train_voll_used": train_voll,
                    "n_train": n_train, "n_valid": n_valid,
+                   #! load_run and the analysis scripts read these back: with --split pdl the validation
+                   #! window is not at int(0.8 * n) any more, and test_range is what neither trainer saw.
+                   "valid_start": int(valid_idx[0]), "test_range": list(test_range),
                    "hidden_sizes": hidden_sizes(args, data), "n_params": sum(p.numel() for p in net.parameters())},
                   fh, indent=2)
     print(f"run dir: {run_dir}   params: {sum(p.numel() for p in net.parameters())}   "
           f"train/valid: {n_train}/{n_valid}   penalty weight: {penalty_weight}   "
           f"train VOLL: {train_voll}   input scale: {cli.input_scale}")
+    print(f"split '{cli.split}': train 0-{int(train_idx[-1]) + 1}, valid {int(valid_idx[0])}-{int(valid_idx[-1]) + 1}, "
+          f"untouched {test_range[0]}-{test_range[1]}")
+    if args.get("train_count") is not None:
+        #! Every config in this repo carries train_count 26142 from the PDL side; honouring it would
+        #! silently cut the 262k-instance runs. --train-size is the explicit way to ask for it.
+        print(f"[note] config train_count={args['train_count']} is ignored; pass --train-size to truncate training")
 
     csv_rows = []
     best = {"epoch": -1, "val/gap_mean": float("inf")}
@@ -510,6 +594,8 @@ def main():
         for k, v in row.items():
             if k != "epoch":
                 writer.add_scalar(k, v, epoch)
+        if wandb_run is not None:
+            wandb_run.log({k: v for k, v in row.items() if k != "epoch"}, step=epoch)
         csv_rows.append(row)
         if do_eval and row["val/gap_mean"] < best["val/gap_mean"]:
             best.update(epoch=epoch, **{"val/gap_mean": row["val/gap_mean"]})
@@ -599,6 +685,9 @@ def main():
         for r in csv_rows:
             w.writerow({k: r.get(k, "") for k in keys})
     writer.close()
+    if wandb_run is not None:
+        wandb_run.summary.update(summary)
+        wandb_run.finish()
     print(f"saved model.pt, model_best.pt, metrics.csv, summary.json in {run_dir}")
 
 
