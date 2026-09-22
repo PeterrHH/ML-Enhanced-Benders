@@ -450,6 +450,24 @@ class BendersSolver():
         #! Shared by default, so building many solvers in a loop does not open
         #! one Gurobi environment (and, under WLS, one licence session) each.
         self.env = env if env is not None else get_shared_env()
+        self._sample_mats_src = None  # (data, sample) the cached matrices belong to
+        self._sample_mats = None
+
+    def _sample_matrices(self, data, sample):
+        """data.get_sample_matrices(sample), built once and reused.
+
+        The full-horizon matrices are dense (kron over every timestep) and do
+        not depend on the investment, yet were rebuilt several times per
+        Benders iteration -- most of each iteration's wall time. Callers only
+        slice or copy them, never write into them, so sharing is safe.
+        """
+        src = self._sample_mats_src
+        if src is None or src[0] is not data or src[1] != sample:
+            self._sample_mats = data.get_sample_matrices(sample)
+            #! Keep `data` itself, not id(data): an id can be reused once the
+            #! object is garbage collected.
+            self._sample_mats_src = (data, sample)
+        return self._sample_mats
 
     def check_licence(self, data, label=""):
         """Fail now if the licence cannot take a model this size.
@@ -753,7 +771,7 @@ class BendersSolver():
         m.setObjective(obj_u @ u + alpha.sum(), GRB.MINIMIZE)
 
         # Original investment-side inequality block (e.g. -u <= 0 style rows)
-        ineq_cm_sample, ineq_rhs_sample, _, _ = data.get_sample_matrices(sample)
+        ineq_cm_sample, ineq_rhs_sample, _, _ = self._sample_matrices(data, sample)
         A_base = ineq_cm_sample[:data.num_g, :data.num_g].detach().cpu().numpy()
         b_base = ineq_rhs_sample[:data.num_g].detach().cpu().numpy()
         m.addConstr(A_base @ u <= b_base, name="inv_base")
@@ -905,7 +923,7 @@ class BendersSolver():
         obj = data.obj_coeff[:data.num_g].detach().numpy()
         obj = np.concatenate((obj, np.ones(num_alpha)), axis=0)
 
-        ineq_cm_sample, ineq_rhs_sample, eq_cm_sample, eq_rhs_sample = data.get_sample_matrices(sample)
+        ineq_cm_sample, ineq_rhs_sample, eq_cm_sample, eq_rhs_sample = self._sample_matrices(data, sample)
 
         # Original investment lower-bound rows, usually -u_g <= 0
         A_ineq = ineq_cm_sample[:data.num_g, :data.num_g].detach().numpy()
@@ -1007,7 +1025,7 @@ class BendersSolver():
 
     #     # Use the pre-converted numpy matrix if provided; else fall back.
     #     if ineq_cm_np is None:
-    #         ineq_cm_np = data.get_sample_matrices(sample)[0].detach().cpu().numpy()
+    #         ineq_cm_np = self._sample_matrices(data, sample)[0].detach().cpu().numpy()
 
     #     num_rows_per_t_ineq = 2 * (data.num_g + data.num_l + data.num_n)
     #     timestep_indices = np.array(timestep_indices, dtype=int)
@@ -1065,7 +1083,7 @@ class BendersSolver():
         if compact:
             raise NotImplementedError("Grouped cuts currently support compact=False only.")
         if ineq_cm_np is None:
-            ineq_cm_np = data.get_sample_matrices(sample)[0].detach().cpu().numpy()
+            ineq_cm_np = self._sample_matrices(data, sample)[0].detach().cpu().numpy()
 
         G = data.num_g
         num_rows_per_t_ineq = 2 * (G + data.num_l + data.num_n)
@@ -1129,7 +1147,7 @@ class BendersSolver():
     ):
         # Lazy fallback if caller didn't provide it
         if ineq_cm_np is None:
-            ineq_cm_np = data.get_sample_matrices(sample)[0].detach().cpu().numpy()
+            ineq_cm_np = self._sample_matrices(data, sample)[0].detach().cpu().numpy()
 
         if self.cut_selection == "single":
             cut = self.find_benders_cut_batch(
@@ -1213,7 +1231,7 @@ class BendersSolver():
         # --- Phase 0: fetch + convert sample matrices ---
         t0 = time.time()
         ineq_cm_sample, ineq_rhs_sample, eq_cm_sample, eq_rhs_sample = \
-            data.get_sample_matrices(sample)
+            self._sample_matrices(data, sample)
         t_getmat = time.time() - t0
 
         t0 = time.time()
@@ -1360,7 +1378,7 @@ class BendersSolver():
         return primal_obj_val_total, dual_obj_val_total, benders_cuts, inference_time_total
 
     def find_subproblem_cm_rhs_obj(self, data,compact,sample,investments,time_step):
-        ineq_cm_sample, ineq_rhs_sample, eq_cm_sample, eq_rhs_sample = data.get_sample_matrices(sample) # TODO: Added only for optimise dataset
+        ineq_cm_sample, ineq_rhs_sample, eq_cm_sample, eq_rhs_sample = self._sample_matrices(data, sample) # TODO: Added only for optimise dataset
         # Calculate information about subproblem sizes
         num_rows_per_t_ineq = 2 * (data.num_g + data.num_l + data.num_n) # lower and upper bounds for p_g, f_l and md_n 
         num_rows_per_t_eq = data.num_n # energy balance equality for each node
@@ -1428,7 +1446,7 @@ class BendersSolver():
         return obj, A_ineq, b_ineq, A_eq, b_eq
 
     def find_benders_cut(self, data, compact, sample, investments, old_benders_cut, time_step, b_ineq, b_eq, obj_val, dual_val):
-        ineq_cm_sample, ineq_rhs_sample, eq_cm_sample, eq_rhs_sample = data.get_sample_matrices(sample) # TODO: Added only for optimise dataset
+        ineq_cm_sample, ineq_rhs_sample, eq_cm_sample, eq_rhs_sample = self._sample_matrices(data, sample) # TODO: Added only for optimise dataset
         benders_cut_lhs = old_benders_cut[0]
         benders_cut_rhs = old_benders_cut[1]
 
@@ -1483,7 +1501,7 @@ class BendersSolver():
         Vectorized Benders cut aggregation (non-compact case) over time steps.
         Returns the full cut (lhs, rhs) as a tuple.
         """
-        # ineq_cm_sample, _, _, _ = data.get_sample_matrices(sample) # TODO: Added only for optimise dataset
+        # ineq_cm_sample, _, _, _ = self._sample_matrices(data, sample) # TODO: Added only for optimise dataset
         T = dual_vals.shape[0]
         num_rows_per_t_ineq = 2 * (data.num_g + data.num_l + data.num_n) # lower and upper bounds for production, lineflow and missed demand
 

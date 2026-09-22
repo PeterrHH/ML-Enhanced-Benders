@@ -446,6 +446,20 @@ python gen_GEP/solve_for_train.py
 
 This writes an ED dataset to `data/ED_data_gen/`.
 
+`solve_for_train.py` solves instances in parallel, one worker process per
+instance, and then splits the label LPs across the same workers. By default it
+uses every CPU the job was allotted (`$SLURM_CPUS_PER_TASK`).
+
+| Flag | Default | Effect |
+|---|---|---|
+| `-j/--workers` | allotted CPUs | Worker processes; `1` runs serially in-process |
+| `--threads` | CPUs // workers | torch/BLAS/Gurobi threads per worker |
+| `--check-direct` | off | Also solve each instance as one MIP and print its objective next to Benders' |
+
+Each worker holds its own Gurobi environment, so under a WLS licence it holds
+its own licence session. With `-j` fewer than the number of instances, workers
+pick up the next instance as they finish.
+
 ## Training on the harvested dataset
 
 Point `main.py` at the harvested file instead of generating one:
