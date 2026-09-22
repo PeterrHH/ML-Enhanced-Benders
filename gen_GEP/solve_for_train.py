@@ -4,6 +4,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import torch
 import json
+import math
 from sklearn.cluster import KMeans
 import sys
 sys.path.insert(
@@ -30,7 +31,9 @@ HORIZON   = 219
 SPLIT_SEED = 42   # near your other knobs at the top, for reproducibility
 N_HOUR_CLUSTERS   = 20    # representative hour-groups per instance
 HOURS_PER_CLUSTER = 1     # hours kept per cluster
-N_INV_CLUSTERS = 30       # Unique amount of Inv Clusters
+
+
+TARGET_STATES = 48000
 
 CUT_SELECTION = "single"  # "single" or "full" (full = all cuts, single = one cut per iteration)
 
@@ -220,14 +223,14 @@ def restrict_to_hours(gep_data, kept_hours):
                for (nn, tech, tt), v in gep_data.pGenAva.items() if tt in remap}
     return pDemand, pGenAva, list(range(1, len(kept_hours) + 1))
 
-def build_instance_X(h, args, n_hour_clusters, hours_per_cluster):
+def build_instance_X(h, args, n_hour_clusters, n_inv_clusters):
     with open(h["instance_path"], "rb") as f:
         gep_data = pickle.load(f)
 
-    kept = select_representative_hours(gep_data, n_hour_clusters, hours_per_cluster)
+    kept = select_representative_hours(gep_data, n_hour_clusters, HOURS_PER_CLUSTER)
     pDemand, pGenAva, new_T = restrict_to_hours(gep_data, kept)
 
-    traj = cluster_investments(h["trajectory"], N_INV_CLUSTERS)
+    traj = cluster_investments(h["trajectory"], n_inv_clusters) 
     U, Tn = traj.shape[0], len(new_T)
     pUnitInvestment = torch.tensor(np.repeat(traj, Tn, axis=0), dtype=torch.float64)
 
@@ -256,15 +259,9 @@ def _init_worker(threads):
     torch.set_num_threads(threads)
     get_shared_env().setParam("Threads", threads)
 
-def _harvest_instance(i, path, args, check_direct, keep_op):
-    """Everything per instance: Benders, then hour/investment clustering and X.
-
-    Returns plain numpy/bytes rather than tensors: torch registers
-    shared-memory reducers with multiprocessing, which hands every returned
-    tensor over as an open file descriptor and runs out of them on big runs.
-    """
+def _harvest_instance(i, path, args, check_direct, keep_op, n_inv_clusters, n_hour_clusters):
     h = solve_and_harvest(path, args, CUT_SELECTION, 1, check_direct=check_direct)
-    op, X, U = build_instance_X(h, args, N_HOUR_CLUSTERS, HOURS_PER_CLUSTER)
+    op, X, U = build_instance_X(h, args, n_hour_clusters, n_inv_clusters)  
     h["n_raw_unique"] = int(np.unique(h["trajectory"], axis=0).shape[0])
     h["n_inv_kept"] = int(U)
     #! Only the first instance's op becomes the saved dataset object; shipping
@@ -370,8 +367,15 @@ def main():
         )
 
     paths = sorted(glob.glob(os.path.join(DIR, "gep_instance_*.pkl")))
+    
     print(f"DIR PATH: {DIR}")
-    print(len(paths), "GEP instances found for training data harvest")
+
+    per_instance = TARGET_STATES / max(1, len(paths))
+    n_hour_clusters = N_HOUR_CLUSTERS                     
+    n_inv_clusters  = max(1, round(per_instance / n_hour_clusters))
+    print(f"Targeting {TARGET_STATES:,} states: {len(paths)} instances "
+          f"× {n_inv_clusters} inv × {n_hour_clusters} hours "
+          f"= {len(paths) * n_inv_clusters * n_hour_clusters:,}")
 
     #! Say so here rather than crashing further down on an empty harvest list.
     if not paths:
@@ -407,7 +411,8 @@ def main():
 
     try:
         harvest, Xs, base_bytes = [None] * len(paths), [None] * len(paths), None
-        jobs = [(i, p, args, cli_args.check_direct, i == 0) for i, p in enumerate(paths)]
+        jobs = [(i, p, args, cli_args.check_direct, i == 0, n_inv_clusters, n_hour_clusters)
+        for i, p in enumerate(paths)]
         t0 = time.time()
         for done, (i, h, X, op_bytes) in enumerate(_run(pool, _harvest_instance, jobs), 1):
             harvest[i], Xs[i] = h, X
