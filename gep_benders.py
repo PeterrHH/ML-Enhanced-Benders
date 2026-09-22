@@ -2102,8 +2102,8 @@ if __name__ == "__main__":
                     dual_net = DualClassificationNetEndToEnd(dual_model_args, operational_data)
                 else:
                     dual_net = DualNetEndToEnd(dual_model_args, operational_data)
-                primal_net.load_state_dict(torch.load(os.path.join(primal_net_directory, "primal_weights.pth"), weights_only=True), strict = False)
-                dual_net.load_state_dict(torch.load(os.path.join(dual_net_directory, "dual_weights.pth"), weights_only=True), strict = False)
+                primal_net.load_state_dict(torch.load(os.path.join(primal_net_directory, "primal_weights.pth"), weights_only=True, map_location = BENDERS_DEVICE), strict = False)
+                dual_net.load_state_dict(torch.load(os.path.join(dual_net_directory, "dual_weights.pth"), weights_only=True, map_location = BENDERS_DEVICE), strict = False)
                 primal_net.eval()
                 dual_net.eval()
 
