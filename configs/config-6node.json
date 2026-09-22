@@ -208,7 +208,7 @@
         "heuristic_lambda_unmet_safety_mass": 0.02,
         "heuristic_lambda_tier2_confidence": 0.1,
         "use_direct_data": true,
-        "direct_data_path": "data/ED_data_gen/GEP_train_data_N6_G30_L8_H219.pkl"
+        "direct_data_path": "data/ED_data_gen/GEP_train_data_N6_G22_L8_H219.pkl"
     },
     "Benders_args": {
         "N": [
