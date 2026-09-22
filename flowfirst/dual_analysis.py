@@ -9,19 +9,23 @@ import time
 
 import torch
 
+from flowfirst.dataset import roots_from_cli
 from flowfirst.dual import DualRecovery, PathPolish, Polish, load_run
 from flowfirst.train import Reference
+from paths import add_path_args
 
 torch.set_default_dtype(torch.float64)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_path_args(ap)
     ap.add_argument("run_dir")
     ap.add_argument("--valid-size", type=int, default=8192)
     ap.add_argument("--cold-sweeps", type=int, default=30)
     cli = ap.parse_args()
-    data, net, valid_start = load_run(cli.run_dir)
+    data_root, _ = roots_from_cli(cli)
+    data, net, valid_start = load_run(cli.run_dir, data_root=data_root)
     ref = Reference(data, torch.arange(valid_start, valid_start + cli.valid_size))
     X, Q, s = ref.X, ref.obj, ref.shortage
     with torch.no_grad():

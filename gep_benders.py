@@ -1896,6 +1896,20 @@ if __name__ == "__main__":
         help="Number of clusters/groups for kmeans/stress/kmeans_dynamic(_shared). "
              "Ignored for 'single' and 'full'.",
     )
+    parser.add_argument(
+        "--benders-setup", "--benders_setup",
+        dest="benders_setup",
+        choices=["Exact", "Inexact", "Inexact_Refine", "All"],
+        default=None,
+        help="Override Benders_args.benders_setup. Left unset, uses the config.",
+    )
+    parser.add_argument(
+        "--specific-name", "--specific_name",
+        dest="specific_name",
+        default=None,
+        help="Override Benders_args.specific_name, the label in the output paths "
+            "(iter_logs_<benders_setup>_<specific_name> and the summary CSV name).",
+    )
 
     args_cli = parser.parse_args()
 
@@ -1917,6 +1931,12 @@ if __name__ == "__main__":
     if args_cli.sample_duration is not None:
         args["Benders_args"]["sample_duration"] = args_cli.sample_duration
         print(f"[override] sample_duration = {args_cli.sample_duration}")
+    if args_cli.benders_setup is not None:
+        args["Benders_args"]["benders_setup"] = args_cli.benders_setup
+        print(f"[override] benders_setup = {args_cli.benders_setup}")
+    if args_cli.specific_name is not None:
+        args["Benders_args"]["specific_name"] = args_cli.specific_name
+        print(f"[override] specific_name = {args_cli.specific_name}")
 
     if args_cli.cut_selection is not None:
         args["Benders_args"]["cut_selection"] = args_cli.cut_selection

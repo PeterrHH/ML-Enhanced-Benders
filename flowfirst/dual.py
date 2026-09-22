@@ -427,7 +427,7 @@ def cast_net(net, dtype):
     return net
 
 
-def load_run(run_dir, device="cpu", dtype=None):
+def load_run(run_dir, device="cpu", dtype=None, data_root=None):
     """Rebuild a training run's network from its `args.json` and `model.pt`.
 
     Returns `(data, net, validation_start)`, the last being the index where
@@ -439,9 +439,13 @@ def load_run(run_dir, device="cpu", dtype=None):
         dtype: casts every float tensor of the data, and so of the network
             built from it; set the default dtype to match before calling,
             because the problem constants built later follow it.
+        data_root: where the run's dataset lives, for a run trained with
+            --data-root / --home-path. Without it the package default is
+            used, and a dataset that is not there would be rebuilt and
+            relabelled by Gurobi rather than found.
     """
     a = json.load(open(Path(run_dir) / "args.json"))
-    data, args = load_or_create(a["config"])
+    data, args = load_or_create(a["config"], data_root=data_root or a.get("data_root"))
     data = cast_data(data, dtype, device)
     # keys missing from older runs take the training script's defaults
     args.update(hidden_size_factor=a["hidden_factor"], n_layers=a["layers"], body=a.get("body", "plain"),

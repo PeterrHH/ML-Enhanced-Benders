@@ -13,8 +13,10 @@ from pathlib import Path
 
 import torch
 
+from flowfirst.dataset import roots_from_cli
 from flowfirst.dual import PathPolish, Polish, load_run
 from flowfirst.train import Reference
+from paths import add_path_args
 
 torch.set_default_dtype(torch.float64)
 
@@ -27,10 +29,12 @@ def stats(U, Q, shortage):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_path_args(ap)
     ap.add_argument("run_dirs", nargs="+")
     ap.add_argument("--valid-size", type=int, default=8192)
     ap.add_argument("--sweeps", default="1,3")
     cli = ap.parse_args()
+    data_root, _ = roots_from_cli(cli)
     sweeps = [int(k) for k in cli.sweeps.split(",")]
     head = "gap mean   median no-short  <=1%  <=0.1%"
     print(f"{'run':52s} {'raw: ' + head:46s}" + "".join(f"{f'{k} sweep(s): ' + head:48s}" for k in sweeps) + "augmentations mean / p95 / max   s")
@@ -38,7 +42,7 @@ def main():
         if not (Path(run_dir) / "model.pt").exists():
             continue
         t0 = time.time()
-        data, net, valid_start = load_run(run_dir)
+        data, net, valid_start = load_run(run_dir, data_root=data_root)
         ref = Reference(data, torch.arange(valid_start, valid_start + cli.valid_size))
         X, Q, s = ref.X, ref.obj, ref.shortage
         polish, path = Polish(data), PathPolish(data)

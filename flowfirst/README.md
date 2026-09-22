@@ -19,6 +19,7 @@ labels, and nothing here touches the PDL trainer.
 | `modal/bench.py` | times the deployed pipeline of a saved run on a Modal GPU: eager, CUDA graph, compiled network, both, per precision (float64, TF32, network in float32 or half precision with the rest in float64; `--precisions`), batch 1024 and 8192, with the accuracy of each precision against the Gurobi labels (`--stages` adds the per-stage table) |
 | `tests/` | checks of the fill, the dual, the certificate and the polish against Gurobi (`pytest flowfirst`) |
 | `docs/OVERVIEW.md` | what flowfirst does and why: the major method changes, each with the finding behind it, and how they map onto the main pipeline — start here |
+| `docs/RUNNING.md` | what to type: datasets (including training on the PDL configs), the recipes per problem size, every flag by role, and how to read a run |
 | `docs/BENCHMARKING.md` | how to make the Gurobi baseline in the Benders benchmark realistic (handoff note for Peter) |
 | `docs/FINDINGS.md` | numbered findings with evidence tables |
 | `docs/IDEAS.md` | prioritized backlog of training and architecture changes |

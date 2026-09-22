@@ -481,7 +481,10 @@ def main():
     print("command:", " ".join(sys.argv))
     writer = SummaryWriter(log_dir=str(run_dir))
     with open(run_dir / "args.json", "w") as fh:
-        json.dump({**vars(cli), "penalty_weight_used": penalty_weight, "train_voll_used": train_voll,
+        #! The resolved roots overwrite the raw CLI strings: --home-path leaves cli.data_root None, and
+        #! load_run reads this key to find the dataset again from an analysis script.
+        json.dump({**vars(cli), "data_root": data_root, "output_root": output_root,
+                   "penalty_weight_used": penalty_weight, "train_voll_used": train_voll,
                    "n_train": n_train, "n_valid": n_valid,
                    "hidden_sizes": hidden_sizes(args, data), "n_params": sum(p.numel() for p in net.parameters())},
                   fh, indent=2)
