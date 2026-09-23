@@ -2155,12 +2155,18 @@ if __name__ == "__main__":
                     primal_model_args["device"] = BENDERS_DEVICE
                     dual_model_args["device"] = BENDERS_DEVICE
 
-                    best_args = {'primal_lr': 0.0006785456069117277, 'hidden_size_factor': 28, 'n_layers': 2, 'decay': 0.9989743016070536, 'batch_size': 2048}  #! Temporary, for primal net
-                    primal_model_args["primal_lr"] = best_args["primal_lr"]
-                    primal_model_args["hidden_size_factor"] = best_args["hidden_size_factor"]
-                    primal_model_args["n_layers"] = best_args["n_layers"]
-                    primal_model_args["decay"] = best_args["decay"]
-                    primal_model_args["batch_size"] = best_args["batch_size"]
+                    #! The run's own args.json decides the architecture. Forcing main.py's
+                    #! best_args here rebuilt every primal net at 2 x 28 * xdim, which does not
+                    #! load a run trained with any other depth or width. Only runs from before
+                    #! main.py recorded its post-override args need the fallback: they store
+                    #! hidden_size_factor false for a net that was trained at 28.
+                    if not primal_model_args.get("hidden_size_factor"):
+                        primal_model_args["hidden_size_factor"] = 28
+                        primal_model_args["n_layers"] = 2
+                        print("[pdl] args.json records no usable hidden_size_factor; assuming main.py's "
+                              "best_args (28 x xdim, 2 layers)")
+                    print(f"[pdl] PrimalNetEndToEnd n_layers={primal_model_args['n_layers']} "
+                          f"hidden_size_factor={primal_model_args['hidden_size_factor']} from {primal_net_directory}")
                     primal_net = PrimalNetEndToEnd(primal_model_args, operational_data)
                     if args["dual_classification"]:
                         dual_net = DualClassificationNetEndToEnd(dual_model_args, operational_data)
