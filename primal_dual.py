@@ -329,6 +329,8 @@ class PrimalDualTrainer():
 
         self.primal_net.to(self.DTYPE).to(self.DEVICE)
 
+        self.init_input_normalization()
+
         if self.logger:
             self.logger.watch(self.primal_net, self.dual_net)
 
@@ -403,6 +405,37 @@ class PrimalDualTrainer():
 
 
 
+
+    def init_input_normalization(self):
+        """Fill the z-score buffers of the nets from the TRAINING rows.
+
+        networks.py registers d_mean/d_std/p_mean/p_std whenever
+        args["normalize_input"] == "z_score", but nothing ever wrote them: the buffers
+        stayed at 0 and 1, so the path scaled x to (x - 0) / 1 and did nothing. The
+        statistics have to come from the training split alone, and being buffers they
+        travel with the checkpoint, so evaluation reproduces them.
+
+        Note the key is read from the top level of the config, not from ED_args.
+        """
+        if self.args.get("normalize_input") != "z_score":
+            return
+
+        X_train = self.X[self.train_indices]
+        n, g = self.data.num_n, self.data.num_g
+        stats = {
+            "d": (X_train[:, :n].mean(dim=0), X_train[:, :n].std(dim=0).clamp_min(1e-8)),
+            "p": (X_train[:, n:n + g].mean(dim=0), X_train[:, n:n + g].std(dim=0).clamp_min(1e-8)),
+        }
+        with torch.no_grad():
+            for net in (self.primal_net, self.dual_net):
+                if getattr(net, "normalize", None) != "z_score":
+                    continue
+                for prefix, (mean, std) in stats.items():
+                    if hasattr(net, f"{prefix}_mean"):
+                        getattr(net, f"{prefix}_mean").copy_(mean.to(self.DTYPE))
+                        getattr(net, f"{prefix}_std").copy_(std.to(self.DTYPE))
+        print(f"[normalize] z-score statistics from {len(self.train_indices)} training rows: "
+              f"demand mean {stats['d'][0].mean():.1f}, capacity mean {stats['p'][0].mean():.1f}")
 
     def build_topology_features(self, X):
         """

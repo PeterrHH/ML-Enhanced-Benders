@@ -19,31 +19,16 @@
         "N": [
             "BEL",
             "GER",
-            "FRA",
-            "SPA",
-            "NED",
-            "SWI"
+            "FRA"
         ],
         "G": [
             [
                 "BEL",
-                "Gas"
-            ],
-            [
-                "BEL",
-                "Oil"
-            ],
-            [
-                "BEL",
-                "SunPV"
-            ],
-            [
-                "BEL",
                 "WindOff"
             ],
             [
-                "GER",
-                "Coal"
+                "BEL",
+                "Gas"
             ],
             [
                 "GER",
@@ -51,15 +36,7 @@
             ],
             [
                 "GER",
-                "Oil"
-            ],
-            [
-                "GER",
                 "SunPV"
-            ],
-            [
-                "GER",
-                "WindOn"
             ],
             [
                 "FRA",
@@ -67,85 +44,21 @@
             ],
             [
                 "FRA",
-                "Oil"
-            ],
-            [
-                "FRA",
                 "SunPV"
-            ],
-            [
-                "FRA",
-                "WindOff"
-            ],
-            [
-                "SPA",
-                "Gas"
-            ],
-            [
-                "SPA",
-                "Nuclear"
-            ],
-            [
-                "SPA",
-                "WindOff"
-            ],
-            [
-                "NED",
-                "SunPV"
-            ],
-            [
-                "NED",
-                "WindOff"
-            ],
-            [
-                "NED",
-                "WindOn"
-            ],
-            [
-                "SWI",
-                "Nuclear"
-            ],
-            [
-                "SWI",
-                "SunPV"
-            ],
-            [
-                "SWI",
-                "WindOn"
             ]
         ],
         "L": [
             [
                 "BEL",
-                "FRA"
-            ],
-            [
-                "BEL",
-                "NED"
-            ],
-            [
-                "GER",
-                "FRA"
-            ],
-            [
-                "GER",
-                "NED"
-            ],
-            [
-                "SPA",
-                "FRA"
-            ],
-            [
-                "SWI",
-                "FRA"
-            ],
-            [
-                "SWI",
                 "GER"
             ],
             [
                 "BEL",
-                "GER"
+                "FRA"
+            ],
+            [
+                "GER",
+                "FRA"
             ]
         ],
         "benders_compact": false,
@@ -167,7 +80,7 @@
         "_comment": "renewable max inv means for renewabels UB is set to max investment if True, if False, UB is set to min(production capacity, max investment)",
         "gen_data_renew_availability": 100,
         "_GenAvailablity_comment": "if = 100, availability is the max(availablity) for the renewable, if < 100, availability is set to the specified percentile of availability in the original data",
-        "specific_name": "6Node",
+        "specific_name": "GenConstRenewUBTrue",
         "gen_data_node_constraint": false,
         "generate_capacity_sobol": false,
         "capacity_sobol_use_hard_cap": false,
@@ -176,38 +89,22 @@
         "heuristic_lambda_unmet_safety_mass": 0.02,
         "heuristic_lambda_tier2_confidence": 0.1,
         "use_direct_data": true,
-        "direct_data_path": "data/ED_data_gen/GEP_train_data_N6_G22_L8_H219.pkl",
-        "_comment_topology": "Mirrors Benders_args: the direct data file is the harvest built from that section (GEP_train_data_N6_G22_L8_H219.pkl), so these must agree or the run directory is mislabelled and a regenerated dataset would not match."
+        "direct_data_path": "data/ED_data_gen/GEP_train_data_N3_G6_L3_H219.pkl"
     },
     "Benders_args": {
         "N": [
             "BEL",
             "GER",
-            "FRA",
-            "SPA",
-            "NED",
-            "SWI"
+            "FRA"
         ],
         "G": [
             [
                 "BEL",
-                "Gas"
-            ],
-            [
-                "BEL",
-                "Oil"
-            ],
-            [
-                "BEL",
-                "SunPV"
-            ],
-            [
-                "BEL",
                 "WindOff"
             ],
             [
-                "GER",
-                "Coal"
+                "BEL",
+                "Gas"
             ],
             [
                 "GER",
@@ -215,15 +112,7 @@
             ],
             [
                 "GER",
-                "Oil"
-            ],
-            [
-                "GER",
                 "SunPV"
-            ],
-            [
-                "GER",
-                "WindOn"
             ],
             [
                 "FRA",
@@ -231,85 +120,21 @@
             ],
             [
                 "FRA",
-                "Oil"
-            ],
-            [
-                "FRA",
                 "SunPV"
-            ],
-            [
-                "FRA",
-                "WindOff"
-            ],
-            [
-                "SPA",
-                "Gas"
-            ],
-            [
-                "SPA",
-                "Nuclear"
-            ],
-            [
-                "SPA",
-                "WindOff"
-            ],
-            [
-                "NED",
-                "SunPV"
-            ],
-            [
-                "NED",
-                "WindOff"
-            ],
-            [
-                "NED",
-                "WindOn"
-            ],
-            [
-                "SWI",
-                "Nuclear"
-            ],
-            [
-                "SWI",
-                "SunPV"
-            ],
-            [
-                "SWI",
-                "WindOn"
             ]
         ],
         "L": [
             [
                 "BEL",
-                "FRA"
-            ],
-            [
-                "BEL",
-                "NED"
-            ],
-            [
-                "GER",
-                "FRA"
-            ],
-            [
-                "GER",
-                "NED"
-            ],
-            [
-                "SPA",
-                "FRA"
-            ],
-            [
-                "SWI",
-                "FRA"
-            ],
-            [
-                "SWI",
                 "GER"
             ],
             [
                 "BEL",
-                "GER"
+                "FRA"
+            ],
+            [
+                "GER",
+                "FRA"
             ]
         ],
         "benders_compact": false,
@@ -324,10 +149,10 @@
         "normalize_input": false,
         "repeats": 1,
         "device": "cpu",
-        "primal_net_directory": "outputs/PDL/ED/6Node_x8/REPLACE_WITH_YOUR_RUN/repeat:0",
-        "dual_net_directory": "outputs/PDL/ED/6Node_x8/REPLACE_WITH_YOUR_RUN/repeat:0",
-        "exp_save_directory": "outputs/Benders/6Node",
-        "specific_name": "6Node_x8",
+        "primal_net_directory": "outputs/PDL/ED/3Nodes-FraBelGer/Benders_ED_manual/NoClass_NormInput/repeat:0",
+        "dual_net_directory": "outputs/PDL/ED/3Nodes-FraBelGer/Benders_ED_manual/NoClass_NormInput/repeat:0",
+        "exp_save_directory": "outputs/Benders/3Node",
+        "specific_name": "Exact_km10_dynamic_shared_cap",
         "benders_setup": "Exact",
         "_Comment_benders_setup": "Benders setup options: [Exact, Inexact, Inexact_Refine, All], All is when all three are run",
         "init_investment": "Zero",
@@ -384,14 +209,14 @@
     "alpha": 10,
     "outer_iterations": 200,
     "inner_iterations": 10,
-    "batch_size": 2000,
-    "primal_lr": 0.0001,
+    "batch_size": 128,
+    "primal_lr": 0.0006785456069117277,
     "dual_lr": 0.0001,
-    "decay": 0.99,
+    "decay": 0.9989743016070536,
     "patience": 10,
     "hidden_size": 500,
-    "hidden_size_factor": false,
-    "n_layers": 2,
+    "hidden_size_factor": 28,
+    "n_layers": 3,
     "train": 0.8,
     "valid": 0.1,
     "test": 0.1,
@@ -455,5 +280,9 @@
     "use_topology_features": false,
     "use_heuristic_lambda_loss": false,
     "heuristic_lambda_weight": 10.0,
-    "train_count": 26142
+    "train_count": 26142,
+    "use_best_args": false,
+    "_comment_use_best_args": "main.py overwrites primal_lr, hidden_size_factor, n_layers, decay and batch_size with a hardcoded best_args block unless this is false. The values below are that block's, except where this run deliberately differs.",
+    "normalize_input": "z_score",
+    "_comment_matched_run": "Matched-budget PDL baseline: same rows as the flow-first runs (train_count 26142), batch 128 and 3 layers at width 28*xdim, z-scored inputs. 200x10 passes at batch 128 is ~410k primal updates, about 15x the runtime of configs/config.json; halve outer_iterations if too slow."
 }

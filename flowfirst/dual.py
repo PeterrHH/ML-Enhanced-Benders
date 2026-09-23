@@ -15,7 +15,7 @@ from pathlib import Path
 
 import torch
 
-from flowfirst.dataset import load_or_create
+from flowfirst.dataset import load_or_create, resolve_config
 from flowfirst.fill import MeritOrderFill
 from flowfirst.train import build_net, line_bounds, make_scaler, split_inputs
 
@@ -460,3 +460,103 @@ def load_run(run_dir, device="cpu", dtype=None, data_root=None):
     net = build_net(a["variant"], args, data, scaler, X_train=X_train, gnn_kwargs=kw).to(device)
     net.load_state_dict(torch.load(Path(run_dir) / "model.pt", map_location=device, weights_only=True))
     return data, net.eval(), n_valid_start
+
+
+# ----------------------------------------------------------------------------
+# Using a trained run on someone else's problem set: gep_benders.py builds its own
+# operational data per experiment, and the evaluation notebook scores every model on
+# one set of instances. Both need the network rebuilt against *given* data, and both
+# need the pair of interfaces the Benders solver calls, primal_net(X) -> y and
+# dual_net(X) -> (mu, lamb). flow-first has no dual network: the prices follow from
+# the flows (F26), and the multipliers from the prices.
+# ----------------------------------------------------------------------------
+
+def build_net_for_data(a, data, run_dir, weights="model.pt", device="cpu"):
+    """Rebuild the network of the run in `run_dir` against `data`.
+
+    Like `load_run`, but the problem set is supplied instead of loaded from the run's
+    config. Only the architecture keys of that config are read; the scaler and the GNN
+    feature statistics are buffers, so the checkpoint overwrites whatever they are
+    constructed with here.
+    """
+    with open(resolve_config(a["config"])) as fh:
+        args = json.load(fh)
+    args.update(device=device, dtype=str(torch.get_default_dtype()).rsplit(".", 1)[-1],
+                hidden_size_factor=a["hidden_factor"], n_layers=a["layers"],
+                body=a.get("body", "plain"), small_output_init=a.get("small_output_init", False))
+    X_train = data.X[:a.get("n_train", int(0.8 * data.X.shape[0]))]
+    kw = dict(hidden=a.get("gnn_hidden", 128), rounds=a.get("gnn_rounds", 2),
+              id_embed=0 if a.get("gnn_no_id_embed") else 8,
+              layernorm=a.get("gnn_layernorm", False), antisym=a.get("gnn_antisym", False))
+    scaler = None if a["variant"] == "flowfirst-gnn" else make_scaler(a.get("input_scale", "layernorm"), X_train)
+    net = build_net(a["variant"], args, data, scaler, X_train=X_train, gnn_kwargs=kw).to(device)
+    net.load_state_dict(torch.load(Path(run_dir) / weights, map_location=device, weights_only=True))
+    return net.eval()
+
+
+class FlowFirstPrimal:
+    """A flow-first network behind the `primal_net(X) -> y` interface.
+
+    The network returns (y, f_raw, f); `polish_sweeps` exact line-search sweeps are
+    applied to the flows first, which is what the deployed pipeline does and what cuts
+    the gap by about five (F27). 0 scores the network alone.
+    """
+
+    def __init__(self, net, data, polish_sweeps=1):
+        self.net, self.data, self.sweeps = net, data, polish_sweeps
+        self.fill = MeritOrderFill(data)
+        self.polish = Polish(data) if polish_sweeps else None
+
+    def flows(self, X):
+        with torch.no_grad():
+            f = self.net(X)[2]
+            if self.polish is not None:
+                f, _ = self.polish(X, f, self.sweeps)
+        return f
+
+    def __call__(self, X, total_demands=None):
+        D, cap = split_inputs(self.data, X)
+        f = self.flows(X)
+        p, e, _ = self.fill(D, cap, f)
+        return torch.cat([p, f, e], dim=1)
+
+    def eval(self):
+        return self
+
+
+class FlowFirstDual:
+    """The constructed dual behind the `dual_net(X) -> (mu, lamb)` interface.
+
+    Prices from the quotient fill over regions of uncongested lines plus node-wise
+    ascent (F26); `completion` turns them into the box multipliers, in the row order
+    the problem class and the Benders cut builder use. The price is returned negated,
+    the convention the problem class stores and `dual_obj_fn` expects.
+    """
+
+    def __init__(self, primal, data, ascent_sweeps=3):
+        self.primal, self.recovery, self.sweeps = primal, DualRecovery(data), ascent_sweeps
+
+    def __call__(self, X):
+        with torch.no_grad():
+            lam = self.recovery.prices(X, self.primal.flows(X), self.sweeps)
+        return self.recovery.completion(lam), -lam
+
+    def eval(self):
+        return self
+
+
+def load_flowfirst_pair(run_dir, data, weights="model.pt", polish_sweeps=1, device="cpu"):
+    """(primal, dual) adapters for the flow-first run in `run_dir`, on `data`.
+
+    Drop-in for the `(primal_net, dual_net)` pair `gep_benders.py` loads from two PDL
+    checkpoint directories; here one directory holds the only network there is.
+    """
+    a = json.load(open(Path(run_dir) / "args.json"))
+    net = build_net_for_data(a, data, run_dir, weights=weights, device=device)
+    primal = FlowFirstPrimal(net, data, polish_sweeps)
+    return primal, FlowFirstDual(primal, data)
+
+
+def is_flowfirst_run(run_dir, weights="model.pt"):
+    """A flow-first run directory holds one network and no dual checkpoint."""
+    return (Path(run_dir) / weights).exists()

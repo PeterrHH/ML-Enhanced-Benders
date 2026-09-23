@@ -1861,7 +1861,25 @@ if __name__ == "__main__":
         "--dual-net-dir", "--dual_net_dir",
         dest="dual_net_dir",
         default=None,
-        help="Override Benders_args.dual_net_directory.",
+        help="Override Benders_args.dual_net_directory. Ignored for a flow-first primal "
+             "directory, whose dual is constructed rather than loaded.",
+    )
+
+    #! Only read when --primal-net-dir points at a flow-first run (a directory with model.pt).
+    parser.add_argument(
+        "--flowfirst-weights", "--flowfirst_weights",
+        dest="flowfirst_weights",
+        default=None,
+        help="Which checkpoint of a flow-first run to use: model.pt (default), "
+             "model_best.pt, or model_ema.pt for a run trained with --ema.",
+    )
+    parser.add_argument(
+        "--flowfirst-polish-sweeps", "--flowfirst_polish_sweeps",
+        dest="flowfirst_polish_sweeps",
+        type=int,
+        default=None,
+        help="Exact line-search sweeps over the predicted flows before each subproblem "
+             "answer (default 1). 0 uses the network's raw flows.",
     )
     parser.add_argument(
         "--device",
@@ -2092,7 +2110,18 @@ if __name__ == "__main__":
                     raise ValueError("Please provide a directory for the primal net in the config file under Benders_args with key 'primal_net_directory'")
                     primal_net_directory = "outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
                 
-                if args_cli.dual_net_dir or "dual_net_directory" in args["Benders_args"]:
+                #! A flow-first run holds one network and no dual checkpoint: its prices are
+                #! constructed from the predicted flows, so the pair of interfaces this solver
+                #! calls comes from one directory and dual_net_directory is not read.
+                flowfirst_weights = (args_cli.flowfirst_weights
+                                     or benders_args.get("flowfirst_weights", "model.pt"))
+                #! By the presence of the checkpoint, not by importing flowfirst: its trainer sets the
+                #! global default dtype to float64 at import time, which the PDL path must not inherit.
+                use_flowfirst = os.path.exists(os.path.join(primal_net_directory, flowfirst_weights))
+
+                if use_flowfirst:
+                    dual_net_directory = primal_net_directory
+                elif args_cli.dual_net_dir or "dual_net_directory" in args["Benders_args"]:
                     dual_net_directory = under_root(
                         args_cli.dual_net_dir or args["Benders_args"]["dual_net_directory"],
                         output_root,
@@ -2102,30 +2131,45 @@ if __name__ == "__main__":
                     dual_net_directory = "outputs/PDL/ED/3Nodes-FraBelGer/learn_primal:True_train:0.8_rho:0.5_rhomax:5000_alpha:10_L:10-OriginalCompletionClassification/repeat:0"
                 print(f"Primal Net Directory: {primal_net_directory}")
                 print(f"Dual Net Directory: {dual_net_directory}")
-                primal_model_args = json.load(open(os.path.join(primal_net_directory, "args.json")))
-                dual_model_args = json.load(open(os.path.join(dual_net_directory, "args.json")))
 
-                #! args.json records the device the nets were TRAINED on. Without
-                #! this override a GPU-trained checkpoint would demand a GPU here,
-                #! where we only run inference. Use this run's own device instead.
-                primal_model_args["device"] = BENDERS_DEVICE
-                dual_model_args["device"] = BENDERS_DEVICE
+                if use_flowfirst:
+                    from flowfirst.dual import load_flowfirst_pair
 
-                best_args = {'primal_lr': 0.0006785456069117277, 'hidden_size_factor': 28, 'n_layers': 2, 'decay': 0.9989743016070536, 'batch_size': 2048}  #! Temporary, for primal net
-                primal_model_args["primal_lr"] = best_args["primal_lr"]
-                primal_model_args["hidden_size_factor"] = best_args["hidden_size_factor"]
-                primal_model_args["n_layers"] = best_args["n_layers"]
-                primal_model_args["decay"] = best_args["decay"]
-                primal_model_args["batch_size"] = best_args["batch_size"]
-                primal_net = PrimalNetEndToEnd(primal_model_args, operational_data)
-                if args["dual_classification"]:
-                    dual_net = DualClassificationNetEndToEnd(dual_model_args, operational_data)
+                    polish_sweeps = int(args_cli.flowfirst_polish_sweeps
+                                        if args_cli.flowfirst_polish_sweeps is not None
+                                        else benders_args.get("flowfirst_polish_sweeps", 1))
+                    print(f"[flowfirst] {flowfirst_weights} with {polish_sweeps} polish sweep(s); "
+                          f"the dual is constructed from the flows, no dual checkpoint is read")
+                    primal_net, dual_net = load_flowfirst_pair(
+                        primal_net_directory, operational_data,
+                        weights=flowfirst_weights, polish_sweeps=polish_sweeps,
+                        device=BENDERS_DEVICE,
+                    )
                 else:
-                    dual_net = DualNetEndToEnd(dual_model_args, operational_data)
-                primal_net.load_state_dict(torch.load(os.path.join(primal_net_directory, "primal_weights.pth"), weights_only=True, map_location = BENDERS_DEVICE), strict = False)
-                dual_net.load_state_dict(torch.load(os.path.join(dual_net_directory, "dual_weights.pth"), weights_only=True, map_location = BENDERS_DEVICE), strict = False)
-                primal_net.eval()
-                dual_net.eval()
+                    primal_model_args = json.load(open(os.path.join(primal_net_directory, "args.json")))
+                    dual_model_args = json.load(open(os.path.join(dual_net_directory, "args.json")))
+
+                    #! args.json records the device the nets were TRAINED on. Without
+                    #! this override a GPU-trained checkpoint would demand a GPU here,
+                    #! where we only run inference. Use this run's own device instead.
+                    primal_model_args["device"] = BENDERS_DEVICE
+                    dual_model_args["device"] = BENDERS_DEVICE
+
+                    best_args = {'primal_lr': 0.0006785456069117277, 'hidden_size_factor': 28, 'n_layers': 2, 'decay': 0.9989743016070536, 'batch_size': 2048}  #! Temporary, for primal net
+                    primal_model_args["primal_lr"] = best_args["primal_lr"]
+                    primal_model_args["hidden_size_factor"] = best_args["hidden_size_factor"]
+                    primal_model_args["n_layers"] = best_args["n_layers"]
+                    primal_model_args["decay"] = best_args["decay"]
+                    primal_model_args["batch_size"] = best_args["batch_size"]
+                    primal_net = PrimalNetEndToEnd(primal_model_args, operational_data)
+                    if args["dual_classification"]:
+                        dual_net = DualClassificationNetEndToEnd(dual_model_args, operational_data)
+                    else:
+                        dual_net = DualNetEndToEnd(dual_model_args, operational_data)
+                    primal_net.load_state_dict(torch.load(os.path.join(primal_net_directory, "primal_weights.pth"), weights_only=True, map_location = BENDERS_DEVICE), strict = False)
+                    dual_net.load_state_dict(torch.load(os.path.join(dual_net_directory, "dual_weights.pth"), weights_only=True, map_location = BENDERS_DEVICE), strict = False)
+                    primal_net.eval()
+                    dual_net.eval()
 
             # Solve single sample with matrix formulation
             start_exact = True

@@ -552,7 +552,10 @@ if __name__ == "__main__":
 
         else:
             # Use best-found hyperparameters using Optuna
-            if args["learn_primal"]:
+            #! These overwrite whatever the config says, which silently disables
+            #! batch_size / n_layers / primal_lr as experiment knobs. Set
+            #! "use_best_args": false to run the config's own values instead.
+            if args["learn_primal"] and args.get("use_best_args", True):
                 best_args = {
                     "primal_lr": 0.0006785456069117277,
                     "hidden_size_factor": 28,
