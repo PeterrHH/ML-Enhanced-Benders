@@ -208,10 +208,11 @@ with `--eval-every 2` keeps evaluation from dominating.
 
 ### 4f. On the PDL datasets
 ```bash
-# 3 nodes, the configs/config.json dataset
+# 3 nodes, the configs/config.json dataset, matched to the PDL run row for row
 python -m flowfirst.train --variant flowfirst --config configs/config.json \
-  --input-scale zscore --layers 3 --batch-size 128 --epochs 250 \
-  --eval-every 5 --log-every 10 --tag main3node
+  --split pdl --train-size 26142 --input-scale zscore --layers 3 \
+  --batch-size 128 --epochs 2000 --lr-schedule step --lr-decay 0.7 --lr-step 200 \
+  --ema 0.999 --eval-every 20 --log-every 20 --tag pdlmatch-2000-stepema
 
 # 6 nodes (22 generators), the configs/config-6node.json dataset
 python -m flowfirst.train --variant flowfirst-gnn --config configs/config-6node.json \
@@ -220,9 +221,18 @@ python -m flowfirst.train --variant flowfirst-gnn --config configs/config-6node.
   --eval-every 1 --log-every 10 --device auto --home-path $SCRATCH/<project> --tag main6node-gnn
 ```
 Run each with `--variant old-prioritized` as well for the baseline on the same
-data. Note that `configs/config-6node.json` is the 22-generator harvested
-system, a different problem from `flowfirst/configs/config-6node-x8.json`
-(30 generators, sampled); their numbers are not comparable.
+data and the same recipe — otherwise the comparison mixes architecture with
+schedule. Both lines are in `flowfirst/jobs/jobs-pdlmatch.txt`.
+
+The decay and the EMA are there because a first 3-node run at a fixed 5e-4 was
+flat in the ratio of totals from about epoch 300 (0.0005–0.0009) while its mean
+gap swung 0.22 to 0.97 through the VOLL part alone: the fixed-step circling of
+F15. The decay settles it (decisive on 6 nodes, F24) and `--ema 0.999` logs the
+averaged iterate under `ema/`, saved as `model_ema.pt` / `model_ema_best.pt`.
+
+Note that `configs/config-6node.json` is the 22-generator harvested system, a
+different problem from `flowfirst/configs/config-6node-x8.json` (30 generators,
+sampled); their numbers are not comparable.
 
 ### 4g. Several jobs at once
 ```bash
