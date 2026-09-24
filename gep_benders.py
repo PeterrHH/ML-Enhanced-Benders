@@ -355,7 +355,8 @@ class BendersSolver():
     def __init__(self, gep_data, operational_data, sample, primal_net=None, dual_net=None, exact=True, 
                  exact_refinement=True, max_investment=100000, init_investment = "Zero", 
                  cut_selection="single",cut_selection_k=1,parallel_subproblems = False, n_workers = None,
-                 dynamic_cluster_features="price", env=None):
+                 dynamic_cluster_features="price", env=None,
+                 gap_gate_threshold=None, gap_gate_action="resolve"):
 
         self.gep_data = gep_data
         self.operational_data = operational_data
@@ -388,6 +389,21 @@ class BendersSolver():
             raise ValueError(f"Unknown dynamic_cluster_features={dynamic_cluster_features}. "
                              "Choose 'price', 'slope' or 'capacity'.")
         self.dynamic_cluster_features = dynamic_cluster_features
+
+        #! Gap gate: on an inexact iteration, a subproblem whose relative duality gap exceeds
+        #! the threshold is not trusted to produce a cut. "resolve" solves it exactly and cuts
+        #! from those duals; "drop" leaves it out of the cut. None disables the gate entirely,
+        #! which is the behaviour of every run made before this existed.
+        if gap_gate_action not in ("resolve", "drop"):
+            raise ValueError(f"Unknown gap_gate_action={gap_gate_action}. Choose 'resolve' or 'drop'.")
+        self.gap_gate_threshold = None if gap_gate_threshold is None else float(gap_gate_threshold)
+        self.gap_gate_action = gap_gate_action
+        self._last_gate_stats = None
+        self.gate_flagged_hist = []
+        self.gate_resolved_hist = []
+        self.gate_dropped_hist = []
+        self.gate_time_hist = []
+        self.gap_rel_max_hist = []
         self._cd_features = None      # cached (demand, capacity potential) blocks for "capacity" features
         self._cut_hist_slopes = []    # adapt-G-S: per-iteration (T, G) disaggregated cut slopes
         self._cut_hist_rhs = []       # adapt-G-S: per-iteration (T,) disaggregated cut rhs
@@ -536,10 +552,10 @@ class BendersSolver():
 
         # Create a new model
         m = gp.Model("Matrix problem", env=self.env)
-        m.setParam('MIPGap', 1e-16)
-        # m.setParam('FeasibilityTol', 1e-9)   # For constraint feasibility
-        # m.setParam('IntFeasTol', 1e-9)   
-        # m.setParam('OptimalityTol', 1e-9)    # For duality/optimality (LP)     
+        m.setParam("MIPGap", 1e-4)
+        m.setParam("Threads", 1)
+        m.setParam("Seed", 0)
+        m.setParam("TimeLimit", 3600)     
 
         # Create variables
         # x = m.addMVar(shape=data.ydim, vtype=GRB.CONTINUOUS, name="x")
@@ -583,8 +599,15 @@ class BendersSolver():
         # Optimize model
         m.optimize()
 
-        # print(x.X)
-        print(f"Obj: {m.ObjVal:g}")
+        if m.SolCount == 0:
+            raise RuntimeError(f"Direct solve found no feasible solution (status {m.Status}).")
+        self.direct_info = {
+            "status": int(m.Status),
+            "mip_gap": float(m.MIPGap),
+            "obj_bound": float(m.ObjBound),
+            "hit_time_limit": m.Status == GRB.TIME_LIMIT,
+        }
+        print(f"Obj: {m.ObjVal:g}  gap: {m.MIPGap:.2e}  status: {m.Status}", flush=True)
 
         return x.X, m.ObjVal
 
@@ -713,6 +736,11 @@ class BendersSolver():
             "gap_abs_total":  float(np.sum(gap_t)),
             "n_negative_gap": int((gap_t < -1e-6).sum()),
             "gap_t": gap_t,
+            #! Per-subproblem series the gap gate needs: the relative gap it thresholds on,
+            #! and the two objectives it has to correct when a subproblem is re-solved.
+            "rel_t": rel_t,
+            "primal_t": primal_t,
+            "dual_t": dual_t,
         }
     
     def _ensure_master_model(self, data, sample):
@@ -733,10 +761,12 @@ class BendersSolver():
             num_alpha = len(data.time_ranges[sample])
 
         self.master_num_alpha = num_alpha
-
         m = gp.Model("Benders Master Persistent", env=self.env)
-        m.setParam("MIPGap", 1e-8)
-        m.setParam("OutputFlag", 0)
+        m.setParam("MIPGap", 1e-4)      # inexact phase; tightened to 1e-5 when switching to exact
+        m.setParam("Threads", 1)        # match the paper's protocol
+        m.setParam("Seed", 0)           # reproducible
+        m.setParam("TimeLimit", 3600)   # safety net; the per-sample wall-clock limit is set in solve_with_benders
+        m.setParam("OutputFlag", 0)     # no Gurobi log
 
         # Variables
         u = m.addMVar(shape=data.num_g, lb=0.0, ub=100000.0,
@@ -846,6 +876,13 @@ class BendersSolver():
         self.master_model.optimize()
         inference_time = time.time() - start
 
+        m = self.master_model
+        if m.SolCount == 0:
+            raise RuntimeError(f"Master found no feasible solution (status {m.Status}).")
+        if m.Status == GRB.TIME_LIMIT:
+            print(f"[master] time limit hit, MIP gap {m.MIPGap:.2e}", flush=True)
+        self._last_master_bound = float(m.ObjBound)
+
         new_investments = np.array(u.X, dtype=float)
         alpha_vals = np.array(alpha.X, dtype=float)
 
@@ -858,6 +895,70 @@ class BendersSolver():
             u.UB = old_ub
 
         return [investment_cost, alpha_total], new_investments, inference_time
+
+    def _apply_gap_gate(self, s, b_ineqs_np, b_eqs_np, dual_vals, primal_total, dual_total):
+        """Act on subproblems whose predicted duality gap is too large to trust.
+
+        Returns (dual_vals, keep_mask, primal_total, dual_total). The gate reads the
+        per-hour relative gap computed alongside the prediction, so it costs nothing
+        when no hour is flagged.
+
+        Dropping an hour from the cut is legitimate because the recourse variable bounds
+        a SUM of subproblem values and every one of them is non-negative (generation cost
+        plus VOLL times unmet demand), so a cut over a subset still lower-bounds it -- it
+        is merely weaker. Re-solving instead replaces that hour's duals with exact ones,
+        which both tightens the cut and corrects the bounds this hour contributes.
+        """
+        keep_mask = np.ones(s.T, dtype=bool)
+        if self.gap_gate_threshold is None or self._last_gap_stats is None:
+            self._last_gate_stats = None
+            return dual_vals, keep_mask, primal_total, dual_total
+
+        t0 = time.time()
+        rel_t = np.asarray(self._last_gap_stats["rel_t"], dtype=float)
+        flagged = np.flatnonzero(rel_t > self.gap_gate_threshold)
+        action = self.gap_gate_action
+
+        #! An empty cut would leave the master unchanged and the loop would stall without
+        #! erroring, so the fallback is to pay for exact solves rather than stop improving.
+        if action == "drop" and len(flagged) == s.T and s.T > 0:
+            print(f"[gap gate] all {s.T} hours exceed {self.gap_gate_threshold:.3%}; "
+                  f"re-solving them instead of dropping every cut", flush=True)
+            action = "resolve"
+
+        n_resolved = 0
+        if len(flagged) and action == "resolve":
+            obj = self.operational_data.obj_coeff.detach().cpu().numpy() * self.pWeight
+            primal_t = np.asarray(self._last_gap_stats["primal_t"], dtype=float)
+            dual_t = np.asarray(self._last_gap_stats["dual_t"], dtype=float)
+            dual_vals = np.array(dual_vals, dtype=float, copy=True)
+            for t in flagged:
+                ov, _, dv, _ = self.solve_matrix_problem_simple(
+                    obj, s.A_ineq_t[t], b_ineqs_np[t], s.A_eq_t[t], b_eqs_np[t], False
+                )
+                dual_vals[t] = dv
+                #! Exact hour: its primal and dual contributions both become the LP optimum.
+                primal_total += ov - primal_t[t]
+                dual_total += ov - dual_t[t]
+            n_resolved = len(flagged)
+        elif len(flagged):
+            keep_mask[flagged] = False
+
+        elapsed = time.time() - t0
+        #! Charged to the exact-solver budget, not to the surrogate's, so the timing split stays honest.
+        self.total_time_subproblem_exact += elapsed if n_resolved else 0.0
+        self._last_gate_stats = {
+            "n_flagged": int(len(flagged)),
+            "n_resolved": int(n_resolved),
+            "n_dropped": int(len(flagged) - n_resolved),
+            "gate_time": float(elapsed),
+            "gap_rel_max": float(rel_t.max()) if rel_t.size else 0.0,
+        }
+        if len(flagged):
+            print(f"[gap gate] {len(flagged)}/{s.T} hours above {self.gap_gate_threshold:.3%} "
+                  f"(max {rel_t.max():.3%}) -> {'re-solved' if n_resolved else 'dropped from the cut'} "
+                  f"in {elapsed:.2f}s", flush=True)
+        return dual_vals, keep_mask, primal_total, dual_total
 
     def find_benders_cut_batch_for_group(
         self, data, compact, sample,
@@ -905,13 +1006,23 @@ class BendersSolver():
     def find_benders_cuts_grouped_batch(
         self, data, compact, sample,
         dual_vals, b_ineqs, b_eqs,
-        struct, investments=None,
+        struct, investments=None, keep_mask=None,
     ):
         s = struct
 
+        #! Hours the gap gate dropped contribute nothing to a cut. Zeroing their duals removes
+        #! them from every sum below (slope and rhs alike); the grouped modes additionally leave
+        #! their theta out, which makes the cut tighter and is still valid because each dropped
+        #! subproblem value is non-negative. Clustering still sees the unmasked duals, so the
+        #! groups -- and therefore the theta bookkeeping -- do not shift under the gate.
+        dual_cut = dual_vals
+        if keep_mask is not None and not keep_mask.all():
+            dual_cut = np.array(dual_vals, dtype=float, copy=True)
+            dual_cut[~keep_mask] = 0.0
+
         if self.cut_selection == "single":
             return [self.find_benders_cut_batch(data, compact, sample,
-                                                dual_vals, b_ineqs, b_eqs, s)]
+                                                dual_cut, b_ineqs, b_eqs, s)]
 
         # kmeans_dynamic(_shared): recluster every iteration; others: cluster once
         if self.cut_selection in ("kmeans_dynamic", "kmeans_dynamic_shared"):
@@ -924,7 +1035,7 @@ class BendersSolver():
             self.cut_groups = make_kmeans_dual_groups(features, self.cut_selection_k)
 
         if self.cut_selection == "kmeans_dynamic_shared":
-            slopes, rhs = compute_per_timestep_cuts(data, dual_vals, b_ineqs, b_eqs, s)
+            slopes, rhs = compute_per_timestep_cuts(data, dual_cut, b_ineqs, b_eqs, s)
             self._cut_hist_slopes.append(slopes)
             self._cut_hist_rhs.append(rhs)
             hist_slopes = np.stack(self._cut_hist_slopes)    # (I, T, G)
@@ -952,14 +1063,18 @@ class BendersSolver():
             print("Group sizes:", self.cut_group_info["group_sizes"], flush=True)
 
         num_alpha = s.T   # one theta per hour
+        groups = self.cut_groups
+        if keep_mask is not None and not keep_mask.all():
+            kept = set(np.flatnonzero(keep_mask).tolist())
+            groups = [g for g in ([t for t in group if t in kept] for group in groups) if g]
         return [
             self.find_benders_cut_batch_for_group(
                 data=data, compact=compact, sample=sample,
-                dual_vals=dual_vals, b_ineqs=b_ineqs, b_eqs=b_eqs,
+                dual_vals=dual_cut, b_ineqs=b_ineqs, b_eqs=b_eqs,
                 timestep_indices=group, alpha_index=k, num_alpha=num_alpha,
                 struct=s,
             )
-            for k, group in enumerate(self.cut_groups)
+            for k, group in enumerate(groups)
         ]
     
     def solve_subproblems(self, data, compact, sample, investments, exact=True):
@@ -1036,6 +1151,15 @@ class BendersSolver():
                 self.solve_matrix_problem_PDL(X)
             t_pdl = time.time() - t0
 
+        # --- Phase 2b: gap gate (inexact iterations only; a no-op unless a threshold is set) ---
+        keep_mask = None
+        if not exact:
+            dual_vals, keep_mask, primal_obj_val_total, dual_obj_val_total = self._apply_gap_gate(
+                s, b_ineqs_np, b_eqs_np, dual_vals, primal_obj_val_total, dual_obj_val_total
+            )
+        else:
+            self._last_gate_stats = None
+
         # --- Phase 3: cut building ---
         t0 = time.time()
         benders_cuts = self.find_benders_cuts_grouped_batch(
@@ -1043,6 +1167,7 @@ class BendersSolver():
             dual_vals=np.array(dual_vals), b_ineqs=b_ineqs_np, b_eqs=b_eqs_np,
             struct=s,
             investments=np.asarray(investments, dtype=float),
+            keep_mask=keep_mask,
         )
         t_cuts = time.time() - t0
 
@@ -1099,13 +1224,10 @@ class BendersSolver():
         return any(torch.allclose(inv, p.to(torch.float64), atol=1e-6) for p in previous)
 
     def _lower_bound(self, obj_val_master):
-        lower_bound = obj_val_master[0] + obj_val_master[1]
-        if self.cut_selection == "kmeans_dynamic_shared":
-            # adapt-G-S master objective is a valid but non-monotone lower bound
-            # (a new grouping can be coarser than the last); report the best one found.
-            self.best_lower_bound = max(self.best_lower_bound, lower_bound)
-            return self.best_lower_bound
-        return lower_bound
+        lb = getattr(self, "_last_master_bound", None)
+        lower_bound = lb if lb is not None else obj_val_master[0] + obj_val_master[1]
+        self.best_lower_bound = max(self.best_lower_bound, lower_bound)
+        return self.best_lower_bound
 
     def solve_with_benders(self, data, compact, sample):
 
@@ -1115,12 +1237,24 @@ class BendersSolver():
         benders_cut_all = [] # list of benders cuts ([lhs],rhs), one for every iteration
 
         # Parameters for Benders algorithm
-        epsilon = 1e-6
+        rel_tol = 1e-4                    # stopping gap, matches Proxy Benders paper
+        wall_limit = 3600.0               # one hour per sample
+        t_start = time.time()
+        self.hit_time_limit = False
+        upper_bound, lower_bound = np.inf, -np.inf
 
         # Start Benders algorithm
         optimal = False
         i = 0
         while not optimal and i < 1000:
+            elapsed = time.time() - t_start
+            if elapsed > wall_limit:
+                print(f"[benders] wall-clock limit reached after {elapsed:.0f}s", flush=True)
+                self.hit_time_limit = True
+                break
+            if self.master_model is not None:
+                self.master_model.setParam("TimeLimit", max(1.0, wall_limit - elapsed))
+
             self._last_gap_stats = None
             t_iter_start = time.time()
             print("-"*50)
@@ -1160,6 +1294,8 @@ class BendersSolver():
                 print("!! Investments are the same as last iteration")
                 if self.exact_refinement:
                     self.exact = True
+                    if self.master_model is not None:
+                        self.master_model.setParam("MIPGap", 1e-5)
                 else:
                     print("Stopping Benders decomposition because exact refinement is not used.")
                     print("Upper bound:", self.best_upper_bound) #! Return the best upper bound found so far if exact refinement is not used
@@ -1236,7 +1372,15 @@ class BendersSolver():
                 self.gap_neg_count_hist.append(0)
                 self.gap_t_hist.append(None)
 
-            # master time only exists when i>0 
+            #! One row per iteration, so the gate's effect can be attributed afterwards.
+            gate = self._last_gate_stats
+            self.gate_flagged_hist.append(gate["n_flagged"] if gate else 0)
+            self.gate_resolved_hist.append(gate["n_resolved"] if gate else 0)
+            self.gate_dropped_hist.append(gate["n_dropped"] if gate else 0)
+            self.gate_time_hist.append(gate["gate_time"] if gate else 0.0)
+            self.gap_rel_max_hist.append(gate["gap_rel_max"] if gate else np.nan)
+
+            # master time only exists when i>0
             if i == 0:
                 self.master_time_hist.append(0.0)
             else:
@@ -1258,7 +1402,7 @@ class BendersSolver():
                 )
 
 
-                if upper_bound - lower_bound < epsilon:
+                if (upper_bound - lower_bound) / max(1.0, abs(upper_bound)) < rel_tol:
                     optimal = True
                     print('Done! Optimal solution found')
                     print('Total number of iterations needed:', i)
@@ -1452,6 +1596,23 @@ if __name__ == "__main__":
         help="Number of clusters/groups for kmeans/stress/kmeans_dynamic(_shared). "
              "Ignored for 'single' and 'full'.",
     )
+    #! Per-subproblem certificate gate, off unless a threshold is given.
+    parser.add_argument(
+        "--gap-gate-threshold", "--gap_gate_threshold",
+        dest="gap_gate_threshold",
+        type=float,
+        default=None,
+        help="On inexact iterations, treat an hour whose relative duality gap exceeds this "
+             "as untrusted, e.g. 0.01 for 1 percent. Unset disables the gate.",
+    )
+    parser.add_argument(
+        "--gap-gate-action", "--gap_gate_action",
+        dest="gap_gate_action",
+        choices=["resolve", "drop"],
+        default=None,
+        help="What to do with a flagged hour: 'resolve' solves it exactly and cuts from those "
+             "duals, 'drop' leaves it out of the cut (and out of its cluster). Default resolve.",
+    )
     parser.add_argument(
         "--benders-setup", "--benders_setup",
         dest="benders_setup",
@@ -1497,6 +1658,13 @@ if __name__ == "__main__":
     if args_cli.specific_name is not None:
         args["Benders_args"]["specific_name"] = args_cli.specific_name
         print(f"[override] specific_name = {args_cli.specific_name}")
+
+    if args_cli.gap_gate_threshold is not None:
+        args["Benders_args"]["gap_gate_threshold"] = args_cli.gap_gate_threshold
+        print(f"[override] gap_gate_threshold = {args_cli.gap_gate_threshold}")
+    if args_cli.gap_gate_action is not None:
+        args["Benders_args"]["gap_gate_action"] = args_cli.gap_gate_action
+        print(f"[override] gap_gate_action = {args_cli.gap_gate_action}")
 
     if args_cli.cut_selection is not None:
         args["Benders_args"]["cut_selection"] = args_cli.cut_selection
@@ -1630,16 +1798,6 @@ if __name__ == "__main__":
                     operational_data = pickle.load(file)
                 with open(gep_data_save_path, 'rb') as file:
                     gep_data = pickle.load(file)
-                # Load data:
-                if args_cli.solve_direct:
-                    operational_data = None
-                    with open(gep_data_save_path, 'rb') as file:
-                        gep_data = pickle.load(file)
-                else:
-                    with open(ed_data_save_path, 'rb') as file:
-                        operational_data = pickle.load(file)
-                    with open(gep_data_save_path, 'rb') as file:
-                        gep_data = pickle.load(file)
 
             # !Load primal and dual net
             if not args_cli.solve_direct:
@@ -1764,7 +1922,9 @@ if __name__ == "__main__":
                                                     cut_selection_k=benders_args["cut_selection_k"],
                                                     parallel_subproblems=benders_args["parallel_subproblems"],
                                                     n_workers=benders_args["n_workers"],
-                                                    dynamic_cluster_features=benders_args.get("dynamic_cluster_features", "price"))
+                                                    dynamic_cluster_features=benders_args.get("dynamic_cluster_features", "price"),
+                                                    gap_gate_threshold=benders_args.get("gap_gate_threshold"),
+                                                    gap_gate_action=benders_args.get("gap_gate_action", "resolve"))
                             start_time_direct = time.time()
                             y, obj = solver.solve_matrix_problem(gep_data, sample, inv_decision=None)
                             total_time_direct = time.time() - start_time_direct
@@ -1787,6 +1947,9 @@ if __name__ == "__main__":
                                 "total_time_master": 0.0,
                                 "total_time_subproblem_exact": 0.0,
                                 "total_time_subproblem_pdl": 0.0,
+                                "mip_gap": solver.direct_info["mip_gap"],
+                                "obj_bound": solver.direct_info["obj_bound"],
+                                "hit_time_limit": solver.direct_info["hit_time_limit"],
                                 "investments": y[:gep_data.num_g].tolist()
                             }
                             all_results.append(result)
@@ -1800,7 +1963,9 @@ if __name__ == "__main__":
                                                     cut_selection_k=benders_args["cut_selection_k"],
                                                     parallel_subproblems=benders_args["parallel_subproblems"],
                                                     n_workers=benders_args["n_workers"],
-                                                    dynamic_cluster_features=benders_args.get("dynamic_cluster_features", "price"))
+                                                    dynamic_cluster_features=benders_args.get("dynamic_cluster_features", "price"),
+                                                    gap_gate_threshold=benders_args.get("gap_gate_threshold"),
+                                                    gap_gate_action=benders_args.get("gap_gate_action", "resolve"))
         
                             # Solve for the ground truth if falg is set to True
                             if args_cli.ground_truth:
@@ -1829,6 +1994,11 @@ if __name__ == "__main__":
                                 "gap_rel_median": solver.gap_rel_median_hist,
                                 "gap_abs_total":  solver.gap_abs_total_hist,
                                 "gap_neg_count":  solver.gap_neg_count_hist,
+                                "gate_flagged":   solver.gate_flagged_hist,
+                                "gate_resolved":  solver.gate_resolved_hist,
+                                "gate_dropped":   solver.gate_dropped_hist,
+                                "gate_time":      solver.gate_time_hist,
+                                "gap_rel_max":    solver.gap_rel_max_hist,
                             })
                             crossover_metrics = BendersSolver.get_crossover_metrics(iter_df)
                             iter_df["investment"] = [json.dumps(v) for v in solver.inv_hist]
@@ -1872,7 +2042,7 @@ if __name__ == "__main__":
                                 "total_time_master": solver.total_time_master,
                                 "total_time_subproblem_exact": solver.total_time_subproblem_exact,
                                 "total_time_subproblem_pdl": solver.total_time_subproblem_pdl,
-                                
+                                "hit_time_limit": solver.hit_time_limit,
                                 "investments": investments_all[-1].tolist() if len(investments_all) > 0 else None,
 
                                 "has_crossover": crossover_metrics["has_crossover"],
@@ -1914,40 +2084,3 @@ if __name__ == "__main__":
                     experiment_data_df.to_csv(data_save_path, index=False)
 
 
-            # ! Plotting optimality gap per iteration
-            if not start_exact:
-                # Plot optimality gap per iteration
-                # Only works for last sample
-                tab10 = plt.get_cmap("tab10")
-                primal_color = tab10(0)  # blue
-                dual_color = tab10(1)    # orange
-
-                plt.figure(figsize=(8, 5))
-                plt.rcParams.update({
-                    "axes.titlesize": 20,
-                    "axes.labelsize": 18,
-                    "xtick.labelsize": 16,
-                    "ytick.labelsize": 16,
-                    "legend.fontsize": 16,
-                    "font.size": 16
-                })
-
-                # plt.plot(np.array(solver.primal_opt_gap_all)*100, label="Primal opt gap", color=primal_color, linewidth=2, marker='o')
-                # plt.plot(np.array(solver.dual_opt_gap_all)*100, label="Dual opt gap", color=dual_color, linewidth=2, marker='o')
-
-                # plt.xlabel("Benders Iteration")
-                # plt.ylabel("Optimality Gap (%)")
-                # plt.title("Primal and Dual Optimality Gap per Benders Iteration")
-                # # Add line at 0
-                # plt.axhline(0, color='black', linewidth=1)
-                # plt.legend(loc='best', frameon=True)
-                # plt.grid(True, linestyle='--', alpha=0.6)
-                # plt.tight_layout()
-                # plt.savefig("experiment-output/ch7/3nodes/benders_test_data_exact.pdf", dpi=300, bbox_inches='tight')
-                # plt.show()
-
-
-'''
-python gep_benders.py -c configs/config.json --sample-duration 219 --cut-selection kmeans --cut-selection-k 10 --primal-net-dir outputs/PDL/ED/3Nodes-FraBelGer/NoClassificationrepeat:0 \ 
---dual-net-dir outputs/PDL/ED/3Nodes-FraBelGer/NoClassificationrepeat:0 --bender-setup Inexact_Refine --specific-name test_run 
-'''

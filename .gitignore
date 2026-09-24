@@ -232,3 +232,4 @@ requiremenets_*.txt
 tests/*
 GurobiKey/*
 evaluate_primal_dual.ipynb
+docs/
