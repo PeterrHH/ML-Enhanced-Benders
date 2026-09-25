@@ -31,7 +31,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 _thread_local = threading.local()
-
+torch.set_num_threads(1)   # match Gurobi's Threads=1 and the paper's single-thread protocol
 #! Licence limits of the size-limited environment bundled with the pip
 #! gurobipy wheel. Anything past these needs a real licence.
 RESTRICTED_LICENCE_VARS = 2000
