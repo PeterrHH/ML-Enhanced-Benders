@@ -1,4 +1,5 @@
 import numpy as np
+import scipy.sparse as sp
 import torch
 import pickle
 import matplotlib.pyplot as plt
@@ -156,7 +157,18 @@ class GEPProblemSet():
     def get_eq_cm_rhs(self, sample_idx):
         return self.build_eq_cm_rhs_sample(self.time_ranges[sample_idx])
 
-    def get_sample_matrices(self, sample_idx):
+    def get_sample_matrices(self, sample_idx, sparse=False):
+        """Full-horizon constraint matrices for one sample.
+
+        The dense form is (num_g + T*R) x (num_g + T*C) and therefore quadratic in
+        the horizon -- 1.6 TB at T=8760 for the 6-node case. Pass sparse=True for
+        anything beyond a few hundred hours; density is ~4e-6, and Gurobi is sparse
+        internally so a CSR costs nothing to solve.
+        """
+        if sparse:
+            ineq_cm, ineq_rhs = self.build_ineq_cm_rhs_sample_sparse(self.time_ranges[sample_idx])
+            eq_cm, eq_rhs = self.build_eq_cm_rhs_sample_sparse(self.time_ranges[sample_idx])
+            return ineq_cm, ineq_rhs, eq_cm, eq_rhs
         ineq_cm, ineq_rhs = self.get_ineq_cm_rhs(sample_idx)
         eq_cm, eq_rhs = self.get_eq_cm_rhs(sample_idx)
         return ineq_cm, ineq_rhs, eq_cm, eq_rhs
@@ -411,6 +423,67 @@ class GEPProblemSet():
             
         return ineq_cm, torch.tensor(ineq_rhs)
         
+    def build_ineq_cm_rhs_sample_sparse(self, time_range):
+        """Sparse twin of build_ineq_cm_rhs_sample; same matrix, never densified."""
+        T = len(time_range)
+        C = self.n_var_per_t
+        R = 2 * (self.num_g + self.num_l + self.num_n)
+        G, L, N = self.num_g, self.num_l, self.num_n
+
+        # One timestep's block, as (row, col, value) triplets -- every bound row
+        # carries a single +-1, matching the assign_identity_or_scalar calls.
+        rows, cols, vals = [], [], []
+        for start_row, start_col, size, value in (
+            (0,             0,     G, -1.0),   # 3.1h: production lower bound
+            (G,             0,     G,  1.0),   # 3.1b: production upper bound
+            (2*G,           G,     L, -1.0),   # 3.1d: lineflow lower bound
+            (2*G + L,       G,     L,  1.0),   # 3.1e: lineflow upper bound
+            (2*G + 2*L,     G + L, N, -1.0),   # 3.1i: missed demand lower bound
+            (2*G + 2*L + N, G + L, N,  1.0),   # 3.1j: missed demand upper bound
+        ):
+            rows.extend(range(start_row, start_row + size))
+            cols.extend(range(start_col, start_col + size))
+            vals.extend([value] * size)
+        block = sp.coo_matrix((vals, (rows, cols)), shape=(R, C))
+
+        # Replicate it down the diagonal, then prepend the 3.1k investment rows.
+        ineq_cm = sp.kron(sp.eye(T, format="csr"), block, format="coo")
+        ui_g = -sp.eye(G, format="coo")
+        ineq_cm = sp.block_diag((ui_g, ineq_cm), format="coo")
+
+        # -GA_{g,t} * UCAP_g in the investment columns of the 3.1b rows.
+        cap_rows, cap_cols, cap_vals = [], [], []
+        row_offset = 2 * G   # 3.1k block, then past 3.1h
+        for t in time_range:
+            for idx_g, g in enumerate(self.G):
+                cap_rows.append(row_offset + idx_g)
+                cap_cols.append(idx_g)
+                cap_vals.append(-(self.pGenAva.get((*g, t), 1.0) * self.pUnitCap[g]))
+            row_offset += R
+
+        ineq_cm = sp.coo_matrix(
+            (np.concatenate([ineq_cm.data, cap_vals]),
+             (np.concatenate([ineq_cm.row, cap_rows]),
+              np.concatenate([ineq_cm.col, cap_cols]))),
+            shape=(G + T * R, G + T * C),
+        ).tocsr()
+
+        return ineq_cm, self.build_ineq_rhs_sample(time_range)
+
+    def build_eq_cm_rhs_sample_sparse(self, time_range):
+        """Sparse twin of build_eq_cm_rhs_sample; same matrix, never densified."""
+        T = len(time_range)
+        block = sp.csr_matrix(torch.concat([
+            self.node_to_gen_mask, self.lineflow_mask, torch.eye(self.num_n),
+        ], dim=1).detach().cpu().numpy())
+
+        eq_cm = sp.kron(sp.eye(T, format="csr"), block, format="csr")
+        # ui_g does not appear in the equality constraints -> num_g zero columns.
+        zero_columns = sp.csr_matrix((eq_cm.shape[0], self.num_g))
+        eq_cm = sp.hstack([zero_columns, eq_cm], format="csr")
+
+        return eq_cm, self.build_eq_rhs_sample(time_range)
+
     def build_ineq_rhs_sample(self, time_range):
         ineq_rhs = []
 

@@ -300,6 +300,11 @@ def make_cut_groups(s, cut_selection="single", cut_selection_k=1, random_state=0
 
 import scipy.sparse as sp
 
+#! Horizons up to this length keep the dense path, so results recorded before the
+#! sparse builders landed stay byte-reproducible; longer ones must go sparse.
+DENSE_HORIZON_LIMIT = 256
+
+
 def _to_numpy(a):
     """Dense numpy view of a torch tensor, scipy sparse matrix or array (small slices only)."""
     if sp.issparse(a):
@@ -312,38 +317,64 @@ def _to_numpy(a):
 class SampleStructure:
     """
     Everything Benders reads from one sample's constraint matrices.
-    Built once; the full-horizon matrices are dropped afterwards.
-    Memory is O(T) instead of O(T^2).
+
+    Built straight from the problem primitives -- the full-horizon matrices are
+    never materialised. get_sample_matrices() would kron the per-hour block into
+    a dense (G + T*R) x (G + T*C) array, which is 1.6 TB at T=8760 for the 6-node
+    case; peak memory here is O(T*G) instead of O(T^2).
+
+    That substitution is exact because the per-hour operational block is the same
+    for every hour: the only time-varying entries are pGenAva * pUnitCap, and they
+    sit in the *investment* columns, which are kept separately as `apmax`.
     """
     def __init__(self, data, sample):
         G, L, N = data.num_g, data.num_l, data.num_n
-        T  = len(data.time_ranges[sample])
+        time_range = data.time_ranges[sample]
+        T  = len(time_range)
         R  = 2 * (G + L + N)      # inequality rows per hour
         Re = N                    # equality rows per hour
         C  = data.n_var_per_t     # variables per hour
         self.G, self.T, self.R, self.Re, self.C = G, T, R, Re, C
 
-        ineq_cm, ineq_rhs, eq_cm, eq_rhs = data.get_sample_matrices(sample)
+        # (1) investment-only rows for the master: the -I_G block that
+        #     build_ineq_cm_rhs_sample prepends via block_diag(ui_g, ...), with
+        #     the leading G entries of the inequality RHS (3.1k, all zero).
+        self.A_base = -np.eye(G)
 
-        # (1) investment-only rows for the master
-        self.A_base = _to_numpy(ineq_cm[:G, :G]).copy()
-        self.b_base = _to_numpy(ineq_rhs[:G]).copy()
-
-        # (2) A_{g,t} * Pmax_g  (row 2G + t*R + g, column g -> diagonal of a GxG slice)
+        # (2) A_{g,t} * Pmax_g -- the only time-varying coefficients, and they
+        #     live in the investment columns rather than the operational block.
+        unit_cap = np.array([float(data.pUnitCap[g]) for g in data.G])
         self.apmax = np.empty((T, G))
-        # (3) per-hour operational blocks
-        self.A_ineq_t = np.empty((T, R, C))
-        self.A_eq_t   = np.empty((T, Re, C))
-        for t in range(T):
-            r, re, c = G + t * R, t * Re, G + t * C
-            self.apmax[t]    = -np.diag(_to_numpy(ineq_cm[r + G:r + 2 * G, :G]))
-            self.A_ineq_t[t] = _to_numpy(ineq_cm[r:r + R, c:c + C])
-            self.A_eq_t[t]   = _to_numpy(eq_cm[re:re + Re, c:c + C])
+        for i, t in enumerate(time_range):
+            ava = np.array([float(data.pGenAva.get((*g, t), 1.0)) for g in data.G])
+            self.apmax[i] = ava * unit_cap
 
-        # (4) right-hand sides, one row per hour
-        self.b_ineq_t = _to_numpy(ineq_rhs[G:G + T * R]).reshape(T, R).copy()
-        self.b_eq_t   = _to_numpy(eq_rhs[:T * Re]).reshape(T, Re).copy()
-        # locals go out of scope here -> the big matrices are freed
+        # (3) per-hour operational blocks, identical for every hour. Stored once
+        #     and broadcast, so s.A_ineq_t[t] keeps working at zero memory cost.
+        A_ineq_block = np.zeros((R, C))
+        A_ineq_block[0:G,                 0:G]           = -np.eye(G)   # 3.1h production lb
+        A_ineq_block[G:2*G,               0:G]           =  np.eye(G)   # 3.1b production ub
+        A_ineq_block[2*G:2*G+L,           G:G+L]         = -np.eye(L)   # 3.1d lineflow lb
+        A_ineq_block[2*G+L:2*G+2*L,       G:G+L]         =  np.eye(L)   # 3.1e lineflow ub
+        A_ineq_block[2*G+2*L:2*G+2*L+N,   G+L:G+L+N]     = -np.eye(N)   # 3.1i missed demand lb
+        A_ineq_block[2*G+2*L+N:R,         G+L:G+L+N]     =  np.eye(N)   # 3.1j missed demand ub
+
+        A_eq_block = np.concatenate([
+            _to_numpy(data.node_to_gen_mask),
+            _to_numpy(data.lineflow_mask),
+            np.eye(N),
+        ], axis=1)
+
+        self.A_ineq_block = A_ineq_block
+        self.A_eq_block   = A_eq_block
+        self.A_ineq_t = np.broadcast_to(A_ineq_block, (T, R, C))
+        self.A_eq_t   = np.broadcast_to(A_eq_block,   (T, Re, C))
+
+        # (4) right-hand sides, one row per hour -- these builders are already O(T)
+        ineq_rhs = _to_numpy(data.build_ineq_rhs_sample(time_range))
+        self.b_base   = ineq_rhs[:G].copy()
+        self.b_ineq_t = ineq_rhs[G:G + T * R].reshape(T, R).copy()
+        self.b_eq_t   = _to_numpy(data.build_eq_rhs_sample(time_range)).reshape(T, Re).copy()
 
     def b_ineq_at(self, investments):
         """Inequality RHS for all hours at a given investment, shape (T, R)."""
@@ -581,12 +612,18 @@ class BendersSolver():
         # b = np.array(data.eq_rhs[i])
         # m.addConstr(A @ x == b, name="eq")
 
-        ineq_cm, ineq_rhs, eq_cm, eq_rhs = data.get_sample_matrices(i) # TODO: Added only for optimise dataset
-        A = np.array(ineq_cm)
+        #! Sparse beyond a few hundred hours: the dense matrices are quadratic in
+        #! the horizon (1.6 TB at T=8760, 6 nodes) while the CSR is ~10 MB. Gurobi
+        #! is sparse internally, so this only avoids work -- it never adds any.
+        T = len(data.time_ranges[i])
+        use_sparse = T > DENSE_HORIZON_LIMIT
+        ineq_cm, ineq_rhs, eq_cm, eq_rhs = data.get_sample_matrices(i, sparse=use_sparse)
+
+        A = ineq_cm if use_sparse else np.array(ineq_cm)
         b = np.array(ineq_rhs)
         m.addConstr(A @ x <= b, name="ineq")
 
-        A = np.array(eq_cm)
+        A = eq_cm if use_sparse else np.array(eq_cm)
         b = np.array(eq_rhs)
         m.addConstr(A @ x == b, name="eq")
         # For plotting
