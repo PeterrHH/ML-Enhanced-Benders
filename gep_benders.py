@@ -34,6 +34,13 @@ _thread_local = threading.local()
 torch.set_num_threads(1)   # match Gurobi's Threads=1 and the paper's single-thread protocol
 #! Licence limits of the size-limited environment bundled with the pip
 #! gurobipy wheel. Anything past these needs a real licence.
+#! Restarts for every KMeans grouping. This was 300, which at k=100 over a
+#! 2190-hour sample cost 36-56 s in the first Benders iteration -- more than that
+#! iteration's master solve and LP solves combined -- for a grouping the run then
+#! keeps for good. 10 is sklearn's classic default and still well above the
+#! 'auto' behaviour (a single init for k-means++).
+KMEANS_N_INIT = 10
+
 RESTRICTED_LICENCE_VARS = 2000
 RESTRICTED_LICENCE_CONSTRS = 2000
 
@@ -132,7 +139,7 @@ def make_kmeans_capacity_demand_groups(s, K, random_state=0):
     labels = KMeans(
         n_clusters=K_eff,
         random_state=random_state,
-        n_init=300
+        n_init=KMEANS_N_INIT
     ).fit_predict(X_scaled)
 
     groups = [np.where(labels == k)[0].tolist() for k in range(K_eff)]
@@ -247,7 +254,7 @@ def make_kmeans_dual_groups(features, K, random_state=0):
     K_eff = min(K, T)
     if K_eff <= 1:
         return [list(range(T))]
-    labels = KMeans(n_clusters=K_eff, n_init=300, random_state=random_state).fit_predict(X)
+    labels = KMeans(n_clusters=K_eff, n_init=KMEANS_N_INIT, random_state=random_state).fit_predict(X)
     return [np.where(labels == k)[0].tolist() for k in range(K_eff) if (labels == k).any()]
 
 
@@ -303,6 +310,10 @@ import scipy.sparse as sp
 #! Horizons up to this length keep the dense path, so results recorded before the
 #! sparse builders landed stay byte-reproducible; longer ones must go sparse.
 DENSE_HORIZON_LIMIT = 256
+
+#! Cut groupings that are built once and never revisited. Because the groups are
+#! fixed, these carry one recourse variable per group rather than per hour.
+STATIC_GROUPED_CUTS = ("full", "kmeans", "stress")
 
 
 def _to_numpy(a):
@@ -780,20 +791,40 @@ class BendersSolver():
             "dual_t": dual_t,
         }
     
+    def _ensure_cut_groups(self, struct):
+        """Build the static cut grouping once. kmeans_dynamic(_shared) reclusters
+        every iteration and therefore does not come through here."""
+        if self.cut_groups is None:
+            self.cut_groups, self.cut_group_info = make_cut_groups(
+                struct, cut_selection=self.cut_selection,
+                cut_selection_k=self.cut_selection_k,
+            )
+            print(f"Cut selection: {self.cut_selection}, groups={len(self.cut_groups)}", flush=True)
+            print("Group sizes:", self.cut_group_info["group_sizes"], flush=True)
+        return self.cut_groups
+
     def _ensure_master_model(self, data, sample):
         """Build the master Gurobi model once. Cheap to call repeatedly."""
         if self.master_model is not None:
             return
 
+        s = self._structure(data, sample)
+
         # Determine number of recourse variables.
-        # "single" uses one aggregate recourse var; all grouped modes (kmeans,
-        # kmeans_dynamic, full, stress) use one theta per timestep. Per-timestep
-        # recourse keeps grouped cuts valid across regroupings without rebuilding.
+        # "single" uses one aggregate recourse var. The static grouped modes (full,
+        # kmeans, stress) cluster once and never regroup, so one theta per *group* is
+        # exactly equivalent to one per timestep: the groups partition the hours, no
+        # cut mixes two groups, and only the per-group sum is ever constrained. Same
+        # bound, same trajectory, far fewer columns and no degenerate plateau.
+        # kmeans_dynamic reclusters every iteration, so its cuts must keep keying off
+        # per-timestep thetas to stay valid across regroupings.
         if self.cut_selection == "single":
             num_alpha = 1
         elif self.cut_selection == "kmeans_dynamic_shared":
             # adapt-G-S: one theta per group (unused thetas stay at their lb of 0)
             num_alpha = max(1, min(self.cut_selection_k, len(data.time_ranges[sample])))
+        elif self.cut_selection in STATIC_GROUPED_CUTS:
+            num_alpha = len(self._ensure_cut_groups(s))
         else:
             num_alpha = len(data.time_ranges[sample])
 
@@ -816,7 +847,6 @@ class BendersSolver():
         obj_u = data.obj_coeff[:data.num_g].detach().cpu().numpy()
         m.setObjective(obj_u @ u + alpha.sum(), GRB.MINIMIZE)
 
-        s = self._structure(data, sample)
         m.addConstr(s.A_base @ u <= s.b_base, name="inv_base")
         # m.addConstr(A_base @ u <= b_base, name="inv_base")
 
@@ -1001,7 +1031,7 @@ class BendersSolver():
         self, data, compact, sample,
         dual_vals, b_ineqs, b_eqs,
         timestep_indices, alpha_index, num_alpha,
-        struct,
+        struct, shared_alpha=False,
     ):
         if compact:
             raise NotImplementedError("Grouped cuts currently support compact=False only.")
@@ -1012,8 +1042,12 @@ class BendersSolver():
 
         benders_cut_lhs = np.zeros((1, G + num_alpha))
         benders_cut_rhs = 0.0
-        # -1 on theta_t for every hour in this group
-        benders_cut_lhs[0, G + timestep_indices] = -1.0
+        if shared_alpha:
+            # one theta per group: the cut bounds that group's recourse directly
+            benders_cut_lhs[0, G + alpha_index] = -1.0
+        else:
+            # -1 on theta_t for every hour in this group
+            benders_cut_lhs[0, G + timestep_indices] = -1.0
 
         # LHS: sum over the group of mu^ub_{g,t} * A_{g,t} Pmax_g
         dual_slice = dual_vals[timestep_indices][:, G:2 * G]            # (Tg, G)
@@ -1092,26 +1126,30 @@ class BendersSolver():
                     cuts.append((cut_lhs, float(group_rhs[it])))
             return cuts
 
-        if self.cut_selection != "kmeans_dynamic" and self.cut_groups is None:
-            self.cut_groups, self.cut_group_info = make_cut_groups(
-                s, cut_selection=self.cut_selection, cut_selection_k=self.cut_selection_k,
-            )
-            print(f"Cut selection: {self.cut_selection}, groups={len(self.cut_groups)}", flush=True)
-            print("Group sizes:", self.cut_group_info["group_sizes"], flush=True)
+        if self.cut_selection != "kmeans_dynamic":
+            self._ensure_cut_groups(s)
 
-        num_alpha = s.T   # one theta per hour
-        groups = self.cut_groups
+        # Static groupings get one theta per group (see _ensure_master_model);
+        # kmeans_dynamic regroups every iteration and stays on per-hour thetas.
+        shared_alpha = self.cut_selection in STATIC_GROUPED_CUTS
+        num_alpha = len(self.cut_groups) if shared_alpha else s.T
+
+        #! Keep each group's original index: it is what the cut keys its theta off
+        #! under shared recourse, so dropping an emptied group must not renumber the
+        #! ones after it.
+        groups = list(enumerate(self.cut_groups))
         if keep_mask is not None and not keep_mask.all():
             kept = set(np.flatnonzero(keep_mask).tolist())
-            groups = [g for g in ([t for t in group if t in kept] for group in groups) if g]
+            groups = [(k, [t for t in group if t in kept]) for k, group in groups]
+            groups = [(k, group) for k, group in groups if group]
         return [
             self.find_benders_cut_batch_for_group(
                 data=data, compact=compact, sample=sample,
                 dual_vals=dual_cut, b_ineqs=b_ineqs, b_eqs=b_eqs,
                 timestep_indices=group, alpha_index=k, num_alpha=num_alpha,
-                struct=s,
+                struct=s, shared_alpha=shared_alpha,
             )
-            for k, group in enumerate(groups)
+            for k, group in groups
         ]
     
     def solve_subproblems(self, data, compact, sample, investments, exact=True):
