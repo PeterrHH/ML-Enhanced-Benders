@@ -1,6 +1,4 @@
 import copy
-import gurobipy as gp
-from gurobipy import GRB
 import numpy as np
 import torch
 import json
@@ -20,18 +18,22 @@ from gep_config_parser import *
 from networks import DualClassificationNetEndToEnd, DualNet, DualNetEndToEnd, PrimalNetEndToEnd
 from devices import KNOWN_DEVICES, resolve_device_name
 from paths import add_path_args, ensure_dir, resolve_roots, under_repo, under_root
+import pyomo.environ as pyo
+import solver_backend as sb
 
 import os
-import threading
-from concurrent.futures import ThreadPoolExecutor
+
+#! Gurobi is optional: a HiGHS run never touches it. Only the licence helpers
+#! below (and Cut_selection_experiment.py, which builds gurobipy models itself)
+#! need it.
+try:
+    import gurobipy as gp
+except ImportError:
+    gp = None
 
 CONFIG_FILE_NAME        = "configs/config.toml"
 
-import threading
-from concurrent.futures import ThreadPoolExecutor
-
-_thread_local = threading.local()
-torch.set_num_threads(1)   # match Gurobi's Threads=1 and the paper's single-thread protocol
+torch.set_num_threads(1)   # match the solvers' Threads=1 and the paper's single-thread protocol
 #! Licence limits of the size-limited environment bundled with the pip
 #! gurobipy wheel. Anything past these needs a real licence.
 #! Restarts for every KMeans grouping. This was 300, which at k=100 over a
@@ -46,6 +48,8 @@ RESTRICTED_LICENCE_CONSTRS = 2000
 
 
 def make_env(quiet=True):
+    if gp is None:
+        raise RuntimeError("gurobipy is not installed; use --solver highs or pip install gurobipy.")
     env = gp.Env(empty=True)
     if quiet:
         env.setParam("OutputFlag", 0)
@@ -87,19 +91,6 @@ def get_shared_env():
     if _shared_env is None:
         _shared_env = make_env()
     return _shared_env
-
-
-def _get_worker_env():
-    """One Gurobi Env per thread — created lazily, reused across LPs on that thread.
-
-    Deliberately NOT the shared env: Gurobi Env objects are not safe to use
-    concurrently from several threads.
-    """
-    env = getattr(_thread_local, "env", None)
-    if env is None:
-        env = make_env()
-        _thread_local.env = env
-    return env
 
 
 def build_capacity_demand_features(s):
@@ -146,41 +137,6 @@ def make_kmeans_capacity_demand_groups(s, K, random_state=0):
 
     return groups, labels, X
 
-
-
-def make_stress_bin_groups(s, K):
-    """
-    Stress grouping without reference investment.
-
-    stress_t = total_demand_t / (total_capacity_potential_t + eps)
-
-    where total_capacity_potential_t = sum_g A_{g,t} Pmax_g.
-    """
-    _, demand_features, capacity_potential_features = build_capacity_demand_features(s)
-
-    total_demand = demand_features.sum(axis=1)
-    total_capacity_potential = capacity_potential_features.sum(axis=1)
-
-    stress = total_demand / (total_capacity_potential + 1e-9)
-
-    T = len(stress)
-
-    if K <= 1:
-        labels = np.zeros(T, dtype=int)
-        return make_single_group(T), labels, stress
-
-    K_eff = min(K, T)
-
-    order = np.argsort(stress)
-    split = np.array_split(order, K_eff)
-
-    groups = [list(x) for x in split]
-
-    labels = np.empty(T, dtype=int)
-    for k, group in enumerate(groups):
-        labels[group] = k
-
-    return groups, labels, stress
 
 
 def compute_investment_duals(data, dual_vals, s):
@@ -286,18 +242,10 @@ def make_cut_groups(s, cut_selection="single", cut_selection_k=1, random_state=0
             "group_sizes": [len(g) for g in groups],
         }
 
-    elif cut_selection == "stress":
-        groups, labels, stress = make_stress_bin_groups(s, K=cut_selection_k)
-        info = {
-            "labels": labels,
-            "stress": stress,
-            "group_sizes": [len(g) for g in groups],
-        }
-
     else:
         raise ValueError(
             f"Unknown cut_selection={cut_selection}. "
-            "Choose from 'single', 'kmeans', 'stress', 'full'."
+            "Choose from 'single', 'kmeans', 'full'."
         )
 
     groups = [g for g in groups if len(g) > 0]
@@ -311,9 +259,14 @@ import scipy.sparse as sp
 #! sparse builders landed stay byte-reproducible; longer ones must go sparse.
 DENSE_HORIZON_LIMIT = 256
 
+#! LP optimality tolerance of the hourly ED subproblems (Gurobi OptimalityTol, HiGHS
+#! dual_feasibility_tolerance). Tighter than the 1e-6 default because their duals
+#! become the Benders cuts; the direct solve and the master keep the default.
+SUBPROBLEM_LP_OPT_TOL = 1e-8
+
 #! Cut groupings that are built once and never revisited. Because the groups are
 #! fixed, these carry one recourse variable per group rather than per hour.
-STATIC_GROUPED_CUTS = ("full", "kmeans", "stress")
+STATIC_GROUPED_CUTS = ("full", "kmeans")
 
 
 def _to_numpy(a):
@@ -398,7 +351,8 @@ class BendersSolver():
                  exact_refinement=True, max_investment=100000, init_investment = "Zero", 
                  cut_selection="single",cut_selection_k=1,parallel_subproblems = False, n_workers = None,
                  dynamic_cluster_features="price", env=None,
-                 gap_gate_threshold=None, gap_gate_action="resolve"):
+                 gap_gate_threshold=None, gap_gate_action="resolve",
+                 solver="gurobi", solver_log_dir=None, solver_tee=False, dump_master=False):
 
         self.gep_data = gep_data
         self.operational_data = operational_data
@@ -449,15 +403,53 @@ class BendersSolver():
         self._cd_features = None      # cached (demand, capacity potential) blocks for "capacity" features
         self._cut_hist_slopes = []    # adapt-G-S: per-iteration (T, G) disaggregated cut slopes
         self._cut_hist_rhs = []       # adapt-G-S: per-iteration (T,) disaggregated cut rhs
-        self._cut_constrs = []        # handles of cut constraints in the persistent master
-        self.parallel_subproblems = parallel_subproblems
+        #! Pyomo's solver interfaces swap sys.stdout (HiGHS even the file descriptor)
+        #! around every solve, so they cannot run from several threads at once. The
+        #! hourly LPs are therefore always solved in sequence -- which is also the
+        #! single-thread protocol the comparison with the direct solve assumes.
+        if parallel_subproblems:
+            print("[solver] parallel_subproblems is ignored: Pyomo solves are not thread-safe, "
+                  "subproblems run sequentially", flush=True)
+        self.parallel_subproblems = False
         self.n_workers = n_workers
 
+        #! One solver for every model of this run -- direct, master, hourly LPs and
+        #! gap-gate re-solves -- so a comparison never mixes two solvers.
+        self.solver = sb.check_solver_name(solver)
+        #! Debugging aids for a master that stalls (see _master_log_path): native solver
+        #! log per solve, optional live echo, and optional LP dump of each master.
+        self.solver_log_dir = solver_log_dir
+        self.solver_tee = bool(solver_tee)
+        self.dump_master = bool(dump_master)
+        if self.dump_master and not self.solver_log_dir:
+            raise ValueError("dump_master needs solver_log_dir: that is where the model files go.")
+        if self.solver_log_dir:
+            os.makedirs(self.solver_log_dir, exist_ok=True)
+
         self.master_model = None
-        self.master_u = None          # MVar of investment vars
-        self.master_alpha = None      # MVar of alpha vars
+        self.master_u = None          # Pyomo Var of investments
+        self.master_alpha = None      # Pyomo Var of recourse (alpha/theta)
         self.master_num_alpha = None
+        self._master_opt = None
+        self._master_time_limit = 3600.0  # safety net; solve_with_benders tightens it to the remaining wall-clock
+        self._master_mip_gap = 1e-4       # inexact phase; tightened to 1e-5 when switching to exact
         self._num_cuts_in_master = 0  # how many cuts already added
+        self._cut_stats = []          # per cut in the master: (min |slope|, max |slope|, |rhs|)
+        self._sub_lp = None           # persistent hourly ED LP (solver_backend.MatrixLP)
+        self._sub_lp_src = None
+
+        # --- master diagnostics, one entry per iteration (iteration 0 has no master) ---
+        self.master_status_hist = []
+        self.master_obj_hist = []
+        self.master_bound_hist = []
+        self.master_gap_hist = []
+        self.master_nodes_hist = []
+        self.master_iters_hist = []
+        self.master_sync_hist = []    # Pyomo bookkeeping around the master solve
+        self.master_ncuts_hist = []
+        self.cut_coef_min_hist = []
+        self.cut_coef_max_hist = []
+        self.cut_rhs_max_hist = []
 
         # --- surrogate duality-gap tracking (inexact iters only) ---
         self.gap_abs_mean_hist   = []
@@ -495,9 +487,27 @@ class BendersSolver():
         self.investment_init_method = init_investment # Zero by Default, also option: "HalfMax"
         #! Shared by default, so building many solvers in a loop does not open
         #! one Gurobi environment (and, under WLS, one licence session) each.
-        self.env = env if env is not None else get_shared_env()
+        #! Opened lazily: a HiGHS run never needs one.
+        self._env = env
         self._struct = None
         self._struct_src = None
+
+    @property
+    def env(self):
+        if self._env is None:
+            self._env = get_shared_env()
+        return self._env
+
+    def _gurobi_env(self):
+        """The Env Pyomo's Gurobi interface should use; None under HiGHS."""
+        return self.env if self.solver == "gurobi" else None
+
+    def _log_file(self, name):
+        return os.path.join(self.solver_log_dir, name) if self.solver_log_dir else None
+
+    def _options(self, **kw):
+        """This run's parameter profile for one solve (see solver_backend.solver_options)."""
+        return sb.solver_options(self.solver, threads=1, seed=0, **kw)
 
     def _structure(self, data, sample):
         src = self._struct_src
@@ -514,12 +524,14 @@ class BendersSolver():
         cluster job at 20 nodes, with an error naming neither the model size
         nor the licence limit.
         """
+        if self.solver != "gurobi":
+            return   # HiGHS has no licence to run out of
         n_vars = int(data.ydim)
         n_constrs = int(data.nineq + data.neq)
 
         probe = gp.Model("licence_probe", env=self.env)
         probe.setParam("OutputFlag", 0)
-        probe.addMVar(shape=n_vars, lb=-GRB.INFINITY)
+        probe.addMVar(shape=n_vars, lb=-gp.GRB.INFINITY)
         try:
             probe.update()
         except gp.GurobiError as exc:
@@ -563,101 +575,82 @@ class BendersSolver():
         pickle.dump(self.dual_solutions, open(os.path.join(folder_path, "dual_solutions.pkl"), "wb"))
         pickle.dump(self.primal_solutions, open(os.path.join(folder_path, "primal_solutions.pkl"), "wb"))
 
-    def _solve_sub_lp(self, obj, A_ineq, b_ineq, A_eq, b_eq):
-        """Thread-safe single-LP solve for ED subproblems. Uses per-thread env."""
-        env = _get_worker_env()
-        m = gp.Model("sub", env=env)
-        m.setParam("OptimalityTol", 1e-9)
-        m.setParam("Threads", 1)   # critical: avoid oversubscription
+    def _hourly_lp(self, struct):
+        """The persistent hourly ED LP for this sample, built once.
 
-        ydim = obj.size
-        x = m.addMVar(shape=ydim, lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name="x")
-        m.setObjective(np.asarray(obj, dtype=float) @ x, GRB.MINIMIZE)
-        m.addConstr(np.asarray(A_ineq, dtype=float) @ x <= np.asarray(b_ineq, dtype=float), name="ineq")
-        m.addConstr(np.asarray(A_eq,  dtype=float) @ x == np.asarray(b_eq,  dtype=float), name="eq")
-
-        t0 = time.time()
-        m.optimize()
-        inf_t = time.time() - t0
-
-        if m.status != GRB.OPTIMAL:
-            raise RuntimeError(f"Subproblem status={m.status}")
-
-        dual_val = m.getAttr("Pi", m.getConstrs())
-        return m.ObjVal, np.array(x.X), np.array(dual_val), inf_t
+        Every hour shares the same matrices (see SampleStructure), so one model
+        serves them all: each hour only pushes its right-hand side, and the solver
+        warm-starts from the previous hour's basis.
+        """
+        if self._sub_lp is None or self._sub_lp_src is not struct:
+            obj = self.operational_data.obj_coeff.detach().cpu().numpy() * self.pWeight
+            self._sub_lp = sb.MatrixLP(
+                self.solver, obj, struct.A_ineq_block, struct.A_eq_block,
+                self._options(lp_optimality_tol=SUBPROBLEM_LP_OPT_TOL),
+                gurobi_env=self._gurobi_env(),
+            )
+            self._sub_lp_src = struct
+        return self._sub_lp
 
     def solve_matrix_problem(self, data, i, inv_decision=None):
+        """Direct (monolithic) solve of sample i: the reference the Benders runs are compared to.
 
-        # env = gp.Env(empty=True)
-        # env.setParam("OutputFlag",0)
-        # env.start()
-
-        # Create a new model
-        m = gp.Model("Matrix problem", env=self.env)
-        m.setParam("MIPGap", 1e-4)
-        m.setParam("Threads", 1)
-        m.setParam("Seed", 0)
-        m.setParam("TimeLimit", 3600)     
-
-        # Create variables
-        # x = m.addMVar(shape=data.ydim, vtype=GRB.CONTINUOUS, name="x")
-        #! Important! We need the lb=-GRB.INFINITY, because otherwise the lower bound is automatically set to 0 by Gurobi.
-        vtypes = np.array([GRB.INTEGER for _ in range(data.num_g)])
-        # vtypes = np.array([GRB.CONTINUOUS for _ in range(data.num_g)])
-        vtypes = np.concatenate((vtypes, np.array([GRB.CONTINUOUS for _ in range(data.ydim-data.num_g)])))
-        x = m.addMVar(shape=data.ydim, lb=-GRB.INFINITY, vtype=vtypes, name="x")
-
-
-        # Set objective
-        obj = np.array(data.obj_coeff)
-        m.setObjective(obj @ x, GRB.MINIMIZE)
-
-        # Add ineq constraints
-
-        # A = np.array(data.ineq_cm[i])
-        # b = np.array(data.ineq_rhs[i])
-        # m.addConstr(A @ x <= b, name="ineq")
-
-        # # Add eq constraints
-        # A = np.array(data.eq_cm[i])
-        # b = np.array(data.eq_rhs[i])
-        # m.addConstr(A @ x == b, name="eq")
+        Same solver and parameter profile as Benders: Threads=1, Seed=0, MIP gap
+        1e-4 (= Benders' stopping tolerance), one hour of solver time. Timing is
+        split so the comparison can use like for like (self.direct_info):
+          solve_time -- inside the solver's optimize()/run(), the quantity the
+                        Benders total_time sums;
+          build_time -- building the model in Pyomo and translating it to the solver;
+          wall_time  -- the whole call.
+        """
+        t_wall = time.perf_counter()
 
         #! Sparse beyond a few hundred hours: the dense matrices are quadratic in
-        #! the horizon (1.6 TB at T=8760, 6 nodes) while the CSR is ~10 MB. Gurobi
-        #! is sparse internally, so this only avoids work -- it never adds any.
+        #! the horizon (1.6 TB at T=8760, 6 nodes) while the CSR is ~10 MB.
         T = len(data.time_ranges[i])
         use_sparse = T > DENSE_HORIZON_LIMIT
         ineq_cm, ineq_rhs, eq_cm, eq_rhs = data.get_sample_matrices(i, sparse=use_sparse)
 
-        A = ineq_cm if use_sparse else np.array(ineq_cm)
-        b = np.array(ineq_rhs)
-        m.addConstr(A @ x <= b, name="ineq")
-
-        A = eq_cm if use_sparse else np.array(eq_cm)
-        b = np.array(eq_rhs)
-        m.addConstr(A @ x == b, name="eq")
-        # For plotting
+        #! Investments integer, operation continuous; every variable free (lb=-inf),
+        #! as in the gurobipy version -- the sign constraints are rows of ineq_cm.
+        integer = np.zeros(data.ydim, dtype=bool)
+        integer[:data.num_g] = True
+        lb = np.full(data.ydim, -np.inf)
+        ub = np.full(data.ydim, np.inf)
         if inv_decision is not None:
-            m.addConstr(x[:data.num_g] == inv_decision)
+            # For plotting: the value function at a fixed investment.
+            lb[:data.num_g] = ub[:data.num_g] = np.asarray(inv_decision, dtype=float).reshape(-1)
 
-        #! Enforce max investment
-        # m.addConstr(x[:data.num_g] <= self.max_investment)
+        m = sb.build_matrix_model(
+            _to_numpy(data.obj_coeff), ineq_cm if use_sparse else np.array(ineq_cm), np.array(ineq_rhs),
+            eq_cm if use_sparse else np.array(eq_cm), np.array(eq_rhs),
+            integer=integer, lb=lb, ub=ub,
+        )
+        t_pyomo = time.perf_counter() - t_wall
 
-        # Optimize model
-        m.optimize()
+        log_file = self._log_file(f"direct_sample{i}.log")
+        opt = sb.make_solver(self.solver, self._gurobi_env())
+        st = sb.solve(opt, m, self._options(time_limit=3600, mip_gap=1e-4, log_file=log_file),
+                      tee=self.solver_tee)
 
-        if m.SolCount == 0:
-            raise RuntimeError(f"Direct solve found no feasible solution (status {m.Status}).")
+        if not st.has_solution:
+            raise RuntimeError(f"Direct solve found no feasible solution (status {st.status}, {self.solver}).")
         self.direct_info = {
-            "status": int(m.Status),
-            "mip_gap": float(m.MIPGap),
-            "obj_bound": float(m.ObjBound),
-            "hit_time_limit": m.Status == GRB.TIME_LIMIT,
+            "solver": self.solver,
+            "status": st.status,
+            "mip_gap": st.gap,
+            "obj_bound": st.bound,
+            "hit_time_limit": st.hit_time_limit,
+            "solve_time": st.solve_time,
+            "build_time": t_pyomo + st.sync_time,
+            "wall_time": time.perf_counter() - t_wall,
+            "nodes": st.nodes,
         }
-        print(f"Obj: {m.ObjVal:g}  gap: {m.MIPGap:.2e}  status: {m.Status}", flush=True)
+        print(f"Obj: {st.objective:g}  gap: {st.gap:.2e}  status: {st.status}  "
+              f"[{self.solver}] solve {st.solve_time:.2f}s, build {self.direct_info['build_time']:.2f}s"
+              + (f"  log: {log_file}" if log_file else ""), flush=True)
 
-        return x.X, m.ObjVal
+        return sb.model_values(m), st.objective
 
     def solve_matrix_problem_simple(
         self,
@@ -671,7 +664,7 @@ class BendersSolver():
         num_alpha=1,
     ):
         """
-        Solve either the master problem or an ED subproblem.
+        Solve either the master problem or an ED subproblem, as a one-off model.
 
         If master=True:
             variables are [u_1, ..., u_G, alpha_1, ..., alpha_K]
@@ -679,62 +672,31 @@ class BendersSolver():
 
         If master=False:
             variables are the ED subproblem variables.
+
+        Benders itself uses the persistent master and _hourly_lp; this stays for
+        scripts that solve single problems from matrices.
         """
-
-        m = gp.Model("Matrix problem", env=self.env)
-        m.setParam("OptimalityTol", 1e-9)
-
+        obj = np.asarray(obj, dtype=float).reshape(-1)
         ydim = obj.size
 
-        if master:
-            m.setParam("MIPGap", 1e-8)
-
-            num_u = ydim - num_alpha
-
-            vtypes = np.array(
-                [GRB.INTEGER for _ in range(num_u)]
-                + [GRB.CONTINUOUS for _ in range(num_alpha)]
-            )
-
-            x = m.addMVar(shape=ydim, lb=0, vtype=vtypes, name="x")
-
-            if investment is not None:
-                m.addConstr(x[:num_u] == np.array(investment, dtype=float))
-
-        else:
-            vtypes = np.array([GRB.CONTINUOUS for _ in range(ydim)])
-            x = m.addMVar(shape=ydim, lb=-GRB.INFINITY, vtype=vtypes, name="x")
-
-        obj = np.array(obj, dtype=float)
-        m.setObjective(obj @ x, GRB.MINIMIZE)
-
-        A = np.array(A_ineq, dtype=float)
-        b = np.array(b_ineq, dtype=float)
-        m.addConstr(A @ x <= b, name="ineq")
-
         if not master:
-            A = np.array(A_eq, dtype=float)
-            b = np.array(b_eq, dtype=float)
-            m.addConstr(A @ x == b, name="eq")
+            lp = sb.MatrixLP(self.solver, obj, np.asarray(A_ineq, dtype=float), np.asarray(A_eq, dtype=float),
+                             self._options(lp_optimality_tol=SUBPROBLEM_LP_OPT_TOL), gurobi_env=self._gurobi_env())
+            return lp.solve(b_ineq, b_eq)
 
-        start_time = time.time()
-        m.optimize()
-        inference_time = time.time() - start_time
-
-        if master:
-            dual_val = []
-        else:
-            if m.status == GRB.OPTIMAL:
-                dual_val = m.getAttr("Pi", m.getConstrs())
-            else:
-                print(f"Warning: Gurobi status = {m.status}. Cannot retrieve duals.")
-                if m.status == 4:
-                    m.computeIIS()
-                    m.write("model_infeasible.ilp")
-                    print("Wrote infeasible model to model_infeasible.ilp")
-                raise RuntimeError("Subproblem not solved to optimality — duals unavailable.")
-
-        return m.ObjVal, x.X, dual_val, inference_time
+        num_u = ydim - num_alpha
+        integer = np.arange(ydim) < num_u
+        lb = np.zeros(ydim)
+        ub = np.full(ydim, np.inf)
+        if investment is not None:
+            lb[:num_u] = ub[:num_u] = np.asarray(investment, dtype=float)
+        m = sb.build_matrix_model(obj, np.asarray(A_ineq, dtype=float), np.asarray(b_ineq, dtype=float),
+                                  integer=integer, lb=lb, ub=ub)
+        st = sb.solve(sb.make_solver(self.solver, self._gurobi_env()), m,
+                      self._options(mip_gap=1e-8, lp_optimality_tol=1e-9))
+        if not st.has_solution:
+            raise RuntimeError(f"Master found no feasible solution (status {st.status}).")
+        return st.objective, sb.model_values(m), [], st.solve_time
 
     def solve_matrix_problem_PDL(self, X):
         '''
@@ -804,7 +766,7 @@ class BendersSolver():
         return self.cut_groups
 
     def _ensure_master_model(self, data, sample):
-        """Build the master Gurobi model once. Cheap to call repeatedly."""
+        """Build the master model once. Cheap to call repeatedly."""
         if self.master_model is not None:
             return
 
@@ -812,7 +774,7 @@ class BendersSolver():
 
         # Determine number of recourse variables.
         # "single" uses one aggregate recourse var. The static grouped modes (full,
-        # kmeans, stress) cluster once and never regroup, so one theta per *group* is
+        # kmeans) cluster once and never regroup, so one theta per *group* is
         # exactly equivalent to one per timestep: the groups partition the hours, no
         # cut mixes two groups, and only the per-group sum is ever constrained. Same
         # bound, same trajectory, far fewer columns and no degenerate plateau.
@@ -829,61 +791,77 @@ class BendersSolver():
             num_alpha = len(data.time_ranges[sample])
 
         self.master_num_alpha = num_alpha
-        m = gp.Model("Benders Master Persistent", env=self.env)
-        m.setParam("MIPGap", 1e-4)      # inexact phase; tightened to 1e-5 when switching to exact
-        m.setParam("Threads", 1)        # match the paper's protocol
-        m.setParam("Seed", 0)           # reproducible
-        m.setParam("TimeLimit", 3600)   # safety net; the per-sample wall-clock limit is set in solve_with_benders
-        m.setParam("OutputFlag", 0)     # no Gurobi log
+        m = pyo.ConcreteModel("Benders Master Persistent")
 
         # Variables
-        u = m.addMVar(shape=data.num_g, lb=0.0, ub=100000.0,
-                    vtype=GRB.INTEGER, name="u")
+        m.u = pyo.Var(range(data.num_g), domain=pyo.NonNegativeIntegers, bounds=(0.0, 100000.0))
         #! If we are solving the master problem, we know the investments are positive, so the lowerbound of each recourse value can be set to 0.
-        alpha = m.addMVar(shape=num_alpha, lb=0.0,
-                        vtype=GRB.CONTINUOUS, name="alpha")
+        m.alpha = pyo.Var(range(num_alpha), domain=pyo.NonNegativeReals)
 
         # Objective: c_u^T u + sum_k alpha_k
         obj_u = data.obj_coeff[:data.num_g].detach().cpu().numpy()
-        m.setObjective(obj_u @ u + alpha.sum(), GRB.MINIMIZE)
+        self._u_list = [m.u[g] for g in range(data.num_g)]
+        self._alpha_list = [m.alpha[k] for k in range(num_alpha)]
+        m.obj = pyo.Objective(
+            expr=sb.linear_expr(list(obj_u) + [1.0] * num_alpha, self._u_list + self._alpha_list),
+            sense=pyo.minimize,
+        )
 
-        m.addConstr(s.A_base @ u <= s.b_base, name="inv_base")
-        # m.addConstr(A_base @ u <= b_base, name="inv_base")
+        sb.add_matrix_constraints(m, "inv_base", m.u, s.A_base, s.b_base, "<=")
+        m.cuts = pyo.ConstraintList()
 
         self.master_model = m
-        self.master_u = u
-        self.master_alpha = alpha
+        self.master_u = m.u
+        self.master_alpha = m.alpha
+        self._master_opt = sb.make_solver(self.solver, self._gurobi_env())
         self._num_cuts_in_master = 0
         self._cut_constrs = []
+        self._cut_stats = []
 
 
     def _add_new_cuts_to_master(self, all_cuts):
         """Only push cuts that aren't already in the model.
         adapt-G-S rebuilds every cut under the new grouping, so its cuts are replaced wholesale."""
+        m = self.master_model
         if self.cut_selection == "kmeans_dynamic_shared":
             if self._cut_constrs:
-                self.master_model.remove(self._cut_constrs)
+                #! A fresh ConstraintList; the persistent solver sees the old rows go.
+                m.del_component(m.cuts)
+                m.cuts = pyo.ConstraintList()
             self._cut_constrs = []
+            self._cut_stats = []
             new_cuts = all_cuts
         else:
             new_cuts = all_cuts[self._num_cuts_in_master:]
         if not new_cuts:
             return
 
-        u = self.master_u
-        alpha = self.master_alpha
-        num_g = u.shape[0]
+        num_g = len(self._u_list)
+        xs = self._u_list + self._alpha_list
 
         for cut_lhs, cut_rhs in new_cuts:
-            row = np.asarray(cut_lhs).reshape(-1)
-            u_coeffs = row[:num_g]
-            alpha_coeffs = row[num_g:]
-            self._cut_constrs.append(self.master_model.addConstr(
-                u_coeffs @ u + alpha_coeffs @ alpha <= float(cut_rhs)
+            row = np.asarray(cut_lhs, dtype=float).reshape(-1)
+            nz = np.flatnonzero(row)
+            self._cut_constrs.append(m.cuts.add(
+                (None, sb.linear_expr(row[nz], [xs[j] for j in nz]), float(cut_rhs))
             ))
+            #! Coefficient range of each cut, for the master diagnostics: a slope
+            #! range of 1e9+ (or rhs that large) is a classic reason for a MIP to stall.
+            slope = np.abs(row[:num_g])
+            slope = slope[slope > 0]
+            self._cut_stats.append((slope.min() if slope.size else np.nan,
+                                    slope.max() if slope.size else np.nan,
+                                    abs(float(cut_rhs))))
 
-        # Gurobi batches lazily; optimize() triggers the update.
         self._num_cuts_in_master = len(all_cuts)
+
+    def _master_log_path(self, sample, it, ext):
+        """<solver_log_dir>/master_sample<s>_iter<i>.<ext>, or None when logging is off.
+
+        One file per master solve, so a stalled solve is simply the last file:
+        the solver writes it live, so it shows the search state while stuck.
+        """
+        return self._log_file(f"master_sample{sample}_iter{it:04d}.{ext}")
 
     @staticmethod
     def get_crossover_metrics(iter_df):
@@ -928,38 +906,71 @@ class BendersSolver():
         self._ensure_master_model(data, sample)
         self._add_new_cuts_to_master(benders_cuts)
 
+        m = self.master_model
         u = self.master_u
-        alpha = self.master_alpha
+        it = len(self.iter_hist)   # the Benders iteration this master solve belongs to
 
         # Final-evaluation call: fix u = investment via temporary bounds.
         if investment is not None:
             inv_arr = np.asarray(investment, dtype=float)
-            old_lb = u.LB.copy()
-            old_ub = u.UB.copy()
-            u.LB = inv_arr
-            u.UB = inv_arr
+            old_bounds = [(u[g].lb, u[g].ub) for g in range(len(inv_arr))]
+            for g, v in enumerate(inv_arr):
+                u[g].setlb(v)
+                u[g].setub(v)
 
-        start = time.time()
-        self.master_model.optimize()
-        inference_time = time.time() - start
+        stats = np.array(self._cut_stats, dtype=float).reshape(-1, 3)
+        coef_min = float(np.nanmin(stats[:, 0])) if len(stats) and np.isfinite(stats[:, 0]).any() else np.nan
+        coef_max = float(np.nanmax(stats[:, 1])) if len(stats) and np.isfinite(stats[:, 1]).any() else np.nan
+        rhs_max = float(stats[:, 2].max()) if len(stats) else np.nan
 
-        m = self.master_model
-        if m.SolCount == 0:
-            raise RuntimeError(f"Master found no feasible solution (status {m.Status}).")
-        if m.Status == GRB.TIME_LIMIT:
-            print(f"[master] time limit hit, MIP gap {m.MIPGap:.2e}", flush=True)
-        self._last_master_bound = float(m.ObjBound)
+        log_file = self._master_log_path(sample, it, "log")
+        if self.dump_master:
+            sb.write_model(m, self._master_log_path(sample, it, "lp"))
+        #! Printed before the solve, so a master that never returns still says what it was given.
+        print(f"[master] iter {it}: {len(self._cut_constrs)} cuts, |slope| in [{coef_min:.3g}, {coef_max:.3g}], "
+              f"|rhs| <= {rhs_max:.3g}, gap {self._master_mip_gap:g}, limit {self._master_time_limit:.0f}s"
+              + (f", log: {log_file}" if log_file else ""), flush=True)
 
-        new_investments = np.array(u.X, dtype=float)
-        alpha_vals = np.array(alpha.X, dtype=float)
+        st = sb.solve(self._master_opt, m,
+                      self._options(time_limit=self._master_time_limit, mip_gap=self._master_mip_gap,
+                                    log_file=log_file),
+                      tee=self.solver_tee)
+        inference_time = st.solve_time
+
+        if not st.has_solution:
+            raise RuntimeError(f"Master found no feasible solution (status {st.status}, {self.solver}).")
+        if st.hit_time_limit:
+            print(f"[master] time limit hit, MIP gap {st.gap:.2e}", flush=True)
+        print(f"[master] iter {it}: {st.status} in {st.solve_time:.2f}s (+{st.sync_time:.2f}s pyomo), "
+              f"obj {st.objective:.6g}, bound {st.bound:.6g}, gap {st.gap:.2e}, nodes {st.nodes}", flush=True)
+        #! Without a finite bound (should not happen for a MIP) fall back to the objective, as before.
+        self._last_master_bound = st.bound if np.isfinite(st.bound) else None
+
+        self._last_master_stats = {
+            "master_status": st.status,
+            "master_obj": st.objective,
+            "master_bound": st.bound,
+            "master_gap": st.gap,
+            "master_nodes": st.nodes,
+            "master_iters": st.iterations,
+            "master_sync": st.sync_time,
+            "master_ncuts": len(self._cut_constrs),
+            "cut_coef_min": coef_min,
+            "cut_coef_max": coef_max,
+            "cut_rhs_max": rhs_max,
+        }
+
+        new_investments = np.array([u[g].value for g in range(len(self._u_list))], dtype=float)
+        alpha_vals = np.array([a.value for a in self._alpha_list], dtype=float)
 
         obj_u = data.obj_coeff[:data.num_g].detach().cpu().numpy()
         investment_cost = float(obj_u @ new_investments)
         alpha_total = float(alpha_vals.sum())
 
         if investment is not None:
-            u.LB = old_lb
-            u.UB = old_ub
+            for g, (lo, hi) in enumerate(old_bounds):
+                u[g].setlb(lo)
+                u[g].setub(hi)
 
         return [investment_cost, alpha_total], new_investments, inference_time
 
@@ -995,14 +1006,12 @@ class BendersSolver():
 
         n_resolved = 0
         if len(flagged) and action == "resolve":
-            obj = self.operational_data.obj_coeff.detach().cpu().numpy() * self.pWeight
+            lp = self._hourly_lp(s)
             primal_t = np.asarray(self._last_gap_stats["primal_t"], dtype=float)
             dual_t = np.asarray(self._last_gap_stats["dual_t"], dtype=float)
             dual_vals = np.array(dual_vals, dtype=float, copy=True)
             for t in flagged:
-                ov, _, dv, _ = self.solve_matrix_problem_simple(
-                    obj, s.A_ineq_t[t], b_ineqs_np[t], s.A_eq_t[t], b_eqs_np[t], False
-                )
+                ov, _, dv, _ = lp.solve(b_ineqs_np[t], b_eqs_np[t])
                 dual_vals[t] = dv
                 #! Exact hour: its primal and dual contributions both become the LP optimum.
                 primal_total += ov - primal_t[t]
@@ -1179,36 +1188,17 @@ class BendersSolver():
         t_pdl = 0.0
 
         if exact:
-            obj = self.operational_data.obj_coeff.detach().cpu().numpy() * self.pWeight
+            lp = self._hourly_lp(s)
 
             obj_vals    = [None] * num_timesteps
             primal_vals = [None] * num_timesteps
             dual_vals   = [None] * num_timesteps
             inf_times   = [None] * num_timesteps
 
-            # --- Phase 2: LP solves ---
+            # --- Phase 2: LP solves (sequential: see __init__ on parallel_subproblems) ---
             t0 = time.time()
-            if self.parallel_subproblems and num_timesteps > 1:
-                if self.n_workers is None or self.n_workers <= 0:
-                    n_workers = min(os.cpu_count() or 4, num_timesteps)
-                else:
-                    n_workers = min(self.n_workers, num_timesteps)
-                print(f"[parallel] n_workers={n_workers}, num_timesteps={num_timesteps}, "
-                      f"os.cpu_count()={os.cpu_count()} =====")
-
-                def _work(t):
-                    return t, self._solve_sub_lp(obj, s.A_ineq_t[t], b_ineqs_np[t],
-                                                 s.A_eq_t[t], b_eqs_np[t])
-
-                with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                    for t, (ov, pv, dv, it) in pool.map(_work, range(num_timesteps)):
-                        obj_vals[t], primal_vals[t], dual_vals[t], inf_times[t] = ov, pv, dv, it
-            else:
-                for t in range(num_timesteps):
-                    ov, pv, dv, it = self.solve_matrix_problem_simple(
-                        obj, s.A_ineq_t[t], b_ineqs_np[t], s.A_eq_t[t], b_eqs_np[t], False
-                    )
-                    obj_vals[t], primal_vals[t], dual_vals[t], inf_times[t] = ov, pv, dv, it
+            for t in range(num_timesteps):
+                obj_vals[t], primal_vals[t], dual_vals[t], inf_times[t] = lp.solve(b_ineqs_np[t], b_eqs_np[t])
             t_solve_wall = time.time() - t0
 
             primal_obj_val_total = float(np.sum(obj_vals))
@@ -1249,11 +1239,10 @@ class BendersSolver():
         t_fn_total = time.time() - t_fn_start
 
         if exact:
-            eff_par = (inference_time_total / t_solve_wall) if t_solve_wall > 0 else 0.0
-            print(f"[solve_subproblems EXACT T={num_timesteps}] total={t_fn_total:.2f}s | "
+            print(f"[solve_subproblems EXACT T={num_timesteps} {self.solver}] total={t_fn_total:.2f}s | "
                   f"struct={t_getmat:.3f}s build={t_build:.3f}s "
                   f"solve_wall={t_solve_wall:.2f}s (sum_solve={inference_time_total:.2f}s, "
-                  f"eff_par={eff_par:.2f}x) cuts={t_cuts:.2f}s", flush=True)
+                  f"pyomo={t_solve_wall - inference_time_total:.2f}s) cuts={t_cuts:.2f}s", flush=True)
         else:
             print(f"[solve_subproblems PDL T={num_timesteps}] total={t_fn_total:.2f}s | "
                   f"struct={t_getmat:.3f}s build={t_build:.3f}s pdl={t_pdl:.2f}s "
@@ -1304,6 +1293,43 @@ class BendersSolver():
         self.best_lower_bound = max(self.best_lower_bound, lower_bound)
         return self.best_lower_bound
 
+    MASTER_STAT_KEYS = ("master_status", "master_obj", "master_bound", "master_gap", "master_nodes",
+                        "master_iters", "master_sync", "master_ncuts",
+                        "cut_coef_min", "cut_coef_max", "cut_rhs_max")
+
+    def _record_master_stats(self, stats):
+        """One row of master diagnostics per iteration; iteration 0 has no master solve."""
+        empty = {k: np.nan for k in self.MASTER_STAT_KEYS}
+        empty.update(master_status="", master_nodes=-1, master_iters=-1, master_ncuts=0)
+        stats = stats or empty
+        self.master_status_hist.append(stats["master_status"])
+        self.master_obj_hist.append(stats["master_obj"])
+        self.master_bound_hist.append(stats["master_bound"])
+        self.master_gap_hist.append(stats["master_gap"])
+        self.master_nodes_hist.append(stats["master_nodes"])
+        self.master_iters_hist.append(stats["master_iters"])
+        self.master_sync_hist.append(stats["master_sync"])
+        self.master_ncuts_hist.append(stats["master_ncuts"])
+        self.cut_coef_min_hist.append(stats["cut_coef_min"])
+        self.cut_coef_max_hist.append(stats["cut_coef_max"])
+        self.cut_rhs_max_hist.append(stats["cut_rhs_max"])
+
+    def master_diagnostics(self):
+        """Per-iteration master diagnostics as columns for the iteration log."""
+        return {
+            "master_status": self.master_status_hist,
+            "master_obj": self.master_obj_hist,
+            "master_bound": self.master_bound_hist,
+            "master_gap": self.master_gap_hist,
+            "master_nodes": self.master_nodes_hist,
+            "master_simplex_iters": self.master_iters_hist,
+            "t_master_pyomo": self.master_sync_hist,
+            "master_ncuts": self.master_ncuts_hist,
+            "cut_coef_min": self.cut_coef_min_hist,
+            "cut_coef_max": self.cut_coef_max_hist,
+            "cut_rhs_max": self.cut_rhs_max_hist,
+        }
+
     def solve_with_benders(self, data, compact, sample):
 
         # Create lists for algorithm
@@ -1316,6 +1342,7 @@ class BendersSolver():
         wall_limit = 3600.0               # one hour per sample
         t_start = time.time()
         self.hit_time_limit = False
+        self._last_master_stats = None
         upper_bound, lower_bound = np.inf, -np.inf
 
         # Start Benders algorithm
@@ -1327,8 +1354,7 @@ class BendersSolver():
                 print(f"[benders] wall-clock limit reached after {elapsed:.0f}s", flush=True)
                 self.hit_time_limit = True
                 break
-            if self.master_model is not None:
-                self.master_model.setParam("TimeLimit", max(1.0, wall_limit - elapsed))
+            self._master_time_limit = max(1.0, wall_limit - elapsed)
 
             self._last_gap_stats = None
             t_iter_start = time.time()
@@ -1369,8 +1395,7 @@ class BendersSolver():
                 print("!! Investments are the same as last iteration")
                 if self.exact_refinement:
                     self.exact = True
-                    if self.master_model is not None:
-                        self.master_model.setParam("MIPGap", 1e-5)
+                    self._master_mip_gap = 1e-5
                 else:
                     print("Stopping Benders decomposition because exact refinement is not used.")
                     print("Upper bound:", self.best_upper_bound) #! Return the best upper bound found so far if exact refinement is not used
@@ -1460,6 +1485,7 @@ class BendersSolver():
                 self.master_time_hist.append(0.0)
             else:
                 self.master_time_hist.append(float(inference_time_master))
+            self._record_master_stats(self._last_master_stats if i > 0 else None)
 
             # Check for optimality
             if self.exact:
@@ -1506,7 +1532,9 @@ class BendersSolver():
             self.wall_iter_hist.append(time.time() - t_iter_start)
             i += 1
 
-            
+        #! Everything solve_with_benders spent, Pyomo bookkeeping, clustering and cut
+        #! building included -- next to total_time, which only sums solver calls.
+        self.wall_time = time.time() - t_start
         return upper_bound, lower_bound, benders_cut_all, investments_all, obj_val_subproblems_all, i
     
 
@@ -1659,7 +1687,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--cut-selection", "--cut_selection",
         dest="cut_selection",
-        choices=["single", "full", "kmeans", "stress", "kmeans_dynamic", "kmeans_dynamic_shared"],
+        choices=["single", "full", "kmeans", "kmeans_dynamic", "kmeans_dynamic_shared"],
         default=None,
         help="Override Benders_args.cut_selection. Left unset, uses the config.",
     )
@@ -1668,7 +1696,7 @@ if __name__ == "__main__":
         dest="cut_selection_k",
         type=int,
         default=None,
-        help="Number of clusters/groups for kmeans/stress/kmeans_dynamic(_shared). "
+        help="Number of clusters/groups for kmeans/kmeans_dynamic(_shared). "
              "Ignored for 'single' and 'full'.",
     )
     #! Per-subproblem certificate gate, off unless a threshold is given.
@@ -1706,6 +1734,37 @@ if __name__ == "__main__":
         "--ground-truth", action="store_true", default=False,
         help="Also solve the full monolithic GEP per sample (dense matrices; small T only).",
     )
+    #! Solver choice applies to every model of the run (direct, master, subproblems),
+    #! so a direct-vs-Benders comparison always uses one solver.
+    parser.add_argument(
+        "--solver",
+        choices=list(sb.SOLVERS),
+        default=None,
+        help="Optimisation solver, through Pyomo. Overrides Benders_args.solver; default gurobi.",
+    )
+    parser.add_argument(
+        "--solver-log-dir", "--solver_log_dir",
+        dest="solver_log_dir",
+        default=None,
+        help="Write the solver's own log for every master solve (and the direct solve) here, one "
+             "file per solve, written live -- a stalled master is the last file. Relative paths "
+             "resolve under the output root.",
+    )
+    parser.add_argument(
+        "--solver-tee", "--solver_tee",
+        dest="solver_tee",
+        action="store_true",
+        default=False,
+        help="Also stream the master/direct solver log to the console.",
+    )
+    parser.add_argument(
+        "--dump-master", "--dump_master",
+        dest="dump_master",
+        action="store_true",
+        default=False,
+        help="Write each master problem to an .lp file next to its log (needs --solver-log-dir), "
+             "to replay it offline with gurobi_cl or highs.",
+    )
 
     args_cli = parser.parse_args()
 
@@ -1741,6 +1800,13 @@ if __name__ == "__main__":
         args["Benders_args"]["gap_gate_action"] = args_cli.gap_gate_action
         print(f"[override] gap_gate_action = {args_cli.gap_gate_action}")
 
+    if args_cli.solver is not None:
+        args["Benders_args"]["solver"] = args_cli.solver
+        print(f"[override] solver = {args_cli.solver}")
+    SOLVER = sb.check_solver_name(args["Benders_args"].get("solver", "gurobi"))
+    if args_cli.dump_master and not args_cli.solver_log_dir:
+        raise SystemExit("--dump-master needs --solver-log-dir: that is where the .lp files go.")
+
     if args_cli.cut_selection is not None:
         args["Benders_args"]["cut_selection"] = args_cli.cut_selection
         print(f"[override] cut_selection = {args_cli.cut_selection}")
@@ -1751,7 +1817,7 @@ if __name__ == "__main__":
     # Coupling check: k-based strategies need a sensible k.
     _cs = args["Benders_args"]["cut_selection"]
     _k  = args["Benders_args"].get("cut_selection_k", 1)
-    _needs_k = _cs in ("kmeans", "stress", "kmeans_dynamic", "kmeans_dynamic_shared")
+    _needs_k = _cs in ("kmeans", "kmeans_dynamic", "kmeans_dynamic_shared")
     if _needs_k and (_k is None or _k < 1):
         raise SystemExit(
             f"cut_selection='{_cs}' needs --cut-selection-k >= 1 "
@@ -1768,9 +1834,12 @@ if __name__ == "__main__":
     data_root = roots["data_root"]
     output_root = roots["output_root"]
 
+    SOLVER_LOG_DIR = under_root(args_cli.solver_log_dir, output_root) if args_cli.solver_log_dir else None
+
     print(f"Run config:   {RUN_CONFIG_FILE}  ({NumNode} nodes)")
     print(f"Dataset root: {data_root}")
     print(f"Output root:  {output_root}")
+    print(f"Solver:       {SOLVER}" + (f"  (logs: {SOLVER_LOG_DIR})" if SOLVER_LOG_DIR else ""))
 
     #! Inference device for the loaded nets, independent of the device they
     #! were trained on. CLI beats the config; "auto" is the fallback.
@@ -1981,13 +2050,21 @@ if __name__ == "__main__":
             # sample = 0
             for (start_exact, exact_refinement) in benders_setups:
                 all_results = []
+                #! Logs of one setup in a folder of their own, so "All" does not overwrite them.
+                setup_tag = "direct" if args_cli.solve_direct else f"start_exact{start_exact}_ref{exact_refinement}"
+                solver_kwargs = dict(
+                    solver=SOLVER,
+                    solver_log_dir=os.path.join(SOLVER_LOG_DIR, setup_tag) if SOLVER_LOG_DIR else None,
+                    solver_tee=args_cli.solver_tee,
+                    dump_master=args_cli.dump_master,
+                )
                 for repeat in range(1):
                     for sample in range(samples):
                         if args_cli.solve_direct:
                             # Solve Directly with Solver
                             primal_net = None
                             dual_net = None
-                            print(f"Solving sample {sample} directly with Gurobi without Benders decomposition.")
+                            print(f"Solving sample {sample} directly with {SOLVER} without Benders decomposition.")
                             solver = BendersSolver(gep_data=gep_data, operational_data=operational_data, 
                                                    primal_net=primal_net, dual_net=dual_net, sample=sample, 
                                                    exact=start_exact, exact_refinement=exact_refinement,
@@ -1999,14 +2076,15 @@ if __name__ == "__main__":
                                                     n_workers=benders_args["n_workers"],
                                                     dynamic_cluster_features=benders_args.get("dynamic_cluster_features", "price"),
                                                     gap_gate_threshold=benders_args.get("gap_gate_threshold"),
-                                                    gap_gate_action=benders_args.get("gap_gate_action", "resolve"))
-                            start_time_direct = time.time()
+                                                    gap_gate_action=benders_args.get("gap_gate_action", "resolve"),
+                                                    **solver_kwargs)
                             y, obj = solver.solve_matrix_problem(gep_data, sample, inv_decision=None)
-                            total_time_direct = time.time() - start_time_direct
+                            info = solver.direct_info
 
                             print(f"Direct exact GEP optimum: {obj}")
                             print(f"Direct investment decision: {y[:gep_data.num_g]}")
-                            print(f"Direct total time: {total_time_direct}")
+                            print(f"Direct solve time: {info['solve_time']:.2f}s "
+                                  f"(build {info['build_time']:.2f}s, wall {info['wall_time']:.2f}s)")
 
                             result = {
                                 "repeat": repeat,
@@ -2018,14 +2096,21 @@ if __name__ == "__main__":
                                 "total_iterations": 1,
                                 "exact_iterations": 1,
                                 "inexact_iterations": 0,
-                                "total_time": total_time_direct,
+                                #! Solver time only, like the Benders total_time (a sum of solver
+                                #! calls); building the model is reported apart in build_time.
+                                "total_time": info["solve_time"],
                                 "total_time_master": 0.0,
                                 "total_time_subproblem_exact": 0.0,
                                 "total_time_subproblem_pdl": 0.0,
-                                "mip_gap": solver.direct_info["mip_gap"],
-                                "obj_bound": solver.direct_info["obj_bound"],
-                                "hit_time_limit": solver.direct_info["hit_time_limit"],
-                                "investments": y[:gep_data.num_g].tolist()
+                                "mip_gap": info["mip_gap"],
+                                "obj_bound": info["obj_bound"],
+                                "hit_time_limit": info["hit_time_limit"],
+                                "investments": y[:gep_data.num_g].tolist(),
+                                "solver": SOLVER,
+                                "status": info["status"],
+                                "build_time": info["build_time"],
+                                "wall_time": info["wall_time"],
+                                "nodes": info["nodes"],
                             }
                             all_results.append(result)
                             continue
@@ -2040,7 +2125,8 @@ if __name__ == "__main__":
                                                     n_workers=benders_args["n_workers"],
                                                     dynamic_cluster_features=benders_args.get("dynamic_cluster_features", "price"),
                                                     gap_gate_threshold=benders_args.get("gap_gate_threshold"),
-                                                    gap_gate_action=benders_args.get("gap_gate_action", "resolve"))
+                                                    gap_gate_action=benders_args.get("gap_gate_action", "resolve"),
+                                                    **solver_kwargs)
         
                             # Solve for the ground truth if falg is set to True
                             if args_cli.ground_truth:
@@ -2074,10 +2160,15 @@ if __name__ == "__main__":
                                 "gate_dropped":   solver.gate_dropped_hist,
                                 "gate_time":      solver.gate_time_hist,
                                 "gap_rel_max":    solver.gap_rel_max_hist,
+                                #! Master state per iteration -- status, bound, gap, nodes and the
+                                #! cut coefficient range -- for tracing a master that stalls.
+                                **solver.master_diagnostics(),
                             })
                             crossover_metrics = BendersSolver.get_crossover_metrics(iter_df)
                             iter_df["investment"] = [json.dumps(v) for v in solver.inv_hist]
                             specific_name = args["Benders_args"].get("specific_name", "")
+                            if SOLVER != "gurobi":
+                                specific_name = f"{specific_name}_{SOLVER}"
                             benders_setup_str = args["Benders_args"].get("benders_setup", "")
                             # if samples == 1:
                             #     out_dir = f"outputs/Benders/{NumNode}Node/Full_Time/iter_logs_{benders_setup_str}_{specific_name}"
@@ -2119,11 +2210,13 @@ if __name__ == "__main__":
                                 "total_time_subproblem_pdl": solver.total_time_subproblem_pdl,
                                 "hit_time_limit": solver.hit_time_limit,
                                 "investments": investments_all[-1].tolist() if len(investments_all) > 0 else None,
-
                                 "has_crossover": crossover_metrics["has_crossover"],
                                 "lb_cross": crossover_metrics["lb_cross"],
                                 "gap_cross_pct": crossover_metrics["gap_cross_pct"],
                                 "lb_cross_ratio_pct": crossover_metrics["lb_cross_ratio_pct"],
+                                "solver": SOLVER,
+                                #! Whole solve_with_benders, Pyomo bookkeeping and cut building included.
+                                "wall_time": solver.wall_time,
                             }
                             all_results.append(result)
                             # break
@@ -2146,10 +2239,15 @@ if __name__ == "__main__":
 
                     if args_cli.solve_direct:
                         specific_name = "direct_exact"
-                        data_save_path = os.path.join(sample_dir, f"Gurobi_Solution.csv")
+                        #! Gurobi keeps its old file name, so existing analysis scripts still find it.
+                        data_save_path = os.path.join(sample_dir, "Gurobi_Solution.csv" if SOLVER == "gurobi"
+                                                      else f"{SOLVER}_Solution.csv")
 
                     else:
                         specific_name = args["Benders_args"].get("specific_name", "")
+                        #! Runs on another solver must not overwrite the Gurobi results.
+                        if SOLVER != "gurobi":
+                            specific_name = f"{specific_name}_{SOLVER}"
 
                         if samples == 1:
                             data_save_path = os.path.join(sample_dir, f"experiment_data_full_time_sample_duration:{benders_args['sample_duration']}_start_exact:{start_exact}_exact_refinement:{exact_refinement}_{specific_name}.csv")

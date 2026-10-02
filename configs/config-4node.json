@@ -69,7 +69,7 @@
         "cut_selection": "kmeans",
         "cut_selection_k": 20,
         "bound_alpha_by_0": true,
-        "_cut_selection_comment":"Options are: single, kmeans, stress, full",
+        "_cut_selection_comment":"Options are: single, kmeans, full",
         "parallel_subproblems": false,
         "n_workers": null
     },

@@ -398,7 +398,7 @@
         "cut_selection": "kmeans_dynamic_shared",
         "cut_selection_k": 10,
         "bound_alpha_by_0": true,
-        "_cut_selection_comment": "Options are: single, kmeans, stress, full, kmeans_dynamic (adapt-G-I, per-timestep recourse), kmeans_dynamic_shared (adapt-G-S, per-group recourse)",
+        "_cut_selection_comment": "Options are: single, kmeans, full, kmeans_dynamic (adapt-G-I, per-timestep recourse), kmeans_dynamic_shared (adapt-G-S, per-group recourse)",
         "dynamic_cluster_features": "capacity",
         "_dynamic_cluster_features_comment": "Features for kmeans_dynamic(_shared): price (nodal shadow prices), slope (cut slopes) or capacity ([D, A*Pmax*u] at the current investment)",
         "parallel_subproblems": false,

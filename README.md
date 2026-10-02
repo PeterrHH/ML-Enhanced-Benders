@@ -193,9 +193,41 @@ Three modes are available:
 | Mode | Flag / config | Subproblem solver |
 |---|---|---|
 | Inexact_Refine | `benders_setup: "Inexact_Refine"` | ML-enhanced Benderes |
-| Exact Benders | `benders_setup: "Exact"` | Use Benders Decomposition but subproblems always solve with Gurobi |
-| Direct solve | `--solve-direct` or `-s` CLI flag | Solve GEP with Gurobi, no decomposition |
+| Exact Benders | `benders_setup: "Exact"` | Use Benders Decomposition but subproblems are always solved exactly by the LP solver |
+| Direct solve | `--solve-direct` or `-s` CLI flag | Solve the full GEP MIP with the solver, no decomposition |
 
+### Solver (Gurobi or HiGHS)
+
+Every model is built in Pyomo (`solver_backend.py`) and solved with the solver
+chosen by `--solver gurobi|highs` (or `Benders_args.solver`; default `gurobi`).
+The choice applies to every model in the run: the direct solve, the Benders master,
+the hourly subproblems, and the gap-gate re-solves. All of them use the same parameter
+profile (1 thread, seed 0, MIP gap 1e-4, one hour; the hourly subproblem LPs use an LP
+optimality tolerance of 1e-8 because their duals become the cuts),
+mapped onto each solver's own option names.
+
+Timing is the same for every method: `total_time` is the time spent inside the
+solver's optimize/run calls. For Benders it also includes PDL inference on inexact
+iterations. Pyomo overhead is kept out of it and reported separately:
+`build_time` for the direct solve, `wall_time` for both. Runs on HiGHS get a
+`_highs` suffix in their output names (`highs_Solution.csv` for the direct solve),
+so they never overwrite Gurobi results.
+
+Debugging a master that stalls:
+
+```bash
+python gep_benders.py -c configs/config-12node-pdlmatch.json --solver highs \
+    --solver-log-dir solver_logs --dump-master        # add --solver-tee to also echo to the console
+```
+
+* `solver_logs/<setup>/master_sample<s>_iter<i>.log` is the solver's own log for each master
+  solve, written live. A stalled master is the last file, and it shows the
+  incumbent, bound, gap and node count as they evolve.
+* `master_sample<s>_iter<i>.lp` (with `--dump-master`) is that exact master problem. Re-run it
+  offline with `gurobi_cl` or `highs` to try other settings or the other solver.
+* Every iteration log (`iterlog_*.csv`) records the master's status, bound, gap, node count,
+  cut count and the cut coefficient range (`cut_coef_min/max`, `cut_rhs_max`). A widening
+  range is a common reason a master MIP slows down.
 
 
 ### Cut Management
