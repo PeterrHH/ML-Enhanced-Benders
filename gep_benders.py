@@ -259,10 +259,23 @@ import scipy.sparse as sp
 #! sparse builders landed stay byte-reproducible; longer ones must go sparse.
 DENSE_HORIZON_LIMIT = 256
 
-#! LP optimality tolerance of the hourly ED subproblems (Gurobi OptimalityTol, HiGHS
-#! dual_feasibility_tolerance). Tighter than the 1e-6 default because their duals
-#! become the Benders cuts; the direct solve and the master keep the default.
-SUBPROBLEM_LP_OPT_TOL = 1e-8
+#! One numerical profile for every solve of a run -- direct, master, hourly LPs and
+#! gap-gate re-solves: primal feasibility (Gurobi FeasibilityTol, HiGHS
+#! primal_feasibility_tolerance) and dual feasibility (OptimalityTol /
+#! dual_feasibility_tolerance), both at Gurobi's minimum. The hourly duals become the
+#! cuts, and a grouped cut sums them over its whole cluster, so noise at the 1e-6
+#! default adds up into near-parallel cuts the master cannot tell apart.
+NUMERIC_TOL = 1e-9
+
+#! Benders stops at this relative UB-LB gap; the direct solve gets it as its MIP gap,
+#! so both certify the same optimality.
+BENDERS_REL_TOL = 1e-4
+
+#! Master MIP gap, the same in the inexact and exact phases. The lower bound is the
+#! master's bound, so it is valid at any gap; the gap only has to sit below the
+#! Benders certificate for the incumbent to let UB-LB close. A tighter gap only makes
+#! every master slower.
+MASTER_MIP_GAP = BENDERS_REL_TOL / 10
 
 #! Cut groupings that are built once and never revisited. Because the groups are
 #! fixed, these carry one recourse variable per group rather than per hour.
@@ -352,7 +365,8 @@ class BendersSolver():
                  cut_selection="single",cut_selection_k=1,parallel_subproblems = False, n_workers = None,
                  dynamic_cluster_features="price", env=None,
                  gap_gate_threshold=None, gap_gate_action="resolve",
-                 solver="gurobi", solver_log_dir=None, solver_tee=False, dump_master=False):
+                 solver="gurobi", solver_log_dir=None, solver_tee=False, dump_master=False,
+                 master_mip_gap=MASTER_MIP_GAP):
 
         self.gep_data = gep_data
         self.operational_data = operational_data
@@ -400,6 +414,10 @@ class BendersSolver():
         self.gate_dropped_hist = []
         self.gate_time_hist = []
         self.gap_rel_max_hist = []
+        # exact iterations: hourly cuts at u_k vs the LP optima (NaN on PDL iterations)
+        self._last_cut_tight = None
+        self.cut_tight_rel_hist = []
+        self.cut_tight_rel_max_hour_hist = []
         self._cd_features = None      # cached (demand, capacity potential) blocks for "capacity" features
         self._cut_hist_slopes = []    # adapt-G-S: per-iteration (T, G) disaggregated cut slopes
         self._cut_hist_rhs = []       # adapt-G-S: per-iteration (T,) disaggregated cut rhs
@@ -432,7 +450,10 @@ class BendersSolver():
         self.master_num_alpha = None
         self._master_opt = None
         self._master_time_limit = 3600.0  # safety net; solve_with_benders tightens it to the remaining wall-clock
-        self._master_mip_gap = 1e-4       # inexact phase; tightened to 1e-5 when switching to exact
+        self._master_mip_gap = float(master_mip_gap)
+        if not 0.0 <= self._master_mip_gap < BENDERS_REL_TOL:
+            raise ValueError(f"master_mip_gap={master_mip_gap} must be below the Benders stopping "
+                             f"tolerance {BENDERS_REL_TOL:g}, or UB-LB cannot close.")
         self._num_cuts_in_master = 0  # how many cuts already added
         self._cut_stats = []          # per cut in the master: (min |slope|, max |slope|, |rhs|)
         self._sub_lp = None           # persistent hourly ED LP (solver_backend.MatrixLP)
@@ -507,7 +528,8 @@ class BendersSolver():
 
     def _options(self, **kw):
         """This run's parameter profile for one solve (see solver_backend.solver_options)."""
-        return sb.solver_options(self.solver, threads=1, seed=0, **kw)
+        return sb.solver_options(self.solver, threads=1, seed=0, lp_optimality_tol=NUMERIC_TOL,
+                                 feasibility_tol=NUMERIC_TOL, **kw)
 
     def _structure(self, data, sample):
         src = self._struct_src
@@ -586,7 +608,7 @@ class BendersSolver():
             obj = self.operational_data.obj_coeff.detach().cpu().numpy() * self.pWeight
             self._sub_lp = sb.MatrixLP(
                 self.solver, obj, struct.A_ineq_block, struct.A_eq_block,
-                self._options(lp_optimality_tol=SUBPROBLEM_LP_OPT_TOL),
+                self._options(),
                 gurobi_env=self._gurobi_env(),
             )
             self._sub_lp_src = struct
@@ -595,8 +617,8 @@ class BendersSolver():
     def solve_matrix_problem(self, data, i, inv_decision=None):
         """Direct (monolithic) solve of sample i: the reference the Benders runs are compared to.
 
-        Same solver and parameter profile as Benders: Threads=1, Seed=0, MIP gap
-        1e-4 (= Benders' stopping tolerance), one hour of solver time. Timing is
+        Same solver and parameter profile as Benders: Threads=1, Seed=0, NUMERIC_TOL,
+        MIP gap BENDERS_REL_TOL (= Benders' stopping tolerance), one hour of solver time. Timing is
         split so the comparison can use like for like (self.direct_info):
           solve_time -- inside the solver's optimize()/run(), the quantity the
                         Benders total_time sums;
@@ -630,7 +652,7 @@ class BendersSolver():
 
         log_file = self._log_file(f"direct_sample{i}.log")
         opt = sb.make_solver(self.solver, self._gurobi_env())
-        st = sb.solve(opt, m, self._options(time_limit=3600, mip_gap=1e-4, log_file=log_file),
+        st = sb.solve(opt, m, self._options(time_limit=3600, mip_gap=BENDERS_REL_TOL, log_file=log_file),
                       tee=self.solver_tee)
 
         if not st.has_solution:
@@ -645,6 +667,8 @@ class BendersSolver():
             "build_time": t_pyomo + st.sync_time,
             "wall_time": time.perf_counter() - t_wall,
             "nodes": st.nodes,
+            "target_mip_gap": BENDERS_REL_TOL,
+            "numeric_tol": NUMERIC_TOL,
         }
         print(f"Obj: {st.objective:g}  gap: {st.gap:.2e}  status: {st.status}  "
               f"[{self.solver}] solve {st.solve_time:.2f}s, build {self.direct_info['build_time']:.2f}s"
@@ -681,7 +705,7 @@ class BendersSolver():
 
         if not master:
             lp = sb.MatrixLP(self.solver, obj, np.asarray(A_ineq, dtype=float), np.asarray(A_eq, dtype=float),
-                             self._options(lp_optimality_tol=SUBPROBLEM_LP_OPT_TOL), gurobi_env=self._gurobi_env())
+                             self._options(), gurobi_env=self._gurobi_env())
             return lp.solve(b_ineq, b_eq)
 
         num_u = ydim - num_alpha
@@ -693,7 +717,7 @@ class BendersSolver():
         m = sb.build_matrix_model(obj, np.asarray(A_ineq, dtype=float), np.asarray(b_ineq, dtype=float),
                                   integer=integer, lb=lb, ub=ub)
         st = sb.solve(sb.make_solver(self.solver, self._gurobi_env()), m,
-                      self._options(mip_gap=1e-8, lp_optimality_tol=1e-9))
+                      self._options(mip_gap=self._master_mip_gap))
         if not st.has_solution:
             raise RuntimeError(f"Master found no feasible solution (status {st.status}).")
         return st.objective, sb.model_values(m), [], st.solve_time
@@ -1186,6 +1210,7 @@ class BendersSolver():
 
         t_solve_wall = 0.0
         t_pdl = 0.0
+        self._last_cut_tight = None
 
         if exact:
             lp = self._hourly_lp(s)
@@ -1204,6 +1229,17 @@ class BendersSolver():
             primal_obj_val_total = float(np.sum(obj_vals))
             dual_obj_val_total   = primal_obj_val_total
             inference_time_total = float(np.sum(inf_times))
+
+            #! Cut tightness: each hour's cut evaluated at this investment is that hour's
+            #! dual objective, which strong duality makes equal to its LP optimum. Anything
+            #! well above NUMERIC_TOL means the duals, not the master, carry the error.
+            slopes_t, rhs_t = compute_per_timestep_cuts(data, np.array(dual_vals), b_ineqs_np, b_eqs_np, s)
+            cut_at_u = slopes_t @ np.asarray(investments, dtype=float) - rhs_t
+            err_t = cut_at_u - np.asarray(obj_vals, dtype=float)
+            self._last_cut_tight = {
+                "cut_tight_rel": float(err_t.sum()) / max(abs(primal_obj_val_total), 1e-10),
+                "cut_tight_rel_max_hour": float(np.max(np.abs(err_t) / np.maximum(np.abs(obj_vals), 1.0))),
+            }
 
         else:
             # --- PDL branch ---
@@ -1338,7 +1374,7 @@ class BendersSolver():
         benders_cut_all = [] # list of benders cuts ([lhs],rhs), one for every iteration
 
         # Parameters for Benders algorithm
-        rel_tol = 1e-4                    # stopping gap, matches Proxy Benders paper
+        rel_tol = BENDERS_REL_TOL         # stopping gap, matches Proxy Benders paper
         wall_limit = 3600.0               # one hour per sample
         t_start = time.time()
         self.hit_time_limit = False
@@ -1395,7 +1431,6 @@ class BendersSolver():
                 print("!! Investments are the same as last iteration")
                 if self.exact_refinement:
                     self.exact = True
-                    self._master_mip_gap = 1e-5
                 else:
                     print("Stopping Benders decomposition because exact refinement is not used.")
                     print("Upper bound:", self.best_upper_bound) #! Return the best upper bound found so far if exact refinement is not used
@@ -1479,6 +1514,9 @@ class BendersSolver():
             self.gate_dropped_hist.append(gate["n_dropped"] if gate else 0)
             self.gate_time_hist.append(gate["gate_time"] if gate else 0.0)
             self.gap_rel_max_hist.append(gate["gap_rel_max"] if gate else np.nan)
+            tight = self._last_cut_tight
+            self.cut_tight_rel_hist.append(tight["cut_tight_rel"] if tight else np.nan)
+            self.cut_tight_rel_max_hour_hist.append(tight["cut_tight_rel_max_hour"] if tight else np.nan)
 
             # master time only exists when i>0
             if i == 0:
@@ -1717,6 +1755,15 @@ if __name__ == "__main__":
              "duals, 'drop' leaves it out of the cut (and out of its cluster). Default resolve.",
     )
     parser.add_argument(
+        "--master-mip-gap", "--master_mip_gap",
+        dest="master_mip_gap",
+        type=float,
+        default=None,
+        help=f"Override Benders_args.master_mip_gap: the master's relative MIP gap in both "
+             f"phases. Must be below the Benders stopping tolerance {BENDERS_REL_TOL:g}. "
+             f"Default {MASTER_MIP_GAP:g}.",
+    )
+    parser.add_argument(
         "--benders-setup", "--benders_setup",
         dest="benders_setup",
         choices=["Exact", "Inexact", "Inexact_Refine", "All"],
@@ -1796,6 +1843,9 @@ if __name__ == "__main__":
     if args_cli.gap_gate_threshold is not None:
         args["Benders_args"]["gap_gate_threshold"] = args_cli.gap_gate_threshold
         print(f"[override] gap_gate_threshold = {args_cli.gap_gate_threshold}")
+    if args_cli.master_mip_gap is not None:
+        args["Benders_args"]["master_mip_gap"] = args_cli.master_mip_gap
+        print(f"[override] master_mip_gap = {args_cli.master_mip_gap}")
     if args_cli.gap_gate_action is not None:
         args["Benders_args"]["gap_gate_action"] = args_cli.gap_gate_action
         print(f"[override] gap_gate_action = {args_cli.gap_gate_action}")
@@ -2057,7 +2107,14 @@ if __name__ == "__main__":
                     solver_log_dir=os.path.join(SOLVER_LOG_DIR, setup_tag) if SOLVER_LOG_DIR else None,
                     solver_tee=args_cli.solver_tee,
                     dump_master=args_cli.dump_master,
+                    master_mip_gap=args["Benders_args"].get("master_mip_gap", MASTER_MIP_GAP),
                 )
+                #! The tolerance profile goes into every result row, so a table can say what it compares.
+                tol_profile = {
+                    "benders_rel_tol": BENDERS_REL_TOL,
+                    "master_mip_gap": solver_kwargs["master_mip_gap"],
+                    "numeric_tol": NUMERIC_TOL,
+                }
                 for repeat in range(1):
                     for sample in range(samples):
                         if args_cli.solve_direct:
@@ -2103,6 +2160,7 @@ if __name__ == "__main__":
                                 "total_time_subproblem_exact": 0.0,
                                 "total_time_subproblem_pdl": 0.0,
                                 "mip_gap": info["mip_gap"],
+                                **tol_profile,
                                 "obj_bound": info["obj_bound"],
                                 "hit_time_limit": info["hit_time_limit"],
                                 "investments": y[:gep_data.num_g].tolist(),
@@ -2160,6 +2218,8 @@ if __name__ == "__main__":
                                 "gate_dropped":   solver.gate_dropped_hist,
                                 "gate_time":      solver.gate_time_hist,
                                 "gap_rel_max":    solver.gap_rel_max_hist,
+                                "cut_tight_rel":  solver.cut_tight_rel_hist,
+                                "cut_tight_rel_max_hour": solver.cut_tight_rel_max_hour_hist,
                                 #! Master state per iteration -- status, bound, gap, nodes and the
                                 #! cut coefficient range -- for tracing a master that stalls.
                                 **solver.master_diagnostics(),
@@ -2215,6 +2275,7 @@ if __name__ == "__main__":
                                 "gap_cross_pct": crossover_metrics["gap_cross_pct"],
                                 "lb_cross_ratio_pct": crossover_metrics["lb_cross_ratio_pct"],
                                 "solver": SOLVER,
+                                **tol_profile,
                                 #! Whole solve_with_benders, Pyomo bookkeeping and cut building included.
                                 "wall_time": solver.wall_time,
                             }

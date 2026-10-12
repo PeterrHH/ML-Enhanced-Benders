@@ -14,7 +14,7 @@ re-solved with only its right-hand side changed.
 Fair comparison between methods rests on three things kept identical here for
 every model, whichever method builds it:
   * one solver for the whole run (direct, master, subproblems, gap-gate re-solves);
-  * one parameter profile (threads, seed, gap, time limit, LP tolerance), mapped
+  * one parameter profile (threads, seed, gap, time limit, LP tolerances), mapped
     onto each solver's own option names by solver_options();
   * one timing definition: SolveStats.solve_time is the time inside the solver's
     own optimize()/run() call -- the span the gurobipy code timed around
@@ -82,12 +82,13 @@ def make_solver(name, gurobi_env=None, auto_updates=None):
 
 
 def solver_options(name, *, threads=1, seed=0, time_limit=None, mip_gap=None,
-                   lp_optimality_tol=None, log_file=None, tee=False):
+                   lp_optimality_tol=None, feasibility_tol=None, log_file=None, tee=False):
     """One parameter profile, in the native option names of `name`.
 
     Every option the old gurobipy code set explicitly has a counterpart here;
-    anything not listed (feasibility tolerances, algorithm choice, ...) is left
-    at the solver's own default, as it was before.
+    anything not listed (integrality tolerance, algorithm choice, ...) is left
+    at the solver's own default. feasibility_tol is the primal feasibility
+    tolerance (Gurobi FeasibilityTol, HiGHS primal_feasibility_tolerance).
 
     Logging is always set explicitly -- also to "off" -- because a persistent
     model keeps its parameters between solves: a log file set for one master
@@ -109,6 +110,8 @@ def solver_options(name, *, threads=1, seed=0, time_limit=None, mip_gap=None,
             opts["MIPGap"] = float(mip_gap)
         if lp_optimality_tol is not None:
             opts["OptimalityTol"] = float(lp_optimality_tol)
+        if feasibility_tol is not None:
+            opts["FeasibilityTol"] = float(feasibility_tol)
     else:
         opts = {
             "threads": threads,
@@ -124,6 +127,8 @@ def solver_options(name, *, threads=1, seed=0, time_limit=None, mip_gap=None,
         if lp_optimality_tol is not None:
             #! HiGHS' counterpart of Gurobi's OptimalityTol (reduced-cost tolerance).
             opts["dual_feasibility_tolerance"] = float(lp_optimality_tol)
+        if feasibility_tol is not None:
+            opts["primal_feasibility_tolerance"] = float(feasibility_tol)
     return opts
 
 
