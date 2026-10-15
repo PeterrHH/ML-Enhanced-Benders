@@ -227,3 +227,10 @@ availability_with_icons.png
 experiment-output/
 GraphMethod-Exploration/
 note.md
+wandb/*
+requiremenets_*.txt
+tests/*
+GurobiKey/*
+evaluate_primal_dual.ipynb
+docs/
+run.txt

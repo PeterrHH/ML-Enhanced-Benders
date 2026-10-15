@@ -1200,10 +1200,10 @@ if __name__ == "__main__":
 
     animate_mean_lb_percent_vs_time(
         method_logs={
-            "Exact Benders": exact_logs,
-            "Single Cut  (Baseline)": dCAB_SLA_10_single_logs,
-            "Full Multi-Cut ": dCAB_SLA_10_full_logs,
-            "K-means Clustered Multi-Cut (Proposed)": dCAB_SLA_10_kmeans10_logs,
+            "Pure Solver baseline": exact_logs,
+            # "Single Cut  (Baseline)": dCAB_SLA_10_single_logs,
+            # "Full Multi-Cut ": dCAB_SLA_10_full_logs,
+            "Proposed Framework": dCAB_SLA_10_kmeans10_logs,
             #r"$D_{\mathrm{Uniform}}$ (Baseline)": dUniform_logs,
             #r"$D_{\mathrm{CAB}}$ (Proposed)": dCAB_SS_logs,
         },
@@ -1215,6 +1215,6 @@ if __name__ == "__main__":
         log_y=True,
         y_stop_threshold=1e-4,
         trim_x_at_threshold=True,
-        duration=12.0,
+        duration=10.0,
         fps=12,
     )

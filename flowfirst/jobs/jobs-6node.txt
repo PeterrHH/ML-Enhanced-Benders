@@ -1,0 +1,5 @@
+# 6 nodes (BEL GER FRA SPA NED SWI), all 30 generators, 8 lines, 262k instances.
+# As F18 (batch 128, three layers, z-score inputs, fixed rate, 250 epochs) but width 14 x 36 = 504 (532k params,
+# about 35 min per job). Width 28 x 36 = 1008 (2.1M params) takes about 80 min per job: change --hidden-factor to 28.
+--variant flowfirst --config flowfirst/configs/config-6node-x8.json --input-scale zscore --layers 3 --hidden-factor 14 --batch-size 128 --epochs 250 --eval-every 1 --log-every 10 --tag 6node-x8-b128-l3-w504
+--variant old-prioritized --config flowfirst/configs/config-6node-x8.json --input-scale zscore --layers 3 --hidden-factor 14 --batch-size 128 --epochs 250 --eval-every 1 --log-every 10 --tag 6node-x8-b128-l3-w504

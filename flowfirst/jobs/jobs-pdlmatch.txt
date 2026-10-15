@@ -1,0 +1,11 @@
+# flow-first against the thesis primal on the PDL runs' own data: configs/config.json, the 48k Benders
+# harvest (3 nodes, 2 generators per node). --split pdl --train-size 26142 reproduces PrimalDualTrainer's
+# rows exactly (train 0-26142, valid 26142-37071, 37071-48000 untouched by both), so the two are comparable.
+# 2000 epochs matches PDL's outer x inner passes; step decay x0.7 every 200 epochs (5e-4 -> 1.4e-5) and an
+# EMA of the weights settle the fixed-rate circling a first run at 5e-4 showed from about epoch 300 (F15, F24).
+# ~25 min each alone. Add --home-path $SCRATCH/<project> on a cluster.
+--variant flowfirst      --config configs/config.json --split pdl --train-size 26142 --input-scale zscore --layers 3 --batch-size 128 --epochs 2000 --lr-schedule step --lr-decay 0.7 --lr-step 200 --ema 0.999 --eval-every 20 --log-every 20 --tag pdlmatch-2000-stepema
+--variant old-prioritized --config configs/config.json --split pdl --train-size 26142 --input-scale zscore --layers 3 --batch-size 128 --epochs 2000 --lr-schedule step --lr-decay 0.7 --lr-step 200 --ema 0.999 --eval-every 20 --log-every 20 --tag pdlmatch-2000-stepema
+# the fixed-rate controls, if the schedule's contribution needs isolating (uncomment):
+# --variant flowfirst      --config configs/config.json --split pdl --train-size 26142 --input-scale zscore --layers 3 --batch-size 128 --epochs 2000 --eval-every 20 --log-every 20 --tag pdlmatch-2000-fixed
+# --variant old-prioritized --config configs/config.json --split pdl --train-size 26142 --input-scale zscore --layers 3 --batch-size 128 --epochs 2000 --eval-every 20 --log-every 20 --tag pdlmatch-2000-fixed

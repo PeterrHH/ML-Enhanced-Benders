@@ -3,7 +3,8 @@ import os
 import time
 import torch
 from torch.utils.data import TensorDataset, DataLoader
-from logger import TensorBoardLogger
+from devices import resolve_device
+from logger import Logger
 import numpy as np
 import pandas as pd
 from mtadam import MTAdam
@@ -62,13 +63,18 @@ class PrimalDualTrainer():
         self.log = args["log"]
         self.log_frequency = args["log_frequency"]
         
-        if self.args["device"] == "mps":
-            self.DTYPE = torch.float32
-            self.DEVICE = torch.device("mps")
-            self.data.to_mps()
-        else:
-            self.DTYPE = torch.float64
-            self.DEVICE = torch.device("cpu")
+        self.DTYPE, self.DEVICE = resolve_device(self.args)
+
+        #! The dataset is always built and pickled on the CPU, so move it onto
+        #! the training device here. Problem sets that predate this (QP) have
+        #! no to(), so say that plainly instead of raising AttributeError.
+        if self.DEVICE.type != "cpu":
+            if not hasattr(self.data, "to"):
+                raise NotImplementedError(
+                    f'{type(self.data).__name__} cannot move to {self.DEVICE}: it has no to(). '
+                    f'Run this problem type with "device": "cpu".'
+                )
+            self.data.to(self.DEVICE, self.DTYPE)
 
         torch.set_default_dtype(self.DTYPE)
         torch.set_default_device(self.DEVICE)
@@ -232,7 +238,7 @@ class PrimalDualTrainer():
         self.lamb_targets_valid = self.lamb_targets_all[self.valid_indices]
 
         if self.log == True:
-            self.logger = TensorBoardLogger(args, data, self.X, self.total_demands, self.train_indices, self.valid_indices, save_dir, args["opt_targets"])
+            self.logger = Logger(args, data, self.X, self.total_demands, self.train_indices, self.valid_indices, save_dir, args["opt_targets"])
         else:
             self.logger = None
 
@@ -322,6 +328,12 @@ class PrimalDualTrainer():
         print(self.dual_net)
 
         self.primal_net.to(self.DTYPE).to(self.DEVICE)
+
+        self.init_input_normalization()
+
+        if self.logger:
+            self.logger.watch(self.primal_net, self.dual_net)
+
         self.primal_optim = torch.optim.Adam(self.primal_net.parameters(), lr=self.primal_lr)
         self.dual_optim = torch.optim.Adam(self.dual_net.parameters(), lr=self.dual_lr)
 
@@ -391,58 +403,39 @@ class PrimalDualTrainer():
 
         self.duality_gap_list =[]
 
-        # Fit the scalers:
-        if args.get("normalize") == "z_score":
-            with torch.no_grad():
-                Xtr = self.X_train
 
-            n = self.data.num_n
-            g = self.data.num_g
 
-            d = Xtr[:, :n]
-            p = Xtr[:, n:n + g]
-            cover = Xtr[:, n + g:n + g + n]
-            export = Xtr[:, n + g + n:n + g + 2 * n]
 
-            d_mean = d.mean(dim=0)
-            d_std  = d.std(dim=0).clamp_min(1e-8)
+    def init_input_normalization(self):
+        """Fill the z-score buffers of the nets from the TRAINING rows.
 
-            p_mean = p.mean(dim=0)
-            p_std  = p.std(dim=0).clamp_min(1e-8)
+        networks.py registers d_mean/d_std/p_mean/p_std whenever
+        args["normalize_input"] == "z_score", but nothing ever wrote them: the buffers
+        stayed at 0 and 1, so the path scaled x to (x - 0) / 1 and did nothing. The
+        statistics have to come from the training split alone, and being buffers they
+        travel with the checkpoint, so evaluation reproduces them.
 
-            self.primal_net.d_mean.copy_(d_mean)
-            self.primal_net.d_std.copy_(d_std)
-            self.primal_net.p_mean.copy_(p_mean)
-            self.primal_net.p_std.copy_(p_std)
+        Note the key is read from the top level of the config, not from ED_args.
+        """
+        if self.args.get("normalize_input") != "z_score":
+            return
 
-            self.dual_net.d_mean.copy_(d_mean)
-            self.dual_net.d_std.copy_(d_std)
-            self.dual_net.p_mean.copy_(p_mean)
-            self.dual_net.p_std.copy_(p_std)
-
-            if cover.shape[1] == n:
-                cover_mean = cover.mean(dim=0)
-                cover_std  = cover.std(dim=0).clamp_min(1e-8)
-
-                if hasattr(self.dual_net, "cover_mean"):
-                    self.dual_net.cover_mean.copy_(cover_mean)
-                    self.dual_net.cover_std.copy_(cover_std)
-
-            if export.shape[1] == n:
-                export_mean = export.mean(dim=0)
-                export_std  = export.std(dim=0).clamp_min(1e-8)
-
-                if hasattr(self.dual_net, "export_mean"):
-                    self.dual_net.export_mean.copy_(export_mean)
-                    self.dual_net.export_std.copy_(export_std)
-
-            print("Computed and set normalization stats.")
-            print(f"D mean: {d_mean}, D std: {d_std}")
-            print(f"P mean: {p_mean}, P std: {p_std}")
-            if cover.shape[1] == n:
-                print(f"Cover mean: {cover_mean}, Cover std: {cover_std}")
-            if export.shape[1] == n:
-                print(f"Export mean: {export_mean}, Export std: {export_std}")
+        X_train = self.X[self.train_indices]
+        n, g = self.data.num_n, self.data.num_g
+        stats = {
+            "d": (X_train[:, :n].mean(dim=0), X_train[:, :n].std(dim=0).clamp_min(1e-8)),
+            "p": (X_train[:, n:n + g].mean(dim=0), X_train[:, n:n + g].std(dim=0).clamp_min(1e-8)),
+        }
+        with torch.no_grad():
+            for net in (self.primal_net, self.dual_net):
+                if getattr(net, "normalize", None) != "z_score":
+                    continue
+                for prefix, (mean, std) in stats.items():
+                    if hasattr(net, f"{prefix}_mean"):
+                        getattr(net, f"{prefix}_mean").copy_(mean.to(self.DTYPE))
+                        getattr(net, f"{prefix}_std").copy_(std.to(self.DTYPE))
+        print(f"[normalize] z-score statistics from {len(self.train_indices)} training rows: "
+              f"demand mean {stats['d'][0].mean():.1f}, capacity mean {stats['p'][0].mean():.1f}")
 
     def build_topology_features(self, X):
         """
@@ -606,6 +599,13 @@ class PrimalDualTrainer():
 
 
     def train_PDL(self, optuna_trial=None):
+        try:
+            return self._train_PDL(optuna_trial)
+        finally:
+            if self.logger:
+                self.logger.finish()
+
+    def _train_PDL(self, optuna_trial=None):
         print("Starting Primal-Dual Learning inside the train_PDL function")
         prev_v_k = 0
         for k in range(self.outer_iterations):

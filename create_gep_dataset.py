@@ -1,7 +1,7 @@
 import pickle
 
 from gep_config_parser import *
-from data_wrangling import dataframe_to_dict
+from data_wrangling import dataframe_to_dict, ramping_rates
 
 from gep_problem import GEPProblemSet
 from gep_problem_operational import GEPOperationalProblemSet
@@ -65,7 +65,8 @@ def create_gep_ed_dataset(args, problem_args, inputs, problem_type, save_path, p
     # Scale inversely proportional to times (T)
     pWeight = inputs["representative_period_weight"] / (problem_args["sample_duration"] / 8760)
 
-    pRamping = inputs["ramping_value"]
+    #! Per generator, from the ramping_rate column of the generation data (scalar fallback).
+    pRamping = dict(sorted(ramping_rates(inputs["generation_data"], inputs["ramping_value"]).items()))
 
     # Extract generator parameters
     pInvCost = dataframe_to_dict(

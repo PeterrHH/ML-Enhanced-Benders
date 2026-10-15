@@ -1,0 +1,12 @@
+# 20-node overfit test, second round: the first run (fixed rate, no clipping) reached 1 % training-set total / 19 % on its
+# no-shortage instances by epoch 90 with a noisy, slowly falling loss (37 of 97 epochs up). These add the F24 stabilizers,
+# clip 180000 and step decay x0.7 every 100 epochs, and vary one thing each. 2048 instances, 1000 epochs, ~50 min each alone;
+# run one at a time, MPS jobs share the GPU.
+# (a) stabilized reference: same network as before
+--variant flowfirst-gnn --config flowfirst/configs/config-20node-x8.json --device mps --gnn-hidden 128 --gnn-rounds 6 --gnn-layernorm --train-size 2048 --valid-size 4096 --batch-size 128 --epochs 1000 --eval-every 10 --log-every 50 --census-size 512 --ema 0.999 --clip-grad 180000 --lr-schedule step --lr-decay 0.7 --lr-step 100 --tag 20node-overfit-2048-gnn128r6ln-stab
+# (b) no LayerNorm (the 6-node result was obtained without it)
+# --variant flowfirst-gnn --config flowfirst/configs/config-20node-x8.json --device mps --gnn-hidden 128 --gnn-rounds 6 --train-size 2048 --valid-size 4096 --batch-size 128 --epochs 1000 --eval-every 10 --log-every 50 --census-size 512 --ema 0.999 --clip-grad 180000 --lr-schedule step --lr-decay 0.7 --lr-step 100 --tag 20node-overfit-2048-gnn128r6-stab
+# (c) wider: hidden 192 (about 2M params)
+# --variant flowfirst-gnn --config flowfirst/configs/config-20node-x8.json --device mps --gnn-hidden 192 --gnn-rounds 6 --gnn-layernorm --train-size 2048 --valid-size 4096 --batch-size 128 --epochs 1000 --eval-every 10 --log-every 50 --census-size 512 --ema 0.999 --clip-grad 180000 --lr-schedule step --lr-decay 0.7 --lr-step 100 --tag 20node-overfit-2048-gnn192r6ln-stab
+# (d) antisymmetric potential-difference readout
+# --variant flowfirst-gnn --config flowfirst/configs/config-20node-x8.json --device mps --gnn-hidden 128 --gnn-rounds 6 --gnn-layernorm --gnn-antisym --train-size 2048 --valid-size 4096 --batch-size 128 --epochs 1000 --eval-every 10 --log-every 50 --census-size 512 --ema 0.999 --clip-grad 180000 --lr-schedule step --lr-decay 0.7 --lr-step 100 --tag 20node-overfit-2048-gnn128r6ln-antisym-stab

@@ -9,66 +9,114 @@ import argparse
 
 from primal_dual import PrimalDualTrainer
 from create_gep_dataset import create_gep_ed_dataset
+from devices import KNOWN_DEVICES, resolve_device_name
+from paths import (
+    add_path_args,
+    ensure_dir,
+    resolve_roots,
+    under_data_root,
+    under_repo,
+    under_root,
+)
 
 
 CONFIG_FILE_NAME = "configs/config.toml"
 
 '''
-ARGS_FILE_NAME option:
-- "config.json": Default config for experiments. (3 Node)
-- "config-4node.json": Config for 4-node experiments.
-- "config-5node.json": Config for 5-node experiments.
-- "config-6node.json": Config for 6-node experiments.
+ARGS_FILE_NAME is the DEFAULT config; override it with -c/--config, e.g.
+    python main.py -c configs/config-5node.json
+Options:
+- "configs/config.json": Default config for experiments. (3 Node)
+- "configs/config-4node.json": Config for 4-node experiments.
+- "configs/config-5node.json": Config for 5-node experiments.
+- "configs/config-6node.json": Config for 6-node experiments.
 '''
 ARGS_FILE_NAME = "configs/config.json"
 
 
 def parse_cli_args():
     parser = argparse.ArgumentParser()
+
+    #! --home-path / --data-root / --output-root
+    add_path_args(parser)
+
     parser.add_argument(
-        "--data-root",
-        default=None,
-        help=(
-            "Parent folder for generated/loaded datasets. "
-            "For example, set this to $SCRATCH/my_project on DelftBlue. "
-            "Relative dataset paths such as data/ED_data/... will become "
-            "$SCRATCH/my_project/data/ED_data/...."
-        ),
+        "-c", "--config",
+        dest="config",
+        default=ARGS_FILE_NAME,
+        help=f"Path to the run config JSON. Relative paths resolve against the "
+             f"repository, not the working directory. Default: {ARGS_FILE_NAME}",
     )
+    parser.add_argument(
+        "--toml-config", "--toml_config",
+        dest="toml_config",
+        default=CONFIG_FILE_NAME,
+        help=f"Path to the input-data TOML config. Default: {CONFIG_FILE_NAME}",
+    )
+
+    parser.add_argument(
+        "--device",
+        dest="device",
+        choices=list(KNOWN_DEVICES),
+        default=None,
+        help="Override the config's device. 'auto' picks CUDA when present and "
+             "CPU otherwise; MPS is never auto-selected because it forces "
+             "float32. Unavailable devices raise instead of falling back.",
+    )
+
+    #! W&B overrides, so a job script does not have to edit the JSON configs.
+    #! All default to None, which leaves the config file's values in force.
+    parser.add_argument(
+        "--wandb-mode", "--wandb_mode",
+        dest="wandb_mode",
+        choices=["online", "offline", "disabled"],
+        default=None,
+        help="Use 'offline' on compute nodes without outbound network, then "
+             "'wandb sync <output-root>/wandb/offline-run-*' from a login node.",
+    )
+    parser.add_argument("--wandb-project", "--wandb_project", dest="wandb_project", default=None)
+    parser.add_argument("--wandb-entity", "--wandb_entity", dest="wandb_entity", default=None)
+    parser.add_argument(
+        "--wandb-group", "--wandb_group",
+        dest="wandb_group",
+        default=None,
+        help="Cluster related runs on one chart, e.g. the SLURM job id.",
+    )
+    parser.add_argument(
+        "--no-wandb",
+        dest="no_wandb",
+        action="store_true",
+        help="Disable W&B logging regardless of the config file.",
+    )
+
     return parser.parse_args()
 
 
+def apply_cli_overrides(args, cli_args):
+    """CLI beats the config file; an unset flag leaves the config value alone."""
+    if cli_args.no_wandb:
+        args["use_wandb"] = False
+    for key in ("device", "wandb_mode", "wandb_project", "wandb_entity", "wandb_group"):
+        value = getattr(cli_args, key, None)
+        if value:
+            args[key] = value
+
+    #! Resolve "auto" once, here, and write the concrete name back. Every
+    #! downstream resolve_device() reads this same dict, so one resolution
+    #! propagates; and args.json then records the device actually used rather
+    #! than the word "auto", which is what Benders later reads back.
+    args["device"] = resolve_device_name(args.get("device"))
+
+
+def save_args(directory, args):
+    """Write args.json into directory; numpy scalars are stored as plain values."""
+    with open(os.path.join(directory, "args.json"), "w") as f:
+        json.dump(args, f, indent=4, default=lambda o: o.item() if hasattr(o, "item") else str(o))
+
+
 def get_data_root(args, cli_data_root=None):
-    """
-    Resolve the parent folder used for dataset storage.
-
-    Priority:
-    1. command line: --data-root ...
-    2. config JSON:  "data_root": "..."
-    3. environment:  DATA_ROOT
-    4. default:      current working directory
-    """
-    root = cli_data_root or args.get("data_root") or os.environ.get("DATA_ROOT") or "."
-    return os.path.abspath(os.path.expanduser(os.path.expandvars(root)))
-
-
-def under_data_root(path, data_root):
-    """
-    Put a relative dataset path under data_root.
-
-    Example:
-        path="data/ED_data/x.pkl"
-        data_root="$SCRATCH/my_project"
-
-    becomes:
-        "$SCRATCH/my_project/data/ED_data/x.pkl"
-
-    Absolute paths are left unchanged.
-    """
-    path = os.path.expanduser(os.path.expandvars(path))
-    if os.path.isabs(path):
-        return path
-    return os.path.join(data_root, path)
+    """Deprecated: kept so older callers keep working. Use paths.resolve_roots."""
+    return resolve_roots(args, argparse.Namespace(data_root=cli_data_root))["data_root"]
 
 
 def build_ed_data_save_path(ED_args, nodes_count, nodes_str, gens_str, lines_str):
@@ -181,13 +229,24 @@ def build_ed_data_save_path(ED_args, nodes_count, nodes_str, gens_str, lines_str
 if __name__ == "__main__":
     cli_args = parse_cli_args()
 
-    # Load the arguments
-    with open(ARGS_FILE_NAME, "r") as file:
+    # Load the arguments.
+    #! Repo-anchored, so the config is found whatever the working directory is
+    #! and its resolution never depends on the roots resolved just below.
+    run_config_file = under_repo(cli_args.config)
+    with open(run_config_file, "r") as file:
         args = json.load(file)
 
-    data_root = get_data_root(args, cli_args.data_root)
-    args["data_root"] = data_root
+    roots = resolve_roots(args, cli_args)
+    args.update(roots)
+    data_root = roots["data_root"]
+    output_root = roots["output_root"]
+
+    apply_cli_overrides(args, cli_args)
+
+    print(f"Run config:  {run_config_file}")
     print(f"Dataset root: {data_root}")
+    print(f"Output root:  {output_root}")
+    print(f"Device:       {args['device']}")
 
     QP_args = args["QP_args"]
 
@@ -204,18 +263,22 @@ if __name__ == "__main__":
         f"_L:{args['alpha']}"
     )
 
-    save_dir = os.path.join(
-        "outputs",
-        "PDL",
-        args["problem_type"],
-        run_name + "-" + str(time.time()).replace(".", "-"),
-    )
+    #! Rooting save_dir roots every output: args.json, the repeat and Optuna
+    #! subdirectories, the checkpoints and CSVs written by PrimalDualTrainer,
+    #! and the TensorBoard event files, all of which join onto it.
+    save_parts = ["outputs", "PDL", args["problem_type"]]
+    #! ED/GEP runs are grouped by problem size: N{|N|}_G{|G|}.
+    if args["problem_type"] != "QP":
+        save_parts.append(f"N{len(args['ED_args']['N'])}_G{len(args['ED_args']['G'])}")
+    save_parts.append(run_name + "-" + str(time.time()).replace(".", "-"))
 
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
+    save_dir = under_root(os.path.join(*save_parts), output_root)
 
-    with open(os.path.join(save_dir, "args.json"), "w") as f:
-        json.dump(args, f, indent=4)
+    ensure_dir(save_dir)
+
+    #! Run-level copy, read by evaluate_filter.py and networks.py. Each repeat
+    #! folder also gets its own args.json with the final per-repeat args.
+    save_args(save_dir, args)
 
     if args["problem_type"] == "QP":
         from create_QP_dataset import (
@@ -331,6 +394,12 @@ if __name__ == "__main__":
                 if not os.path.exists(curr_repeat_save_dir):
                     os.makedirs(curr_repeat_save_dir)
 
+                args["repeat"] = repeat
+                if not args.get("wandb_group"):
+                    args["wandb_group"] = os.path.basename(save_dir)
+
+                save_args(curr_repeat_save_dir, args)
+
                 trainer = PrimalDualTrainer(data, args, curr_repeat_save_dir)
                 primal_net, dual_net = trainer.train_PDL()
 
@@ -338,7 +407,7 @@ if __name__ == "__main__":
         ED_args = args["ED_args"]
 
         # Reads the input data using config.toml's experiment.inputs.data path.
-        input_data = parse_config(CONFIG_FILE_NAME)
+        input_data = parse_config(under_repo(cli_args.toml_config))
 
         # Take first experiment, we don't change the inputs here.
         gep_ed_data = input_data["experiment"]["experiments"][0]
@@ -455,6 +524,7 @@ if __name__ == "__main__":
 
                 trial_save_dir = os.path.join(save_dir, f"optuna_trial:{trial.number}")
                 os.makedirs(trial_save_dir, exist_ok=True)
+                save_args(trial_save_dir, args)
 
                 trainer = PrimalDualTrainer(data, args, trial_save_dir)
                 primal_net, dual_net, primal_loss, dual_loss = trainer.train_PDL(trial)
@@ -482,7 +552,10 @@ if __name__ == "__main__":
 
         else:
             # Use best-found hyperparameters using Optuna
-            if args["learn_primal"]:
+            #! These overwrite whatever the config says, which silently disables
+            #! batch_size / n_layers / primal_lr as experiment knobs. Set
+            #! "use_best_args": false to run the config's own values instead.
+            if args["learn_primal"] and args.get("use_best_args", True):
                 best_args = {
                     "primal_lr": 0.0006785456069117277,
                     "hidden_size_factor": 28,
@@ -500,6 +573,14 @@ if __name__ == "__main__":
             for repeat in range(ED_args["repeats"]):
                 curr_repeat_save_dir = os.path.join(save_dir, f"repeat:{repeat}")
                 os.makedirs(curr_repeat_save_dir, exist_ok=True)
+
+                #! Repeats of one launch share a W&B group, so they cluster
+                #! into a single mean/range band per chart.
+                args["repeat"] = repeat
+                if not args.get("wandb_group"):
+                    args["wandb_group"] = os.path.basename(save_dir)
+
+                save_args(curr_repeat_save_dir, args)
 
                 # Run PDL
                 trainer = PrimalDualTrainer(data, args, curr_repeat_save_dir)

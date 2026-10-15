@@ -7,6 +7,7 @@ import pickle
 import matplotlib.pyplot as plt
 
 from data_wrangling import dataframe_to_dict
+from devices import move_attrs, resolve_device
 from gep_config_parser import parse_config
 from gep_problem import GEPProblemSet
 from scipy.stats import qmc
@@ -15,12 +16,12 @@ class GEPOperationalProblemSet():
 
     def __init__(self, args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap, pUnitInvestment_Input = None):
         
-        if args["device"] == "mps":
-            self.DTYPE = torch.float32
-            self.DEVICE = torch.device("cpu")
-        else:
-            self.DTYPE = torch.float64
-            self.DEVICE = torch.device("cpu")
+        #! Build on the CPU whatever device the run will train on. This object
+        #! is pickled whole (create_gep_dataset.py), and CUDA/MPS storages in a
+        #! .pkl cannot be loaded on a machine without that device. The training
+        #! device is chosen later by PrimalDualTrainer, through self.to().
+        self.DTYPE, _ = resolve_device(args)
+        self.DEVICE = torch.device("cpu")
 
         torch.set_default_dtype(self.DTYPE)
         torch.set_default_device(self.DEVICE)
@@ -149,7 +150,10 @@ class GEPOperationalProblemSet():
             self.X = self.build_X()
         
         if self.ED_args["normalize_input"]:
-            self.total_demands = self.X[:, :self.data.num_n].sum(dim=1).unsqueeze(1)
+            #! self.num_n, not self.data.num_n -- this class has no .data
+            #! attribute, so the old spelling raised AttributeError on every
+            #! config with normalize_input enabled.
+            self.total_demands = self.X[:, :self.num_n].sum(dim=1).unsqueeze(1)
             self.X /= self.total_demands
         else:
             self.total_demands = torch.ones((self.X.shape[0], 1))
@@ -219,15 +223,28 @@ class GEPOperationalProblemSet():
             # self.node_to_gen_mask = self.node_to_gen_mask.to(torch.float32).to(torch.device('mps'))
             # self.lineflow_mask = self.lineflow_mask.to(torch.float32).to(torch.device('mps'))
             
+    def to(self, device=None, dtype=None):
+        """Move every tensor attribute onto `device`, in place.
+
+        Covers the whole object rather than a fixed list of names: X,
+        total_demands, pUnitInvestment, capacity_samples, the opt_targets dict
+        and the heuristic_lambda_* group were all missed by the old to_mps,
+        which converted 7 of 13 tensor attributes and left the rest on the CPU.
+        Integer tensors (the lambda tiers, index tensors) keep their dtype.
+        """
+        device = torch.device(device) if device is not None else self.DEVICE
+        dtype = dtype if dtype is not None else self.DTYPE
+        print(f"Moving problem data to {device} ({dtype})")
+
+        move_attrs(self, device, dtype)
+        #! move_attrs rewrote every attribute, these two included, so restore
+        #! them to the scalars they are meant to be.
+        self.DEVICE = device
+        self.DTYPE = dtype
+        return self
+
     def to_mps(self):
-        print("Converting to mps")
-        self.obj_coeff = self.obj_coeff.to(torch.float32).to(torch.device('mps'))
-        self.cost_vec = self.cost_vec.to(torch.float32).to(torch.device('mps'))
-        self.node_to_gen_mask = self.node_to_gen_mask.to(torch.float32).to(torch.device('mps'))
-        self.lineflow_mask = self.lineflow_mask.to(torch.float32).to(torch.device('mps'))
-        self.ineq_rhs = self.ineq_rhs.to(torch.float32).to(torch.device('mps'))
-        self.ineq_cm = self.ineq_cm.to(torch.float32).to(torch.device('mps'))
-        self.eq_cm = self.eq_cm.to(torch.float32).to(torch.device('mps'))
+        return self.to(torch.device("mps"), torch.float32)
 
     def load_targets(self, target_path):
         with open(target_path, 'rb') as file:
@@ -674,7 +691,7 @@ class GEPOperationalProblemSet():
         base_points = sobol_sampler.random_base2(m=m)
         np.random.shuffle(base_points)
 
-        dtype_np = np.float32 if self.args["device"] == "mps" else np.float64
+        dtype_np = np.float32 if self.DTYPE == torch.float32 else np.float64
         points01 = torch.tensor(base_points.astype(dtype_np), dtype=self.DTYPE)
 
         lb_g = torch.zeros(self.num_g, dtype=self.DTYPE)
@@ -914,7 +931,7 @@ class GEPOperationalProblemSet():
         base_points = sobol_sampler.random_base2(m=m)
         np.random.shuffle(base_points)
     
-        dtype_np = np.float32 if self.args["device"] == "mps" else np.float64
+        dtype_np = np.float32 if self.DTYPE == torch.float32 else np.float64
         points01 = torch.tensor(base_points.astype(dtype_np))
     
         lb_g, ub_g = _compute_lb_ub_per_generator()
@@ -932,10 +949,8 @@ class GEPOperationalProblemSet():
         base_points = sobol_sampler.random_base2(m=m)
         np.random.shuffle(base_points)
         # Scale to max_inv
-        if self.args["device"] == "mps":
-            points = torch.tensor(np.float32(base_points)) * max_inv
-        else:
-            points = torch.tensor(np.float64(base_points)) * max_inv
+        dtype_np = np.float32 if self.DTYPE == torch.float32 else np.float64
+        points = torch.tensor(base_points.astype(dtype_np)) * max_inv
         
        #! TODO: Do we need samples to be exactly 0?
 
@@ -1614,8 +1629,8 @@ def solve_matrix_problem_simple(obj_coeff, eq_cm, ineq_cm, eq_rhs, ineq_rhs, ver
     import gurobipy as gp
     from gurobipy import GRB
 
-    # Create a new model
-    m = gp.Model("matrix_problem")
+    from gep_benders import get_shared_env
+    m = gp.Model("Matrix problem", env=get_shared_env())
     
     # Important: Set method to dual simplex to get dual values
     m.setParam('Method', 1)  # Use dual simplex

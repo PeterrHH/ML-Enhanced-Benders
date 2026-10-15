@@ -1,7 +1,7 @@
 import time
 import numpy as np
 from gep_config_parser import *
-from data_wrangling import dataframe_to_dict
+from data_wrangling import dataframe_to_dict, ramping_rates, missing_ramping_rates
 import pyomo.environ as pyo
 from pyomo.environ import Var, Constraint
 from pyomo.repn import generate_standard_repn
@@ -86,7 +86,10 @@ def prep_data(args, inputs, N=None, G=None, L=None, scale=True):
         # Extract scalar parameters
         pVOLL = inputs["value_of_lost_load"]
         pWeight = inputs["representative_period_weight"] / (args["sample_duration"] / len(T))
-        pRamping = inputs["ramping_value"]
+        #! Per generator, from the ramping_rate column of the generation data (scalar fallback).
+        pRamping = dict(sorted(ramping_rates(inputs["generation_data"], inputs["ramping_value"]).items()))
+        if inputs["ramping"] == "true" and missing_ramping_rates(pRamping, G):
+            raise ValueError(f"No ramping_rate for {missing_ramping_rates(pRamping, G)} in the generation data.")
 
         # Extract generator parameters
         pInvCost = dataframe_to_dict(
@@ -131,7 +134,7 @@ def prep_data(args, inputs, N=None, G=None, L=None, scale=True):
             pGenAva = scale_dict(pGenAva, SCALE_FACTORS["pGenAva"])
             pVOLL *= SCALE_FACTORS["pVOLL"]
             pWeight *= SCALE_FACTORS["pWeight"]
-            pRamping *= SCALE_FACTORS["pRamping"]
+            pRamping = scale_dict(pRamping, SCALE_FACTORS["pRamping"])
             pInvCost = scale_dict(pInvCost, SCALE_FACTORS["pInvCost"])
             pVarCost = scale_dict(pVarCost, SCALE_FACTORS["pVarCost"])
             pUnitCap = scale_dict(pUnitCap, SCALE_FACTORS["pUnitCap"])
@@ -270,7 +273,7 @@ def run_model(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pI
                     return pyo.Constraint.Skip
                 return (
                     model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]
-                    <= pRamping * pUnitCap[(g0, g1)] * pGenInv[(g0, g1)]
+                    <= pRamping[(g0, g1)] * pUnitCap[(g0, g1)] * pGenInv[(g0, g1)]
                 )
             model.eRampingUp = pyo.Constraint(G, T, rule=eRampingUp_rule)
 
@@ -279,7 +282,7 @@ def run_model(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pI
                 if t == T[0]:  # Skip the first time step for ramping constraints
                     return pyo.Constraint.Skip
                 return (
-                    -pRamping * pUnitCap[(g0, g1)] * pGenInv[(g0, g1)]
+                    -pRamping[(g0, g1)] * pUnitCap[(g0, g1)] * pGenInv[(g0, g1)]
                     <= model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]
                 )
             model.eRampingDown = pyo.Constraint(G, T, rule=eRampingDown_rule)
@@ -291,7 +294,7 @@ def run_model(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pI
                     return pyo.Constraint.Skip
                 return (
                     model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]
-                    <= pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]
+                    <= pRamping[(g0, g1)] * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]
                 )
             model.eRampingUp = pyo.Constraint(G, T, rule=eRampingUp_rule)
 
@@ -300,7 +303,7 @@ def run_model(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pI
                 if t == T[0]:  # Skip the first time step for ramping constraints
                     return pyo.Constraint.Skip
                 return (
-                    -pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]
+                    -pRamping[(g0, g1)] * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]
                     <= model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]
                 )
             model.eRampingDown = pyo.Constraint(G, T, rule=eRampingDown_rule)
@@ -467,8 +470,8 @@ def run_model_no_bounds(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pR
                 return pyo.Constraint.Skip
             return (
                 # model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]
-                # <= pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)] # ! Transform to <= 0
-                (model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]) - (pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]) <= 0
+                # <= pRamping[(g0, g1)] * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)] # ! Transform to <= 0
+                (model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]) - (pRamping[(g0, g1)] * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]) <= 0
             )
         model.eRampingUp = pyo.Constraint(G, T, rule=eRampingUp_rule)
 
@@ -477,9 +480,9 @@ def run_model_no_bounds(inputs, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pR
             if t == T[0]:  # Skip the first time step for ramping constraints
                 return pyo.Constraint.Skip
             return (
-                # -pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]
+                # -pRamping[(g0, g1)] * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]
                 # <= model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]] # ! Transform to <= 0
-                (-pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]) - (model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]) <= 0
+                (-pRamping[(g0, g1)] * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]) - (model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]) <= 0
             )
         model.eRampingDown = pyo.Constraint(G, T, rule=eRampingDown_rule)
 
@@ -656,8 +659,8 @@ def run_operational_model_no_bounds(inputs, T, N, G, L, pDemand, pGenAva, pVOLL,
                 return pyo.Constraint.Skip
             return (
                 # model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]
-                # <= pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)] # ! Transform to <= 0
-                (model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]) - (pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]) <= 0
+                # <= pRamping[(g0, g1)] * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)] # ! Transform to <= 0
+                (model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]) - (pRamping[(g0, g1)] * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]) <= 0
             )
         model.eRampingUp = pyo.Constraint(G, T, rule=eRampingUp_rule)
 
@@ -666,9 +669,9 @@ def run_operational_model_no_bounds(inputs, T, N, G, L, pDemand, pGenAva, pVOLL,
             if t == T[0]:  # Skip the first time step for ramping constraints
                 return pyo.Constraint.Skip
             return (
-                # -pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]
+                # -pRamping[(g0, g1)] * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]
                 # <= model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]] # ! Transform to <= 0
-                (-pRamping * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]) - (model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]) <= 0
+                (-pRamping[(g0, g1)] * pUnitCap[(g0, g1)] * model.vGenInv[(g0, g1)]) - (model.vGenProd[(g0, g1), t] - model.vGenProd[(g0, g1), T[T.index(t) - 1]]) <= 0
             )
         model.eRampingDown = pyo.Constraint(G, T, rule=eRampingDown_rule)
 
