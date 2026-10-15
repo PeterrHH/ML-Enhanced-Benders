@@ -11,9 +11,10 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
 
-from gep_problem import GEPProblemSet
+from gep_problem import GEPProblemSet, ramp_block_rows
 from gep_problem_operational import GEPOperationalProblemSet
 from create_gep_dataset import create_gep_ed_dataset
+from data_wrangling import ramping_rates
 from gep_config_parser import *
 from networks import DualClassificationNetEndToEnd, DualNet, DualNetEndToEnd, PrimalNetEndToEnd
 from devices import KNOWN_DEVICES, resolve_device_name
@@ -118,6 +119,7 @@ def make_kmeans_capacity_demand_groups(s, K, random_state=0):
     No ED solve and no reference investment required.
     """
     X, _, _ = build_capacity_demand_features(s)
+    X = s.per_unit(X)
 
     if K <= 1:
         labels = np.zeros(X.shape[0], dtype=int)
@@ -180,6 +182,21 @@ def compute_per_timestep_cuts(data, dual_vals, b_ineqs, b_eqs, s):
     return slopes, rhs
 
 
+def compute_per_unit_cuts(data, dual_vals, ramp_duals, b_ineqs, b_eqs, s):
+    """
+    Disaggregated Benders cut per subproblem unit k, slope_k @ u - theta_k <= rhs_k.
+    Without ramping a unit is one hour and this is compute_per_timestep_cuts. With
+    ramping a unit is a block of s.B hours: its hours' terms are summed, and the ramp
+    rows add sum_rows nu * R_g to the slope -- their rhs R_g u_g depends on u, so they
+    belong in the slope and never in the constant. Returns slopes (K, G) and rhs (K,).
+    """
+    slopes, rhs = compute_per_timestep_cuts(data, dual_vals, b_ineqs, b_eqs, s)
+    if s.B == 1:
+        return slopes, rhs
+    slopes = slopes.reshape(s.K, s.B, -1).sum(axis=1) + np.asarray(ramp_duals) @ s.ramp_u_coef
+    return slopes, rhs.reshape(s.K, s.B).sum(axis=1)
+
+
 def compute_installed_capacity_features(demand_features, capacity_potential_features, investments, scale=None):
     """
     Primal, investment-dependent features: [D_{n,t}, A_{g,t} Pmax_g u_g].
@@ -215,7 +232,8 @@ def make_kmeans_dual_groups(features, K, random_state=0):
 
 
 def make_cut_groups(s, cut_selection="single", cut_selection_k=1, random_state=0):
-    T = s.T
+    """Groups of subproblem units (hours, or ramping blocks of s.B hours)."""
+    T = s.K
     cut_selection = cut_selection.lower()
 
     if cut_selection == "single":
@@ -277,6 +295,13 @@ BENDERS_REL_TOL = 1e-4
 #! every master slower.
 MASTER_MIP_GAP = BENDERS_REL_TOL / 10
 
+#! Default LP phase of a gep_benders.py run: the master's u stays continuous until the relaxed
+#! problem is solved to this gap, then turns integer with every cut kept. Cheap LP masters build
+#! the first cuts, so the integer masters start from a tight relaxation. Off with --no-lp-phase
+#! (or "lp_phase_tol": null in Benders_args). BendersSolver itself defaults to off, so library
+#! callers such as gen_GEP/solve_for_train.py keep integer trajectories.
+LP_PHASE_TOL = 1e-3
+
 #! Cut groupings that are built once and never revisited. Because the groups are
 #! fixed, these carry one recourse variable per group rather than per hour.
 STATIC_GROUPED_CUTS = ("full", "kmeans")
@@ -303,6 +328,12 @@ class SampleStructure:
     That substitution is exact because the per-hour operational block is the same
     for every hour: the only time-varying entries are pGenAva * pUnitCap, and they
     sit in the *investment* columns, which are kept separately as `apmax`.
+
+    With ramping (data.set_ramping(B), B > 1) the subproblem is a block of B hours,
+    since ramp rows couple the hours inside a block. Everything per hour above stays
+    per hour; the subproblem *unit* becomes the block: K = T/B units, each with the
+    B hourly blocks on the diagonal plus 2G(B-1) ramp rows (A_ineq_unit, A_eq_unit).
+    B = 1 makes the unit the hour and every unit array the hourly one.
     """
     def __init__(self, data, sample):
         G, L, N = data.num_g, data.num_l, data.num_n
@@ -353,6 +384,36 @@ class SampleStructure:
         self.b_ineq_t = ineq_rhs[G:G + T * R].reshape(T, R).copy()
         self.b_eq_t   = _to_numpy(data.build_eq_rhs_sample(time_range)).reshape(T, Re).copy()
 
+        # (5) subproblem units: hours, or ramping blocks of B hours
+        B = getattr(data, "ramp_block_hours_", 1)
+        if T % B:
+            raise ValueError(f"Sample of {T} hours does not split into ramping blocks of {B}.")
+        self.B, self.K = B, T // B
+        self.n_ramp = 2 * G * (B - 1)
+        if B == 1:
+            self.A_ineq_unit, self.A_eq_unit = A_ineq_block, A_eq_block
+        else:
+            r, c, v, gen = ramp_block_rows(B, G, C)
+            A_ramp = np.zeros((self.n_ramp, B * C))
+            A_ramp[r, c] = v
+            self.A_ineq_unit = np.vstack([np.kron(np.eye(B), A_ineq_block), A_ramp])
+            self.A_eq_unit = np.kron(np.eye(B), A_eq_block)
+            #! Ramp row i bounds generator ramp_gen[i] by R_g u_g: ramp_u_coef maps the
+            #! ramp duals of a block onto its cut slope, and the ramp rhs at u.
+            R_g = data.ramp_limits()
+            self.ramp_gen = gen
+            self.ramp_u_coef = np.zeros((self.n_ramp, G))
+            self.ramp_u_coef[np.arange(self.n_ramp), gen] = R_g[gen]
+
+    def per_unit(self, X):
+        """Per-hour rows (T, d) -> per-unit rows (K, B*d), the hours of a block side by side."""
+        X = np.asarray(X)
+        return X if self.B == 1 else X.reshape(self.K, -1)
+
+    def ramp_rhs_at(self, investments):
+        """Ramp-row rhs R_g u_g of one block at a given investment, shape (n_ramp,)."""
+        return self.ramp_u_coef @ np.asarray(investments, dtype=float)
+
     def b_ineq_at(self, investments):
         """Inequality RHS for all hours at a given investment, shape (T, R)."""
         b = self.b_ineq_t.copy()
@@ -366,7 +427,7 @@ class BendersSolver():
                  dynamic_cluster_features="price", env=None,
                  gap_gate_threshold=None, gap_gate_action="resolve",
                  solver="gurobi", solver_log_dir=None, solver_tee=False, dump_master=False,
-                 master_mip_gap=MASTER_MIP_GAP):
+                 master_mip_gap=MASTER_MIP_GAP, lp_phase_tol=None, lp_phase_max_iters=50):
 
         self.gep_data = gep_data
         self.operational_data = operational_data
@@ -454,6 +515,16 @@ class BendersSolver():
         if not 0.0 <= self._master_mip_gap < BENDERS_REL_TOL:
             raise ValueError(f"master_mip_gap={master_mip_gap} must be below the Benders stopping "
                              f"tolerance {BENDERS_REL_TOL:g}, or UB-LB cannot close.")
+        #! LP phase (two-phase Benders): the master's u is continuous until the relaxed problem
+        #! is solved to lp_phase_tol, so the first cuts come from cheap LP masters; then u turns
+        #! integer and every cut is kept. A cut is valid for any u and the LP master's bound is a
+        #! valid lower bound, so only the stopping tests (and the incumbent upper bound, whose u
+        #! is fractional) wait for the integer phase. None: integer from the start, as before.
+        self.lp_phase_tol = None if lp_phase_tol is None else float(lp_phase_tol)
+        self.lp_phase_max_iters = int(lp_phase_max_iters)
+        self._lp_phase = self.lp_phase_tol is not None
+        self._lp_iters = 0
+        self.lp_phase_hist = []
         self._num_cuts_in_master = 0  # how many cuts already added
         self._cut_stats = []          # per cut in the master: (min |slope|, max |slope|, |rhs|)
         self._sub_lp = None           # persistent hourly ED LP (solver_backend.MatrixLP)
@@ -606,8 +677,10 @@ class BendersSolver():
         """
         if self._sub_lp is None or self._sub_lp_src is not struct:
             obj = self.operational_data.obj_coeff.detach().cpu().numpy() * self.pWeight
+            #! With ramping the LP is one block: B hours of the same objective.
+            obj = np.tile(obj, struct.B) if struct.B > 1 else obj
             self._sub_lp = sb.MatrixLP(
-                self.solver, obj, struct.A_ineq_block, struct.A_eq_block,
+                self.solver, obj, struct.A_ineq_unit, struct.A_eq_unit,
                 self._options(),
                 gurobi_env=self._gurobi_env(),
             )
@@ -808,17 +881,19 @@ class BendersSolver():
             num_alpha = 1
         elif self.cut_selection == "kmeans_dynamic_shared":
             # adapt-G-S: one theta per group (unused thetas stay at their lb of 0)
-            num_alpha = max(1, min(self.cut_selection_k, len(data.time_ranges[sample])))
+            num_alpha = max(1, min(self.cut_selection_k, s.K))
         elif self.cut_selection in STATIC_GROUPED_CUTS:
             num_alpha = len(self._ensure_cut_groups(s))
         else:
-            num_alpha = len(data.time_ranges[sample])
+            # one theta per subproblem unit: an hour, or a ramping block
+            num_alpha = s.K
 
         self.master_num_alpha = num_alpha
         m = pyo.ConcreteModel("Benders Master Persistent")
 
         # Variables
-        m.u = pyo.Var(range(data.num_g), domain=pyo.NonNegativeIntegers, bounds=(0.0, 100000.0))
+        m.u = pyo.Var(range(data.num_g), domain=pyo.NonNegativeReals if self._lp_phase else pyo.NonNegativeIntegers,
+                      bounds=(0.0, 100000.0))
         #! If we are solving the master problem, we know the investments are positive, so the lowerbound of each recourse value can be set to 0.
         m.alpha = pyo.Var(range(num_alpha), domain=pyo.NonNegativeReals)
 
@@ -878,6 +953,15 @@ class BendersSolver():
                                     abs(float(cut_rhs))))
 
         self._num_cuts_in_master = len(all_cuts)
+
+    def _end_lp_phase(self, reason):
+        """Turn the master's u integer for the rest of the run; the persistent solver picks
+        the domain change up on the next solve. All cuts stay."""
+        for u in self._u_list:
+            u.domain = pyo.NonNegativeIntegers
+        self._lp_phase = False
+        print(f"[benders] LP phase done after {self._lp_iters} LP masters ({reason}); "
+              f"master is integer from now on, with all {self._num_cuts_in_master} cuts", flush=True)
 
     def _master_log_path(self, sample, it, ext):
         """<solver_log_dir>/master_sample<s>_iter<i>.<ext>, or None when logging is off.
@@ -1110,9 +1194,11 @@ class BendersSolver():
     def find_benders_cuts_grouped_batch(
         self, data, compact, sample,
         dual_vals, b_ineqs, b_eqs,
-        struct, investments=None, keep_mask=None,
+        struct, investments=None, keep_mask=None, ramp_duals=None,
     ):
         s = struct
+        if s.B > 1:
+            return self._block_cuts(data, sample, dual_vals, ramp_duals, b_ineqs, b_eqs, s, investments)
 
         #! Hours the gap gate dropped contribute nothing to a cut. Zeroing their duals removes
         #! them from every sum below (slope and rhs alike); the grouped modes additionally leave
@@ -1185,6 +1271,58 @@ class BendersSolver():
             for k, group in groups
         ]
     
+    def _block_cuts(self, data, sample, dual_vals, ramp_duals, b_ineqs, b_eqs, s, investments):
+        """Cuts when the subproblem unit is a ramping block (s.B > 1).
+
+        Same modes and theta bookkeeping as the hourly path, over blocks instead of
+        hours: groups are groups of blocks, per-unit thetas are per block, and a
+        group's cut sums its blocks' disaggregated cuts (compute_per_unit_cuts), which
+        is what the hourly path computes when every block is one hour.
+        """
+        G = data.num_g
+        slopes_u, rhs_u = compute_per_unit_cuts(data, dual_vals, ramp_duals, b_ineqs, b_eqs, s)
+
+        def cut(units, num_alpha, alpha_cols):
+            lhs = np.zeros((1, G + num_alpha))
+            lhs[0, :G] = slopes_u[units].sum(axis=0)
+            lhs[0, G + np.asarray(alpha_cols, dtype=int)] = -1.0
+            return lhs, float(rhs_u[units].sum())
+
+        if self.cut_selection == "single":
+            return [cut(np.arange(s.K), 1, [0])]
+
+        if self.cut_selection in ("kmeans_dynamic", "kmeans_dynamic_shared"):
+            if self.dynamic_cluster_features == "price":
+                features = compute_shadow_prices(data, dual_vals)
+            elif self.dynamic_cluster_features == "capacity":
+                features = self._capacity_features(data, sample, investments)
+            else:
+                features = compute_investment_duals(data, dual_vals, s)
+            self.cut_groups = make_kmeans_dual_groups(s.per_unit(features), self.cut_selection_k)
+
+        if self.cut_selection == "kmeans_dynamic_shared":
+            self._cut_hist_slopes.append(slopes_u)
+            self._cut_hist_rhs.append(rhs_u)
+            hist_slopes = np.stack(self._cut_hist_slopes)    # (I, K, G)
+            hist_rhs = np.stack(self._cut_hist_rhs)          # (I, K)
+            num_alpha = max(1, min(self.cut_selection_k, s.K))
+            cuts = []
+            for k, group in enumerate(self.cut_groups):
+                group = np.asarray(group, dtype=int)
+                for it in range(hist_slopes.shape[0]):
+                    lhs = np.zeros((1, G + num_alpha))
+                    lhs[0, :G] = hist_slopes[it, group].sum(axis=0)
+                    lhs[0, G + k] = -1.0
+                    cuts.append((lhs, float(hist_rhs[it, group].sum())))
+            return cuts
+
+        if self.cut_selection != "kmeans_dynamic":
+            self._ensure_cut_groups(s)
+        shared_alpha = self.cut_selection in STATIC_GROUPED_CUTS
+        num_alpha = len(self.cut_groups) if shared_alpha else s.K
+        return [cut(np.asarray(group, dtype=int), num_alpha, [k] if shared_alpha else group)
+                for k, group in enumerate(self.cut_groups)]
+
     def solve_subproblems(self, data, compact, sample, investments, exact=True):
         '''
         Solve all hourly subproblems (exact LPs or PDL) at the given investment
@@ -1211,29 +1349,51 @@ class BendersSolver():
         t_solve_wall = 0.0
         t_pdl = 0.0
         self._last_cut_tight = None
+        ramp_duals = None
+
+        if not exact and s.B > 1:
+            raise NotImplementedError("Ramping blocks need exact subproblems: the PDL nets "
+                                      "predict single hours without ramp rows.")
 
         if exact:
             lp = self._hourly_lp(s)
 
-            obj_vals    = [None] * num_timesteps
+            obj_vals    = [None] * s.K
             primal_vals = [None] * num_timesteps
             dual_vals   = [None] * num_timesteps
-            inf_times   = [None] * num_timesteps
+            inf_times   = [None] * s.K
 
             # --- Phase 2: LP solves (sequential: see __init__ on parallel_subproblems) ---
             t0 = time.time()
-            for t in range(num_timesteps):
-                obj_vals[t], primal_vals[t], dual_vals[t], inf_times[t] = lp.solve(b_ineqs_np[t], b_eqs_np[t])
+            if s.B == 1:
+                for t in range(num_timesteps):
+                    obj_vals[t], primal_vals[t], dual_vals[t], inf_times[t] = lp.solve(b_ineqs_np[t], b_eqs_np[t])
+            else:
+                #! One LP per block. Its duals are split back into the per-hour layout
+                #! [ineq R | eq N] the cut, clustering and diagnostics code reads, plus
+                #! the block's ramp duals, which only the cut slope needs.
+                B, R, N = s.B, s.R, s.Re
+                ramp_rhs = s.ramp_rhs_at(investments)
+                ramp_duals = np.empty((s.K, s.n_ramp))
+                for k in range(s.K):
+                    hrs = slice(k * B, (k + 1) * B)
+                    obj_vals[k], x, duals, inf_times[k] = lp.solve(
+                        np.concatenate([b_ineqs_np[hrs].ravel(), ramp_rhs]), b_eqs_np[hrs].ravel())
+                    hour_ineq = duals[:B * R].reshape(B, R)
+                    ramp_duals[k] = duals[B * R:B * R + s.n_ramp]
+                    hour_eq = duals[B * R + s.n_ramp:].reshape(B, N)
+                    dual_vals[hrs] = list(np.concatenate([hour_ineq, hour_eq], axis=1))
+                    primal_vals[hrs] = list(np.asarray(x).reshape(B, -1))
             t_solve_wall = time.time() - t0
 
             primal_obj_val_total = float(np.sum(obj_vals))
             dual_obj_val_total   = primal_obj_val_total
             inference_time_total = float(np.sum(inf_times))
 
-            #! Cut tightness: each hour's cut evaluated at this investment is that hour's
-            #! dual objective, which strong duality makes equal to its LP optimum. Anything
+            #! Cut tightness: each unit's cut (hour, or ramping block) evaluated at this
+            #! investment is that unit's dual objective, which strong duality makes equal to its LP optimum. Anything
             #! well above NUMERIC_TOL means the duals, not the master, carry the error.
-            slopes_t, rhs_t = compute_per_timestep_cuts(data, np.array(dual_vals), b_ineqs_np, b_eqs_np, s)
+            slopes_t, rhs_t = compute_per_unit_cuts(data, np.array(dual_vals), ramp_duals, b_ineqs_np, b_eqs_np, s)
             cut_at_u = slopes_t @ np.asarray(investments, dtype=float) - rhs_t
             err_t = cut_at_u - np.asarray(obj_vals, dtype=float)
             self._last_cut_tight = {
@@ -1269,6 +1429,7 @@ class BendersSolver():
             struct=s,
             investments=np.asarray(investments, dtype=float),
             keep_mask=keep_mask,
+            ramp_duals=ramp_duals,
         )
         t_cuts = time.time() - t0
 
@@ -1394,6 +1555,8 @@ class BendersSolver():
 
             self._last_gap_stats = None
             t_iter_start = time.time()
+            in_lp = self._lp_phase         # this iteration's master is (or would be) the LP relaxation
+            lp_repeated = False
             print("-"*50)
             print("Iteration", i, "Exact:", self.exact)
 
@@ -1420,6 +1583,7 @@ class BendersSolver():
                 print("Solving the master problem in iteration", i)
                 obj_val_master, investments_iter_k, inference_time_master = self.solve_master_problem(data,compact,sample,torch.stack(investments_all),torch.tensor(obj_val_subproblems_all),benders_cut_all)
                 self.total_time_master += inference_time_master
+                self._lp_iters += int(in_lp)
 
             # Add investment values of current iteration to list
             print("The investment decisions are", investments_iter_k)
@@ -1427,7 +1591,12 @@ class BendersSolver():
 
             self.inv_hist.append(investments_iter_k.detach().cpu().numpy().tolist())
 
-            if self.exact == False and i > 0 and self._investment_repeated(investments_iter_k, investments_all):
+            #! In the LP phase a repeated u only means the relaxation has converged: end the phase
+            #! (below) instead of triggering exact refinement or a stop.
+            if in_lp and i > 0 and self._investment_repeated(investments_iter_k, investments_all):
+                lp_repeated = True
+                investments_all.append(investments_iter_k)
+            elif self.exact == False and i > 0 and self._investment_repeated(investments_iter_k, investments_all):
                 print("!! Investments are the same as last iteration")
                 if self.exact_refinement:
                     self.exact = True
@@ -1517,6 +1686,7 @@ class BendersSolver():
             tight = self._last_cut_tight
             self.cut_tight_rel_hist.append(tight["cut_tight_rel"] if tight else np.nan)
             self.cut_tight_rel_max_hour_hist.append(tight["cut_tight_rel_max_hour"] if tight else np.nan)
+            self.lp_phase_hist.append(bool(in_lp))
 
             # master time only exists when i>0
             if i == 0:
@@ -1525,8 +1695,9 @@ class BendersSolver():
                 self.master_time_hist.append(float(inference_time_master))
             self._record_master_stats(self._last_master_stats if i > 0 else None)
 
-            # Check for optimality
-            if self.exact:
+            # Check for optimality -- not in the LP phase: its u is fractional, so neither its
+            # upper bound nor a repeated u says anything about the integer problem yet.
+            if self.exact and not in_lp:
                 # print("Found upper bound:",upper_bound)
                 if upper_bound < self.best_upper_bound:
                     self.best_upper_bound = upper_bound
@@ -1563,6 +1734,14 @@ class BendersSolver():
                     # Add Benders cut of current iteration to list
                     self._update_cut_list(benders_cut_all, benders_cuts)
                     print(f"Subproblems solved. Added {len(benders_cuts)} Benders cuts.")
+            if in_lp and i > 0:
+                lp_gap = (upper_bound - lower_bound) / max(1.0, abs(upper_bound))
+                if lp_gap < self.lp_phase_tol:
+                    self._end_lp_phase(f"relaxation gap {lp_gap:.1e} < {self.lp_phase_tol:g}")
+                elif lp_repeated:
+                    self._end_lp_phase("investment repeated")
+                elif self._lp_iters >= self.lp_phase_max_iters:
+                    self._end_lp_phase(f"cap of {self.lp_phase_max_iters} reached, relaxation gap still {lp_gap:.1e}")
             self.wall_master_hist.append(
                             float(inference_time_master) if i > 0 else 0.0
                         )
@@ -1755,6 +1934,15 @@ if __name__ == "__main__":
              "duals, 'drop' leaves it out of the cut (and out of its cluster). Default resolve.",
     )
     parser.add_argument(
+        "--ramp-block-hours", "--ramp_block_hours",
+        dest="ramp_block_hours",
+        type=int,
+        default=None,
+        help="Override Benders_args.ramp_block_hours: ramp limits between consecutive hours "
+             "inside blocks of this many hours (never across blocks). 1 or unset: no ramping. "
+             "Must divide sample_duration; needs --benders-setup Exact.",
+    )
+    parser.add_argument(
         "--master-mip-gap", "--master_mip_gap",
         dest="master_mip_gap",
         type=float,
@@ -1762,6 +1950,29 @@ if __name__ == "__main__":
         help=f"Override Benders_args.master_mip_gap: the master's relative MIP gap in both "
              f"phases. Must be below the Benders stopping tolerance {BENDERS_REL_TOL:g}. "
              f"Default {MASTER_MIP_GAP:g}.",
+    )
+    parser.add_argument(
+        "--lp-phase-tol", "--lp_phase_tol",
+        dest="lp_phase_tol",
+        type=float,
+        default=None,
+        help=f"LP phase: the master's investments stay continuous (LP master) until the relaxed "
+             f"problem's UB-LB gap is below this, then turn integer with every cut kept. "
+             f"Default {LP_PHASE_TOL:g}, or Benders_args.lp_phase_tol.",
+    )
+    parser.add_argument(
+        "--no-lp-phase", "--no_lp_phase",
+        dest="no_lp_phase",
+        action="store_true",
+        help="Integer master from the first iteration (no LP phase).",
+    )
+    parser.add_argument(
+        "--lp-phase-max-iters", "--lp_phase_max_iters",
+        dest="lp_phase_max_iters",
+        type=int,
+        default=None,
+        help="Safety cap on LP-phase iterations (default 50); the phase also ends when the LP "
+             "master repeats an investment.",
     )
     parser.add_argument(
         "--benders-setup", "--benders_setup",
@@ -1843,6 +2054,25 @@ if __name__ == "__main__":
     if args_cli.gap_gate_threshold is not None:
         args["Benders_args"]["gap_gate_threshold"] = args_cli.gap_gate_threshold
         print(f"[override] gap_gate_threshold = {args_cli.gap_gate_threshold}")
+    if args_cli.ramp_block_hours is not None:
+        args["Benders_args"]["ramp_block_hours"] = args_cli.ramp_block_hours
+        print(f"[override] ramp_block_hours = {args_cli.ramp_block_hours}")
+    #! Ramping runs keep their own result files: the block length goes into the name.
+    RAMP_B = int(args["Benders_args"].get("ramp_block_hours") or 1)
+    if RAMP_B > 1 and not args_cli.solve_direct and args["Benders_args"]["benders_setup"] != "Exact":
+        raise SystemExit("--ramp-block-hours needs --benders-setup Exact: the PDL nets predict "
+                         "single hours and have no ramp rows.")
+    if args_cli.no_lp_phase:
+        args["Benders_args"]["lp_phase_tol"] = None
+        print("[override] lp_phase_tol = None (no LP phase)")
+    elif args_cli.lp_phase_tol is not None:
+        args["Benders_args"]["lp_phase_tol"] = args_cli.lp_phase_tol
+        print(f"[override] lp_phase_tol = {args_cli.lp_phase_tol}")
+    #! On by default; a config can switch it off with "lp_phase_tol": null.
+    args["Benders_args"].setdefault("lp_phase_tol", LP_PHASE_TOL)
+    if args_cli.lp_phase_max_iters is not None:
+        args["Benders_args"]["lp_phase_max_iters"] = args_cli.lp_phase_max_iters
+        print(f"[override] lp_phase_max_iters = {args_cli.lp_phase_max_iters}")
     if args_cli.master_mip_gap is not None:
         args["Benders_args"]["master_mip_gap"] = args_cli.master_mip_gap
         print(f"[override] master_mip_gap = {args_cli.master_mip_gap}")
@@ -1879,6 +2109,9 @@ if __name__ == "__main__":
     #! Derived from the config itself rather than from its filename, so an
     #! absolute or ./-prefixed --config no longer fails.
     NumNode = len(args["Benders_args"]["N"])
+    #! Ramping runs get a results folder of their own, <N>Node_Block<B>, laid out exactly
+    #! like <N>Node (same file names), so analysis scripts only need the other folder.
+    BLOCK_SUFFIX = f"_Block{RAMP_B}" if RAMP_B > 1 else ""
 
     roots = resolve_roots(args, args_cli)
     data_root = roots["data_root"]
@@ -1992,6 +2225,26 @@ if __name__ == "__main__":
                     operational_data = pickle.load(file)
                 with open(gep_data_save_path, 'rb') as file:
                     gep_data = pickle.load(file)
+
+            #! Ramping is a property of the run, not of the cached dataset, so the same
+            #! pickle serves both. config.toml's `ramping` only drives gep_exact_solver.py
+            #! (ramping over the whole horizon); the matrix pipeline reads the block length.
+            gep_data.set_ramping(RAMP_B)
+            #! Ramp rates are baked into the cached pickle when the dataset is built, so read
+            #! them again from the generation data (ramping_rate column, or ramping_value in
+            #! inputs/scalars.toml without it): an edit to either would otherwise be ignored.
+            rates = ramping_rates(experiment_instance["generation_data"], experiment_instance["ramping_value"])
+            cached = gep_data.pRamping
+            if not isinstance(cached, dict) or any(cached.get(g) != rates.get(g) for g in gep_data.G):
+                print("[ramping] ramp rates taken from the generation data, not the cached dataset")
+            gep_data.pRamping = rates
+            if RAMP_B > 1:
+                gep_data.ramp_limits()   # fails here, naming the generators, if a rate is missing
+                print(f"[ramping] blocks of {RAMP_B} h, R_g = rate_g * UnitCap_g: " +
+                      ", ".join(f"{n} {t} {rates[(n, t)]:g}" for n, t in gep_data.G))
+            elif str(experiment_instance.get("ramping", "false")).lower() == "true":
+                print("[ramping] WARNING: config.toml has ramping = true, but ramp_block_hours is "
+                      "unset, so this run has no ramp rows. Set --ramp-block-hours to ramp.")
 
             # !Load primal and dual net
             if not args_cli.solve_direct:
@@ -2108,11 +2361,15 @@ if __name__ == "__main__":
                     solver_tee=args_cli.solver_tee,
                     dump_master=args_cli.dump_master,
                     master_mip_gap=args["Benders_args"].get("master_mip_gap", MASTER_MIP_GAP),
+                    lp_phase_tol=args["Benders_args"].get("lp_phase_tol"),
+                    lp_phase_max_iters=args["Benders_args"].get("lp_phase_max_iters", 50),
                 )
                 #! The tolerance profile goes into every result row, so a table can say what it compares.
                 tol_profile = {
+                    "ramp_block_hours": RAMP_B,
                     "benders_rel_tol": BENDERS_REL_TOL,
                     "master_mip_gap": solver_kwargs["master_mip_gap"],
+                    "lp_phase_tol": solver_kwargs["lp_phase_tol"],
                     "numeric_tol": NUMERIC_TOL,
                 }
                 for repeat in range(1):
@@ -2220,6 +2477,7 @@ if __name__ == "__main__":
                                 "gap_rel_max":    solver.gap_rel_max_hist,
                                 "cut_tight_rel":  solver.cut_tight_rel_hist,
                                 "cut_tight_rel_max_hour": solver.cut_tight_rel_max_hour_hist,
+                                "lp_phase":       solver.lp_phase_hist,
                                 #! Master state per iteration -- status, bound, gap, nodes and the
                                 #! cut coefficient range -- for tracing a master that stalls.
                                 **solver.master_diagnostics(),
@@ -2234,7 +2492,7 @@ if __name__ == "__main__":
                             #     out_dir = f"outputs/Benders/{NumNode}Node/Full_Time/iter_logs_{benders_setup_str}_{specific_name}"
                             # else:
                             out_dir = under_root(
-                                f"outputs/Benders/{NumNode}Node/Sample_{benders_args['sample_duration']}/iter_logs_{benders_setup_str}_{specific_name}",
+                                f"outputs/Benders/{NumNode}Node{BLOCK_SUFFIX}/Sample_{benders_args['sample_duration']}/iter_logs_{benders_setup_str}_{specific_name}",
                                 output_root,
                             )
 
@@ -2287,7 +2545,8 @@ if __name__ == "__main__":
                     experiment_data_df = pd.DataFrame(all_results)
 
                     exp_save_directory = under_root(
-                        args["Benders_args"].get("exp_save_directory") or f"outputs/Benders/{NumNode}Node",
+                        (args["Benders_args"].get("exp_save_directory") or f"outputs/Benders/{NumNode}Node").rstrip("/")
+                        + BLOCK_SUFFIX,
                         output_root,
                     )
 

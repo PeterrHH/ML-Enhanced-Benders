@@ -51,14 +51,41 @@ def precompute_pool(inputs, countries, pool_times=None):
 # ======================================================================
 # 2. Availability perturbation — interior values only
 # ======================================================================
-def perturb_availability(A, rng, sigma=0.0, hi=0.999, lo=1e-6):
+def perturb_availability(A, rng, sigma=0.0, hi=0.999, lo=1e-6, block=1):
+    """Interior-only availability noise. With block > 1 one draw is shared by the
+    `block` consecutive hours of each window, so the noise adds no hour-to-hour jumps
+    for the ramp limits to react to."""
     if sigma <= 0.0:
         return A
     A = A.copy()
     mask = (A > lo) & (A < hi)
-    noise = rng.normal(0.0, sigma, size=A.shape)
+    if block == 1:
+        noise = rng.normal(0.0, sigma, size=A.shape)
+    else:
+        noise = np.repeat(rng.normal(0.0, sigma, size=(A.shape[0] // block, A.shape[1])), block, axis=0)
     A[mask] = np.clip(A[mask] + noise[mask], 0.0, 1.0)
     return A
+
+
+def draw_hours(pool, horizon, rng, block=1):
+    """Hours of the pool to build an instance from, as positions into pool_times.
+
+    block == 1: `horizon` independent hours, drawn with replacement (the original
+    sampler, same random stream).
+    block > 1: horizon // block windows of `block` consecutive hours. A window may
+    start only where its whole span lies in the pool, so it never runs past the end
+    of the year or into hours held out by POOL_TIMES. The instance renumbers its hours
+    1..horizon and ramping blocks start at its first hour, so window k is exactly
+    ramping block k, and no ramp limit links two windows drawn from different times.
+    """
+    times = pool["pool_times"]
+    if block == 1:
+        return rng.choice(len(times), size=horizon, replace=True)
+    starts = np.flatnonzero(times[block - 1:] - times[:len(times) - block + 1] == block - 1)
+    if len(starts) == 0:
+        raise ValueError(f"The pool has no run of {block} consecutive hours to draw a window from.")
+    picked = rng.choice(starts, size=horizon // block, replace=True)
+    return (picked[:, None] + np.arange(block)[None, :]).ravel()
 
 # ======================================================================
 # 3. Build ONE instance
@@ -71,20 +98,23 @@ def build_one_gep_instance(
     demand_lognormal_sigma=0.0,
     avail_sigma=0.0,
     seed=0,
+    ramp_block_hours=1,
 ):
     rng = np.random.default_rng(seed)
     countries = pool["countries"]
-    idx   = rng.choice(len(pool["pool_times"]), size=horizon, replace=True)
+    B = int(ramp_block_hours)
+    idx   = draw_hours(pool, horizon, rng, block=B)
     drawn = pool["pool_times"][idx]
     new_times = np.arange(1, horizon + 1)
 
-    # --- demand: global scale (+ optional per-hour lognormal jitter) ---
+    # --- demand: global scale (+ optional lognormal jitter: per hour, or per window when B > 1) ---
     D = pool["dem_wide"].loc[drawn].to_numpy().copy()
     D *= demand_scale
     if demand_lognormal_sigma > 0.0:
+        shape = D.shape if B == 1 else (D.shape[0] // B, D.shape[1])
         f = rng.lognormal(mean=-0.5*demand_lognormal_sigma**2,
-                          sigma=demand_lognormal_sigma, size=D.shape)
-        D = D * f
+                          sigma=demand_lognormal_sigma, size=shape)
+        D = D * (f if B == 1 else np.repeat(f, B, axis=0))
     demand_new = pd.DataFrame([
         {"Country": c, "Time": int(t), "Demand_MW": float(D[k, j])}
         for k, t in enumerate(new_times) for j, c in enumerate(countries)
@@ -93,7 +123,7 @@ def build_one_gep_instance(
     # --- availability: real drawn rows, interior-only perturbation ---
     ava_cols = list(pool["ava_wide"].columns)
     A = pool["ava_wide"].loc[drawn].to_numpy().copy()
-    A = perturb_availability(A, rng, sigma=avail_sigma)
+    A = perturb_availability(A, rng, sigma=avail_sigma, block=B)
     ava_rows = []
     for k, t in enumerate(new_times):
         for j, (c, tech) in enumerate(ava_cols):
@@ -133,6 +163,8 @@ def build_one_gep_instance(
             "renew_cinv_scale": renew_cinv_scale,
             "demand_lognormal_sigma": demand_lognormal_sigma,
             "avail_sigma": avail_sigma, "cinv_factors": cinv_factors,
+            "ramp_block_hours": B,
+            "window_starts": drawn[::B].tolist() if B > 1 else None,
             "drawn_hours": drawn.tolist()}
     return data, meta
 
@@ -214,11 +246,28 @@ parser.add_argument(
     default=MASTER_SEED,
     help=f"Master seed for the perturbation sampler (default {MASTER_SEED}).",
 )
+parser.add_argument(
+    "--ramp-block-hours", "--ramp_block_hours",
+    dest="ramp_block_hours",
+    type=int,
+    default=1,
+    help="Build instances for ramping inside blocks of this many hours: hours are drawn "
+         "as whole windows of consecutive hours, one per ramping block, and demand and "
+         "availability noise is drawn once per window. 1 (default) draws single hours, "
+         "as before. The horizon must be a multiple of it, e.g. 216 for 4, 6 or 8.",
+)
 cli_args = parser.parse_args()
 
 N_INSTANCES = cli_args.n_instances
 HORIZON     = cli_args.horizon
 MASTER_SEED = cli_args.seed
+RAMP_B      = cli_args.ramp_block_hours
+if RAMP_B < 1:
+    raise SystemExit(f"--ramp-block-hours must be at least 1, got {RAMP_B}.")
+if HORIZON % RAMP_B:
+    _near = max(RAMP_B, (HORIZON // RAMP_B) * RAMP_B)
+    raise SystemExit(f"--horizon {HORIZON} is not a multiple of --ramp-block-hours {RAMP_B}; "
+                     f"use e.g. --horizon {_near} (216 works for blocks of 4, 6 and 8).")
 
 with open(under_repo(cli_args.config), "r") as file:
     args = json.load(file)
@@ -229,8 +278,10 @@ data_root = roots["data_root"]
 #! e.g. data/GEP_perturb_mix_N20_G107_L44_H219 -- the topology and horizon are
 #! in the name, so runs of different sizes coexist instead of overwriting one
 #! another. solve_for_train.py rebuilds this exact name from the same config.
+#! Ramping instances get _B<hours> as well: their hours come in windows, so they must
+#! never mix with an hourly set of the same horizon.
 OUT_DIR = ensure_dir(under_root(
-    f"{OUT_PREFIX}_{topology_tag(args)}_H{HORIZON}", data_root
+    f"{OUT_PREFIX}_{topology_tag(args)}_H{HORIZON}" + (f"_B{RAMP_B}" if RAMP_B > 1 else ""), data_root
 ))
 
 #! Instance count is NOT in the directory name, so re-running with fewer
@@ -253,7 +304,8 @@ COUNTRIES = list(dict.fromkeys(args["Benders_args"]["N"]))
 print(f"Run config: {under_repo(cli_args.config)}")
 print(f"Countries ({len(COUNTRIES)}): {COUNTRIES}")
 print(f"Generators: {len(args['Benders_args']['G'])}  Lines: {len(args['Benders_args']['L'])}")
-print(f"Instances:  {N_INSTANCES}  Horizon: {HORIZON}h  Seed: {MASTER_SEED}")
+print(f"Instances:  {N_INSTANCES}  Horizon: {HORIZON}h  Seed: {MASTER_SEED}"
+      + (f"  Ramping blocks: {RAMP_B}h ({HORIZON // RAMP_B} windows per instance)" if RAMP_B > 1 else ""))
 print(f"Output dir: {OUT_DIR}")
 
 input_data = parse_config(under_repo(cli_args.toml_config))
@@ -273,7 +325,7 @@ for i in range(N_INSTANCES):
     path = os.path.join(OUT_DIR, f"gep_instance_{i:03d}.pkl")
     _, meta = build_one_gep_instance(
         inputs=gep_ed_data, base_problem_args=args["Benders_args"], args=args,
-        pool=pool, save_path=path, horizon=HORIZON, seed=1000 + i, **reg,
+        pool=pool, save_path=path, horizon=HORIZON, seed=1000 + i, ramp_block_hours=RAMP_B, **reg,
     )
     meta["instance_id"] = i
     meta["class"] = inst_class

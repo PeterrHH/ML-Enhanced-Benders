@@ -233,3 +233,4 @@ tests/*
 GurobiKey/*
 evaluate_primal_dual.ipynb
 docs/
+run.txt

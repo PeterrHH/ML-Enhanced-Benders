@@ -7,6 +7,36 @@ import matplotlib.pyplot as plt
 from devices import move_attrs
 
 
+def ramp_block_rows(B, G, C):
+    """Ramp rows of one block of B hours, as triplets over the block's own variables.
+
+    Hours inside a block are coupled, hours of different blocks never are
+    (docs/ramping-blocks-plan.md). For every hour j = 1..B-1 of the block and
+    every generator g:
+        up:    p_{g,j} - p_{g,j-1} - R_g u_g <= 0
+        down:  p_{g,j-1} - p_{g,j} - R_g u_g <= 0
+    All up rows come first, ordered (j, g), then all down rows. Columns index the
+    block's operational variables, hour j at j*C (p_g first in every hour); the
+    investment term lives in a separate column and is returned as `gen`, the
+    generator each row bounds, so callers can place -R_g themselves.
+
+    Returns rows, cols, vals (the operational part) and gen, all numpy arrays,
+    for 2*G*(B-1) rows.
+    """
+    rows, cols, vals, gen = [], [], [], []
+    n_half = G * (B - 1)
+    for sign_row, (now, prev) in ((0, (1.0, -1.0)), (n_half, (-1.0, 1.0))):
+        for j in range(1, B):
+            for g in range(G):
+                r = sign_row + (j - 1) * G + g
+                rows += [r, r]
+                cols += [j * C + g, (j - 1) * C + g]
+                vals += [now, prev]
+                gen.append(g)
+    return (np.asarray(rows, dtype=int), np.asarray(cols, dtype=int),
+            np.asarray(vals, dtype=float), np.asarray(gen, dtype=int))
+
+
 class GEPProblemSet():
 
     def __init__(self, args, T, N, G, L, pDemand, pGenAva, pVOLL, pWeight, pRamping, pInvCost, pVarCost, pUnitCap, pExpCap, pImpCap):
@@ -67,6 +97,11 @@ class GEPProblemSet():
         self.nineq = self.n_ineq_per_t * self.sample_duration + self.n_inv_vars #Q Maaike: with investment var right?
         self.ydim = self.n_inv_vars + self.n_prod_vars + self.n_line_vars + self.n_md_vars
 
+
+        #! Ramping off until set_ramping() is called. Kept out of the constructor so a
+        #! cached pickle serves both settings; pickles from before ramping existed
+        #! have no attribute and read as off through ramp_block_hours_.
+        self.ramp_block_hours = 1
 
         # Masks for node balance!
         # Initialize mask
@@ -137,6 +172,64 @@ class GEPProblemSet():
         self.DEVICE = device
         self.DTYPE = dtype
         return self
+
+    @property
+    def ramp_block_hours_(self):
+        """B, the ramping block length; 1 means no ramp rows at all."""
+        return getattr(self, "ramp_block_hours", 1)
+
+    def set_ramping(self, block_hours):
+        """Switch ramping inside blocks of `block_hours` hours on (>1) or off (1/None/0).
+
+        Ramp rows are appended after every existing inequality row, so with
+        ramping off every matrix is exactly what it was before ramping existed.
+        """
+        B = int(block_hours) if block_hours else 1
+        if B < 1:
+            raise ValueError(f"ramp_block_hours must be >= 1, got {block_hours}.")
+        if B > 1 and self.sample_duration % B:
+            raise ValueError(f"sample_duration {self.sample_duration} is not a multiple of the "
+                             f"ramping block length {B}; blocks must tile every sample.")
+        old = self.n_ramp_rows(self.sample_duration)
+        self.ramp_block_hours = B
+        self.nineq += self.n_ramp_rows(self.sample_duration) - old
+        return self
+
+    def n_ramp_rows(self, T):
+        """Ramp rows of a T-hour horizon: 2*G*(B-1) per block of B hours."""
+        B = self.ramp_block_hours_
+        return 0 if B <= 1 else (T // B) * 2 * self.num_g * (B - 1)
+
+    def ramp_limits(self):
+        """R_g = rate_g * pUnitCap_g, the ramp limit per unit built (MW/h).
+
+        pRamping is a dict of per-generator rates (the ramping_rate column of the
+        generation data) or, in datasets built before that column existed, one scalar.
+        """
+        from data_wrangling import missing_ramping_rates
+        missing = missing_ramping_rates(self.pRamping, self.G)
+        if missing:
+            raise ValueError(f"No ramping_rate for {missing} in the generation data; "
+                             "ramping needs a rate for every generator in the run.")
+        rate = (lambda g: self.pRamping[g]) if isinstance(self.pRamping, dict) else (lambda g: self.pRamping)
+        return np.array([float(rate(g)) * float(self.pUnitCap[g]) for g in self.G])
+
+    def _ramp_triplets(self, T, row0):
+        """Ramp rows of a T-hour sample in full-vector coordinates ([u, y_1, ..., y_T]),
+        starting at row `row0`. Empty when ramping is off."""
+        B = self.ramp_block_hours_
+        if B <= 1:
+            return np.empty(0, int), np.empty(0, int), np.empty(0)
+        G, C = self.num_g, self.n_var_per_t
+        r, c, v, gen = ramp_block_rows(B, G, C)
+        nr = 2 * G * (B - 1)
+        R_g = self.ramp_limits()
+        rows, cols, vals = [], [], []
+        for k in range(T // B):
+            rows += [row0 + k * nr + r, row0 + k * nr + np.arange(nr)]
+            cols += [G + k * B * C + c, gen]
+            vals += [v, -R_g[gen]]
+        return np.concatenate(rows), np.concatenate(cols), np.concatenate(vals)
 
     def build_rhs_only(self):
         eq_rhss = []
@@ -368,6 +461,10 @@ class GEPProblemSet():
 
         # TODO: Convert to sparse matrices for efficiency??
 
+        #! Every tensor gets self.DTYPE explicitly, as in the sparse twin. Left to torch's
+        #! default it was float32 whenever the problem came from a cached pickle (only the
+        #! constructor sets float64), so short direct solves saw rounded data.
+        dt = self.DTYPE
         num_timesteps = len(time_range)
         num_columns_per_t = self.n_var_per_t
 
@@ -375,7 +472,7 @@ class GEPProblemSet():
         num_rows_per_t = 2 * (self.num_g + self.num_l + self.num_n)
 
         # Create a single block for one timestep
-        block_matrix = torch.zeros((num_rows_per_t, num_columns_per_t))
+        block_matrix = torch.zeros((num_rows_per_t, num_columns_per_t), dtype=dt)
 
         # Apply constraints
         # Bounds are always identity, -1 for lower bounds, +1 for upper bounds.
@@ -387,11 +484,11 @@ class GEPProblemSet():
         self.assign_identity_or_scalar(block_matrix, 2*self.num_g + 2*self.num_l + self.num_n, self.num_g + self.num_l, self.num_n, 1)  # 3.1j: Missed demand upper bound
 
         # Use Kronecker product to copy the block matrix diagonally for all timesteps
-        ineq_cm = torch.kron(torch.eye(num_timesteps), block_matrix)
+        ineq_cm = torch.kron(torch.eye(num_timesteps, dtype=dt), block_matrix)
 
         # 3.1k, ui_g lower bound
         # prepend ui_g to top left corner. lower bound, so minus.
-        ui_g = -torch.eye(self.num_g)
+        ui_g = -torch.eye(self.num_g, dtype=dt)
         ineq_cm = torch.block_diag(ui_g, ineq_cm)
 
         row_offset = self.num_g # offset first g for 3.1k
@@ -420,8 +517,16 @@ class GEPProblemSet():
             ineq_rhs += [0 for _ in range(self.num_n)]
             # 3.1j: Missed demand upper bound
             ineq_rhs += [self.pDemand[(n, t)] for n in self.N]
-            
-        return ineq_cm, torch.tensor(ineq_rhs)
+
+        n_ramp = self.n_ramp_rows(num_timesteps)
+        if n_ramp:
+            r, c, v = self._ramp_triplets(num_timesteps, 0)
+            ramp = torch.zeros((n_ramp, ineq_cm.shape[1]), dtype=ineq_cm.dtype)
+            ramp[torch.as_tensor(r), torch.as_tensor(c)] = torch.as_tensor(v, dtype=ineq_cm.dtype)
+            ineq_cm = torch.cat([ineq_cm, ramp], dim=0)
+            ineq_rhs += [0.0] * n_ramp
+
+        return ineq_cm, torch.tensor(ineq_rhs, dtype=dt)
         
     def build_ineq_cm_rhs_sample_sparse(self, time_range):
         """Sparse twin of build_ineq_cm_rhs_sample; same matrix, never densified."""
@@ -461,11 +566,13 @@ class GEPProblemSet():
                 cap_vals.append(-(self.pGenAva.get((*g, t), 1.0) * self.pUnitCap[g]))
             row_offset += R
 
+        #! Ramp rows (none when ramping is off) go after every hourly row.
+        r_rows, r_cols, r_vals = self._ramp_triplets(T, G + T * R)
         ineq_cm = sp.coo_matrix(
-            (np.concatenate([ineq_cm.data, cap_vals]),
-             (np.concatenate([ineq_cm.row, cap_rows]),
-              np.concatenate([ineq_cm.col, cap_cols]))),
-            shape=(G + T * R, G + T * C),
+            (np.concatenate([ineq_cm.data, cap_vals, r_vals]),
+             (np.concatenate([ineq_cm.row, cap_rows, r_rows]),
+              np.concatenate([ineq_cm.col, cap_cols, r_cols]))),
+            shape=(G + T * R + self.n_ramp_rows(T), G + T * C),
         ).tocsr()
 
         return ineq_cm, self.build_ineq_rhs_sample(time_range)
@@ -504,6 +611,9 @@ class GEPProblemSet():
             # missed demand upper bound
             ineq_rhs += [self.pDemand[(n, t)] for n in self.N]
 
+        # ramp rows: the R_g u_g term sits in the matrix, so their rhs is zero
+        ineq_rhs += [0.0] * self.n_ramp_rows(len(time_range))
+
         return torch.tensor(ineq_rhs, dtype=self.DTYPE, device=self.DEVICE)
 
 
@@ -518,16 +628,18 @@ class GEPProblemSet():
         """Build the constraint matrix for the equality constraints
         """
         # TODO: Convert to sparse matrix for efficiency??
+        dt = self.DTYPE   # explicit, see build_ineq_cm_rhs_sample
         num_timesteps = len(time_range)
 
         # p_{g}, f_in - f_out, md_n
-        block_matrix = torch.concat([self.node_to_gen_mask, self.lineflow_mask, torch.eye(self.num_n)], dim=1)
+        block_matrix = torch.concat([self.node_to_gen_mask.to(dt), self.lineflow_mask.to(dt),
+                                     torch.eye(self.num_n, dtype=dt)], dim=1)
 
         # Use Kronecker product to copy the block matrix diagonally for all timesteps
-        eq_cm = torch.kron(torch.eye(num_timesteps), block_matrix)
+        eq_cm = torch.kron(torch.eye(num_timesteps, dtype=dt), block_matrix)
 
         # prepend num_g columns of zeros (ui_g not present in equality constraint matrix, so zeros)
-        zero_columns = torch.zeros((eq_cm.shape[0], self.num_g))
+        zero_columns = torch.zeros((eq_cm.shape[0], self.num_g), dtype=dt)
         # Concatenate zero_columns with eq_cm horizontally
         eq_cm = torch.hstack([zero_columns, eq_cm])
 
@@ -536,4 +648,4 @@ class GEPProblemSet():
         for t in time_range:
             eq_rhs += [self.pDemand[(n, t)] for n in self.N]
 
-        return eq_cm, torch.tensor(eq_rhs)
+        return eq_cm, torch.tensor(eq_rhs, dtype=dt)

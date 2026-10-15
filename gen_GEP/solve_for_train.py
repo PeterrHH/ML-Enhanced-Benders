@@ -82,6 +82,38 @@ def parse_cli():
              "objective next to Benders'. Off by default: it is the most "
              "expensive solve per instance and the harvest does not use it.",
     )
+    parser.add_argument(
+        "--ramp-block-hours", "--ramp_block_hours",
+        dest="ramp_block_hours",
+        type=int,
+        default=1,
+        help="Read the instances stage 1 built with --ramp-block-hours B (folder ..._H<h>_B<B>) "
+             "and solve them with ramping inside blocks of B hours. 1 (default): hourly "
+             "instances, no ramping, as before.",
+    )
+    parser.add_argument(
+        "--solve-only", "--solve_only",
+        dest="solve_only",
+        action="store_true",
+        help="Solve every instance with exact Benders and save the trajectories (every "
+             "investment visited, the optimum, the bounds per iteration), without harvesting "
+             "or labelling. Required for ramping instances until the block harvest exists.",
+    )
+    parser.add_argument(
+        "--cut-selection", "--cut_selection",
+        dest="cut_selection",
+        choices=["single", "full", "kmeans", "kmeans_dynamic", "kmeans_dynamic_shared"],
+        default=CUT_SELECTION,
+        help=f"Cut mode of the Benders solves (default {CUT_SELECTION}). 'single' converges "
+             "slowly, which spreads the trajectory; the benchmark mode gives realistic ones.",
+    )
+    parser.add_argument(
+        "--cut-selection-k", "--cut_selection_k",
+        dest="cut_selection_k",
+        type=int,
+        default=1,
+        help="Number of clusters for the kmeans cut modes.",
+    )
     return parser.parse_args()
 
 
@@ -99,15 +131,20 @@ def available_cpus():
     return os.cpu_count() or 1
 
 
-def resolve_instance_dir(args, data_root, horizon):
+def resolve_instance_dir(args, data_root, horizon, block=1):
     """Stage 1's horizon is a flag now, so rather than assume a value, find the
     directory it actually produced for this topology. Only ask for --horizon
-    when the answer is genuinely ambiguous."""
+    when the answer is genuinely ambiguous.
+
+    Ramping instances live in ..._H<h>_B<block>; an hourly search must not pick
+    them up, and a ramping search must find only its own block length."""
     stem = under_root(f"{IN_PREFIX}_{topology_tag(args)}", data_root)
+    suffix = f"_B{block}" if block > 1 else ""
     if horizon is not None:
-        return f"{stem}_H{horizon}"
+        return f"{stem}_H{horizon}{suffix}"
     candidates = sorted(
-        d for d in glob.glob(f"{stem}_H*") if glob.glob(os.path.join(d, "gep_instance_*.pkl"))
+        d for d in glob.glob(f"{stem}_H*")
+        if re.fullmatch(rf".*_H\d+{suffix}", d) and glob.glob(os.path.join(d, "gep_instance_*.pkl"))
     )
     if len(candidates) > 1:
         raise SystemExit(
@@ -116,7 +153,7 @@ def resolve_instance_dir(args, data_root, horizon):
             + "\nPick one with --horizon <hours>."
         )
     #! No match: fall back to the default name so the error below can print it.
-    return candidates[0] if candidates else f"{stem}_H{HORIZON}"
+    return candidates[0] if candidates else f"{stem}_H{HORIZON}{suffix}"
 
 
 def build_operational_companion(gep_data, args):
@@ -155,9 +192,11 @@ def check_licence(instance_path, args, horizon):
         gep_data, label=f"{topology_tag(args)}, H{horizon}")
 
 def solve_and_harvest(instance_path, args, cut_selection="single", cut_selection_k=1,
-                      check_direct=False):
+                      check_direct=False, ramp_block_hours=1):
     with open(instance_path, "rb") as f:
         gep_data = pickle.load(f)
+    #! Ramping is switched on at solve time; stage 1 only shaped the hours into blocks.
+    gep_data.set_ramping(ramp_block_hours)
     solver = make_solver(gep_data, args, cut_selection, cut_selection_k)
     t0 = time.time()
     obj_direct = None
@@ -177,7 +216,11 @@ def solve_and_harvest(instance_path, args, cut_selection="single", cut_selection
             "obj_direct": None if obj_direct is None else float(obj_direct),
             "gap_rel": float((ub-lb)/max(1.0, abs(ub))),
             "iterations": int(iters), "n_traj_points": int(traj.shape[0]),
-            "wall_sec": wall, "horizon": len(gep_data.T)}
+            "wall_sec": wall, "horizon": len(gep_data.T),
+            "ramp_block_hours": int(ramp_block_hours), "cut_selection": cut_selection,
+            #! Per iteration, aligned with `trajectory`: which phase of the run each u came from.
+            "ub_hist": list(map(float, solver.ub_hist)), "lb_hist": list(map(float, solver.lb_hist)),
+            "solver_time": float(solver.total_time_master + solver.total_time_subproblem_exact)}
 
 def cluster_investments(traj, n_clusters, seed=0):
     """Cluster an instance's trajectory investments; keep centroid-nearest per cluster."""
@@ -268,6 +311,11 @@ def _harvest_instance(i, path, args, check_direct, keep_op, n_inv_clusters, n_ho
     #! every one back would just be pickled and dropped.
     return i, h, X.numpy(), pickle.dumps(op) if keep_op else None
 
+def _solve_instance(i, path, args, check_direct, cut_selection, cut_selection_k, ramp_block_hours):
+    """Solve-only worker: one exact Benders run, its trajectory and bounds; no harvest."""
+    return i, solve_and_harvest(path, args, cut_selection, cut_selection_k,
+                                check_direct=check_direct, ramp_block_hours=ramp_block_hours)
+
 def _label_chunk(start, obj_coeff, eq_cm, ineq_cm, eq_rhs, ineq_rhs):
     """compute_opt_targets for rows [start, start + len(eq_rhs)).
 
@@ -336,11 +384,15 @@ def main():
     roots = resolve_roots(args, cli_args)
     data_root = roots["data_root"]
 
-    DIR = resolve_instance_dir(args, data_root, cli_args.horizon)
+    RAMP_B = cli_args.ramp_block_hours
+    if RAMP_B > 1 and not cli_args.solve_only:
+        raise SystemExit("Ramping instances can only be solved with --solve-only for now: the "
+                         "harvest below builds hourly states, and the block harvest does not exist yet.")
+    DIR = resolve_instance_dir(args, data_root, cli_args.horizon, RAMP_B)
 
     #! The horizon we are actually reading, taken from the directory name rather
     #! than assumed, so the harvest is labelled with the horizon that produced it.
-    _match = re.search(r"_H(\d+)$", os.path.basename(DIR))
+    _match = re.search(r"_H(\d+)(?:_B\d+)?$", os.path.basename(DIR))
     horizon = int(_match.group(1)) if _match else HORIZON
 
     #! Name derived from topology + horizon so harvests never collide.
@@ -348,15 +400,21 @@ def main():
     ED_OUT = under_root(RELATIVE_OUT, data_root)
     ensure_dir(os.path.dirname(ED_OUT))
 
+    #! Solve-only output: the trajectories, named like the instance folder plus the cut mode,
+    #! so runs with different block lengths or cut modes never overwrite one another.
+    TRAJ_OUT = under_root(os.path.join(os.path.dirname(RELATIVE_OUT),
+                                       f"GEP_trajectories_{os.path.basename(DIR)[len(IN_PREFIX.split('/')[-1]) + 1:]}"
+                                       f"_{cli_args.cut_selection}.pkl"), data_root)
+
     print(f"Run config: {under_repo(cli_args.config)}")
     print(f"Instances:  {DIR}")
-    print(f"Harvest to: {ED_OUT}")
+    print(f"Trajectories to: {TRAJ_OUT}" if cli_args.solve_only else f"Harvest to: {ED_OUT}")
 
     #! main.py reads ED_args.direct_data_path. If it does not name the file we are
     #! about to write, training would load something else entirely -- say so now
     #! rather than let it be discovered three stages later.
     _configured = args["ED_args"].get("direct_data_path")
-    if _configured and os.path.normpath(_configured) != os.path.normpath(RELATIVE_OUT):
+    if not cli_args.solve_only and _configured and os.path.normpath(_configured) != os.path.normpath(RELATIVE_OUT):
         print(
             f"[warn] this config's ED_args.direct_data_path is\n"
             f"           {_configured}\n"
@@ -373,9 +431,10 @@ def main():
     per_instance = TARGET_STATES / max(1, len(paths))
     n_hour_clusters = N_HOUR_CLUSTERS                     
     n_inv_clusters  = max(1, round(per_instance / n_hour_clusters))
-    print(f"Targeting {TARGET_STATES:,} states: {len(paths)} instances "
-          f"× {n_inv_clusters} inv × {n_hour_clusters} hours "
-          f"= {len(paths) * n_inv_clusters * n_hour_clusters:,}")
+    if not cli_args.solve_only:
+        print(f"Targeting {TARGET_STATES:,} states: {len(paths)} instances "
+              f"× {n_inv_clusters} inv × {n_hour_clusters} hours "
+              f"= {len(paths) * n_inv_clusters * n_hour_clusters:,}")
 
     #! Say so here rather than crashing further down on an empty harvest list.
     if not paths:
@@ -410,6 +469,24 @@ def main():
         )
 
     try:
+        if cli_args.solve_only:
+            jobs = [(i, p, args, cli_args.check_direct, cli_args.cut_selection,
+                     cli_args.cut_selection_k, RAMP_B) for i, p in enumerate(paths)]
+            results, t0 = [None] * len(paths), time.time()
+            for done, (i, h) in enumerate(_run(pool, _solve_instance, jobs), 1):
+                results[i] = h
+                direct = "" if h["obj_direct"] is None else \
+                    f"  obj_direct={h['obj_direct']:.6g} obj_benders={h['obj_benders']:.6g}"
+                print(f"[{done}/{len(paths)}] {os.path.basename(h['instance_path'])}  "
+                      f"iters={h['iterations']}  gap={h['gap_rel']:.2e}  "
+                      f"solver={h['solver_time']:.1f}s  wall={h['wall_sec']:.1f}s{direct}", flush=True)
+            ensure_dir(os.path.dirname(TRAJ_OUT))
+            with open(TRAJ_OUT, "wb") as f:
+                pickle.dump(results, f)
+            print(f"Solved {len(paths)} instances in {time.time() - t0:.1f}s  |  "
+                  f"{sum(len(h['trajectory']) for h in results):,} investments visited  |  saved -> {TRAJ_OUT}")
+            return
+
         harvest, Xs, base_bytes = [None] * len(paths), [None] * len(paths), None
         jobs = [(i, p, args, cli_args.check_direct, i == 0, n_inv_clusters, n_hour_clusters)
         for i, p in enumerate(paths)]
