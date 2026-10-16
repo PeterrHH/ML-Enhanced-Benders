@@ -302,6 +302,11 @@ MASTER_MIP_GAP = BENDERS_REL_TOL / 10
 #! callers such as gen_GEP/solve_for_train.py keep integer trajectories.
 LP_PHASE_TOL = 1e-3
 
+#! The lower-bound stall trigger for exact refinement only counts once the inexact UB-LB gap
+#! is below this: early iterations can stall the bound for many iterations while the master is
+#! still far from converged (one generator at a time, before the cuts say anything).
+REFINE_STALL_MAX_GAP = 0.01
+
 #! Cut groupings that are built once and never revisited. Because the groups are
 #! fixed, these carry one recourse variable per group rather than per hour.
 STATIC_GROUPED_CUTS = ("full", "kmeans")
@@ -427,7 +432,8 @@ class BendersSolver():
                  dynamic_cluster_features="price", env=None,
                  gap_gate_threshold=None, gap_gate_action="resolve",
                  solver="gurobi", solver_log_dir=None, solver_tee=False, dump_master=False,
-                 master_mip_gap=MASTER_MIP_GAP, lp_phase_tol=None, lp_phase_max_iters=50):
+                 master_mip_gap=MASTER_MIP_GAP, lp_phase_tol=None, lp_phase_max_iters=50,
+                 refine_change_tol=None, refine_stall_iters=None, refine_stall_tol=1e-4):
 
         self.gep_data = gep_data
         self.operational_data = operational_data
@@ -525,6 +531,17 @@ class BendersSolver():
         self._lp_phase = self.lp_phase_tol is not None
         self._lp_iters = 0
         self.lp_phase_hist = []
+        #! Practical convergence of the inexact phase. With surrogate cuts the master keeps moving a
+        #! few units back and forth instead of repeating an investment exactly, so the exact-repeat
+        #! test alone may never end the phase. Either trigger below acts like a repeat (exact
+        #! refinement, or a stop without it); both are off when None.
+        #!   refine_change_tol: the investment moved by less than this share of built capacity (MW);
+        #!   refine_stall_iters / refine_stall_tol: the lower bound rose by less than the tol over that
+        #!   many iterations, counted only once the inexact gap is below REFINE_STALL_MAX_GAP.
+        self.refine_change_tol = None if refine_change_tol is None else float(refine_change_tol)
+        self.refine_stall_iters = None if not refine_stall_iters else int(refine_stall_iters)
+        self.refine_stall_tol = float(refine_stall_tol)
+        self.refine_reason = None
         self._num_cuts_in_master = 0  # how many cuts already added
         self._cut_stats = []          # per cut in the master: (min |slope|, max |slope|, |rhs|)
         self._sub_lp = None           # persistent hourly ED LP (solver_backend.MatrixLP)
@@ -1476,6 +1493,22 @@ class BendersSolver():
         else:
             benders_cut_all.extend(benders_cuts)
 
+    def _refine_trigger(self, investments_all, lb_now, unit_cap):
+        """Why the inexact phase counts as converged in practice, or None (see refine_change_tol)."""
+        if self.refine_change_tol is not None and len(investments_all) >= 2:
+            cur = investments_all[-1].to(torch.float64).numpy()
+            prev = investments_all[-2].to(torch.float64).numpy()
+            change = float(np.abs(cur - prev) @ unit_cap) / max(float(prev @ unit_cap), 1.0)
+            if change < self.refine_change_tol:
+                return f"investment moved {change:.2%} of built capacity < {self.refine_change_tol:.2%}"
+        k = self.refine_stall_iters
+        if k and len(self.lb_hist) >= k and self.ub_hist:
+            gap = (min(self.ub_hist[-k:]) - lb_now) / max(1.0, abs(min(self.ub_hist[-k:])))
+            rise = (lb_now - self.lb_hist[-k]) / max(1.0, abs(lb_now))
+            if gap < REFINE_STALL_MAX_GAP and rise < self.refine_stall_tol:
+                return f"lower bound rose {rise:.1e} < {self.refine_stall_tol:g} over {k} iterations at gap {gap:.2%}"
+        return None
+
     def _investment_repeated(self, investments_iter_k, investments_all):
         # adapt-G-S rebuilds the master under a new grouping every iteration, so it can cycle
         # through several investments; treat a return to ANY earlier investment as stalled.
@@ -1539,6 +1572,7 @@ class BendersSolver():
         wall_limit = 3600.0               # one hour per sample
         t_start = time.time()
         self.hit_time_limit = False
+        unit_cap = np.array([float(data.pUnitCap[g]) for g in data.G])   # MW per unit, for refine_change_tol
         self._last_master_stats = None
         upper_bound, lower_bound = np.inf, -np.inf
 
@@ -1598,6 +1632,7 @@ class BendersSolver():
                 investments_all.append(investments_iter_k)
             elif self.exact == False and i > 0 and self._investment_repeated(investments_iter_k, investments_all):
                 print("!! Investments are the same as last iteration")
+                self.refine_reason = "investment repeated"
                 if self.exact_refinement:
                     self.exact = True
                 else:
@@ -1611,6 +1646,20 @@ class BendersSolver():
                 # if self.exact == False:
                 #     # print("!! !! Different investments than last iteration")
                 investments_all.append(investments_iter_k)
+                if self.exact == False and i > 0 and not in_lp:
+                    _lb = getattr(self, "_last_master_bound", None)
+                    lb_now = max(self.best_lower_bound, _lb if _lb is not None else sum(obj_val_master))
+                    reason = self._refine_trigger(investments_all, lb_now, unit_cap)
+                    if reason:
+                        self.refine_reason = reason
+                        print(f"[benders] inexact phase converged in practice: {reason}; "
+                              + ("switching to exact refinement" if self.exact_refinement
+                                 else "stopping (exact refinement is off)"), flush=True)
+                        if self.exact_refinement:
+                            self.exact = True
+                        else:
+                            lower_bound = self._lower_bound(obj_val_master)
+                            break
             
             if self.exact:
                 self.exact_iterations += 1
@@ -1833,7 +1882,9 @@ if __name__ == "__main__":
     by default solve direct is False
     '''
     ## Step 1: parse the input data
-    parser = argparse.ArgumentParser()
+    #! No abbreviated options: argparse would otherwise read e.g. --sample as --sample-duration
+    #! (or refuse it as ambiguous), and a typo could silently set a different option.
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument(
         "-s", "--solve-direct",
         action="store_true",
@@ -1975,11 +2026,45 @@ if __name__ == "__main__":
              "master repeats an investment.",
     )
     parser.add_argument(
+        "--refine-change-tol", "--refine_change_tol",
+        dest="refine_change_tol",
+        type=float,
+        default=None,
+        help="Inexact phase: switch to exact refinement once the investment moves by less than "
+             "this share of built capacity (MW) between iterations, e.g. 0.01. Unset: only an "
+             "exactly repeated investment ends the inexact phase.",
+    )
+    parser.add_argument(
+        "--refine-stall-iters", "--refine_stall_iters",
+        dest="refine_stall_iters",
+        type=int,
+        default=None,
+        help=f"Inexact phase: switch to exact refinement once the lower bound has risen by less "
+             f"than --refine-stall-tol over this many iterations, counted only once the inexact "
+             f"gap is below {REFINE_STALL_MAX_GAP * 100:g}%%. Unset: off.",   # %% : argparse formats help
+    )
+    parser.add_argument(
+        "--refine-stall-tol", "--refine_stall_tol",
+        dest="refine_stall_tol",
+        type=float,
+        default=None,
+        help="Relative lower-bound rise that counts as a stall (default 1e-4).",
+    )
+    parser.add_argument(
         "--benders-setup", "--benders_setup",
         dest="benders_setup",
         choices=["Exact", "Inexact", "Inexact_Refine", "All"],
         default=None,
         help="Override Benders_args.benders_setup. Left unset, uses the config.",
+    )
+    parser.add_argument(
+        "--samples",
+        dest="samples",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Solve only these samples (0-based), e.g. --samples 2, to rerun or debug one "
+             "instance. Default: every sample of the year.",
     )
     parser.add_argument(
         "--specific-name", "--specific_name",
@@ -2062,6 +2147,10 @@ if __name__ == "__main__":
     if RAMP_B > 1 and not args_cli.solve_direct and args["Benders_args"]["benders_setup"] != "Exact":
         raise SystemExit("--ramp-block-hours needs --benders-setup Exact: the PDL nets predict "
                          "single hours and have no ramp rows.")
+    for _key in ("refine_change_tol", "refine_stall_iters", "refine_stall_tol"):
+        if getattr(args_cli, _key) is not None:
+            args["Benders_args"][_key] = getattr(args_cli, _key)
+            print(f"[override] {_key} = {getattr(args_cli, _key)}")
     if args_cli.no_lp_phase:
         args["Benders_args"]["lp_phase_tol"] = None
         print("[override] lp_phase_tol = None (no LP phase)")
@@ -2350,6 +2439,9 @@ if __name__ == "__main__":
 
             # experiment_data = {"opt_obj": [], "upper_bound": [], "lower_bound": [], "total_iterations": [], "exact_iterations": [], "inexact_iterations": [], "total_time": [], "total_time_master": [], "total_time_subproblem_exact": [], "total_time_subproblem_pdl": []}
             samples = 8760 // benders_args["sample_duration"] # SAMPLE
+            sample_ids = list(range(samples)) if args_cli.samples is None else args_cli.samples
+            if any(not 0 <= s_ < samples for s_ in sample_ids):
+                raise SystemExit(f"--samples {args_cli.samples}: this run has samples 0..{samples - 1}.")
             # sample = 0
             for (start_exact, exact_refinement) in benders_setups:
                 all_results = []
@@ -2363,6 +2455,9 @@ if __name__ == "__main__":
                     master_mip_gap=args["Benders_args"].get("master_mip_gap", MASTER_MIP_GAP),
                     lp_phase_tol=args["Benders_args"].get("lp_phase_tol"),
                     lp_phase_max_iters=args["Benders_args"].get("lp_phase_max_iters", 50),
+                    refine_change_tol=args["Benders_args"].get("refine_change_tol"),
+                    refine_stall_iters=args["Benders_args"].get("refine_stall_iters"),
+                    refine_stall_tol=args["Benders_args"].get("refine_stall_tol", 1e-4),
                 )
                 #! The tolerance profile goes into every result row, so a table can say what it compares.
                 tol_profile = {
@@ -2370,10 +2465,12 @@ if __name__ == "__main__":
                     "benders_rel_tol": BENDERS_REL_TOL,
                     "master_mip_gap": solver_kwargs["master_mip_gap"],
                     "lp_phase_tol": solver_kwargs["lp_phase_tol"],
+                    "refine_change_tol": solver_kwargs["refine_change_tol"],
+                    "refine_stall_iters": solver_kwargs["refine_stall_iters"],
                     "numeric_tol": NUMERIC_TOL,
                 }
                 for repeat in range(1):
-                    for sample in range(samples):
+                    for sample in sample_ids:
                         if args_cli.solve_direct:
                             # Solve Directly with Solver
                             primal_net = None
@@ -2536,6 +2633,8 @@ if __name__ == "__main__":
                                 **tol_profile,
                                 #! Whole solve_with_benders, Pyomo bookkeeping and cut building included.
                                 "wall_time": solver.wall_time,
+                                #! What ended the inexact phase: "investment repeated", or the practical trigger.
+                                "refine_reason": solver.refine_reason,
                             }
                             all_results.append(result)
                             # break

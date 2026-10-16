@@ -196,6 +196,16 @@ For the first iterations the master's investments are **continuous**, so each ma
 
 The iteration log marks LP-phase iterations in the `lp_phase` column. `gen_GEP/solve_for_train.py` does not use the LP phase, so harvested trajectories stay integer.
 
+### When the inexact phase ends
+By default, exact refinement starts when the master proposes **exactly** the same investment twice. With surrogate cuts the master often keeps moving a few units back and forth instead, so that can take very long, or never happen. Two optional triggers end the phase earlier. Both are off by default and inactive during the LP phase.
+
+| Flag | Ends the inexact phase when |
+|---|---|
+| `--refine-change-tol 0.01` | the investment moved by less than 1 % of built capacity (MW, summed over generators) since the last iteration |
+| `--refine-stall-iters 5` (`--refine-stall-tol 1e-4`) | the lower bound rose by less than 1e-4 over the last 5 iterations, counted only once the inexact UB−LB gap is below 1 % |
+
+Either trigger acts like a repeated investment: switch to exact refinement, or stop in pure `Inexact` mode. The result rows record what ended the phase in `refine_reason`.
+
 ### One solver profile for every model
 Every model in a run uses the same solver and the same parameters, so the direct solve and Benders compare like for like:
 - **Applies to:** the direct solve, the master, the subproblem LPs, and the gap-gate re-solves.
