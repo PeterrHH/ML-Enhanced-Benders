@@ -307,6 +307,13 @@ LP_PHASE_TOL = 1e-3
 #! still far from converged (one generator at a time, before the cuts say anything).
 REFINE_STALL_MAX_GAP = 0.01
 
+#! Default exact-refinement switch of a gep_benders.py run: the inexact phase ends once its UB-LB
+#! gap is below this. Surrogate cuts stall at the surrogate's own error level (0.4-0.8 % at 12
+#! nodes), far above LP_PHASE_TOL, so without it the switch waits for a repeated investment and
+#! spends integer masters that cannot move the lower bound. Off with --refine-gap-tol 0 (or
+#! "refine_gap_tol": null in Benders_args); BendersSolver itself defaults to off.
+REFINE_GAP_TOL = 1e-2
+
 #! Cut groupings that are built once and never revisited. Because the groups are
 #! fixed, these carry one recourse variable per group rather than per hour.
 STATIC_GROUPED_CUTS = ("full", "kmeans")
@@ -433,7 +440,8 @@ class BendersSolver():
                  gap_gate_threshold=None, gap_gate_action="resolve",
                  solver="gurobi", solver_log_dir=None, solver_tee=False, dump_master=False,
                  master_mip_gap=MASTER_MIP_GAP, lp_phase_tol=None, lp_phase_max_iters=50,
-                 refine_change_tol=None, refine_stall_iters=None, refine_stall_tol=1e-4):
+                 refine_change_tol=None, refine_stall_iters=None, refine_stall_tol=1e-4,
+                 refine_gap_tol=None):
 
         self.gep_data = gep_data
         self.operational_data = operational_data
@@ -541,6 +549,10 @@ class BendersSolver():
         self.refine_change_tol = None if refine_change_tol is None else float(refine_change_tol)
         self.refine_stall_iters = None if not refine_stall_iters else int(refine_stall_iters)
         self.refine_stall_tol = float(refine_stall_tol)
+        #! refine_gap_tol: the inexact UB-LB gap is below this, checked in the LP phase as well.
+        #! When set, the LP phase also never hands over to the integer master on surrogate cuts:
+        #! if it would end while still inexact, the run switches to exact cuts first.
+        self.refine_gap_tol = float(refine_gap_tol) if refine_gap_tol else None
         self.refine_reason = None
         self._num_cuts_in_master = 0  # how many cuts already added
         self._cut_stats = []          # per cut in the master: (min |slope|, max |slope|, |rhs|)
@@ -979,6 +991,14 @@ class BendersSolver():
         self._lp_phase = False
         print(f"[benders] LP phase done after {self._lp_iters} LP masters ({reason}); "
               f"master is integer from now on, with all {self._num_cuts_in_master} cuts", flush=True)
+
+    def _switch_to_exact(self, reason):
+        """End the inexact phase: from the next iteration on, subproblems are solved exactly."""
+        self.refine_reason = reason
+        self.exact = True
+        print(f"[benders] inexact phase converged in practice: {reason}; switching to exact "
+              f"refinement" + (" (LP phase continues on exact cuts)" if self._lp_phase else ""),
+              flush=True)
 
     def _master_log_path(self, sample, it, ext):
         """<solver_log_dir>/master_sample<s>_iter<i>.<ext>, or None when logging is off.
@@ -1783,9 +1803,22 @@ class BendersSolver():
                     # Add Benders cut of current iteration to list
                     self._update_cut_list(benders_cut_all, benders_cuts)
                     print(f"Subproblems solved. Added {len(benders_cuts)} Benders cuts.")
+            #! Gap switch to exact refinement, in the LP phase too. sub_exact: whether this
+            #! iteration's cuts (and so its gap) came from exact subproblems.
+            gap_now = (upper_bound - lower_bound) / max(1.0, abs(upper_bound))
+            sub_exact = self.exact
+            gap_switch = self.refine_gap_tol is not None and self.exact_refinement
+            if gap_switch and not sub_exact and i > 0 and gap_now < self.refine_gap_tol:
+                self._switch_to_exact(f"gap {gap_now:.1e} < {self.refine_gap_tol:g}")
             if in_lp and i > 0:
-                lp_gap = (upper_bound - lower_bound) / max(1.0, abs(upper_bound))
-                if lp_gap < self.lp_phase_tol:
+                lp_gap = gap_now
+                lp_done = (lp_gap < self.lp_phase_tol or lp_repeated
+                           or self._lp_iters >= self.lp_phase_max_iters)
+                if gap_switch and not sub_exact and lp_done:
+                    #! Never go integer on surrogate cuts: stay in the LP phase on exact cuts.
+                    if not self.exact:
+                        self._switch_to_exact("LP phase ended inexact")
+                elif lp_gap < self.lp_phase_tol:
                     self._end_lp_phase(f"relaxation gap {lp_gap:.1e} < {self.lp_phase_tol:g}")
                 elif lp_repeated:
                     self._end_lp_phase("investment repeated")
@@ -2026,6 +2059,15 @@ if __name__ == "__main__":
              "master repeats an investment.",
     )
     parser.add_argument(
+        "--refine-gap-tol", "--refine_gap_tol",
+        dest="refine_gap_tol",
+        type=float,
+        default=None,
+        help=f"Inexact phase: switch to exact refinement once the UB-LB gap is below this, in the "
+             f"LP phase too; the LP phase then also never ends on surrogate cuts. "
+             f"Default {REFINE_GAP_TOL:g}, or Benders_args.refine_gap_tol; 0: off.",
+    )
+    parser.add_argument(
         "--refine-change-tol", "--refine_change_tol",
         dest="refine_change_tol",
         type=float,
@@ -2147,7 +2189,7 @@ if __name__ == "__main__":
     if RAMP_B > 1 and not args_cli.solve_direct and args["Benders_args"]["benders_setup"] != "Exact":
         raise SystemExit("--ramp-block-hours needs --benders-setup Exact: the PDL nets predict "
                          "single hours and have no ramp rows.")
-    for _key in ("refine_change_tol", "refine_stall_iters", "refine_stall_tol"):
+    for _key in ("refine_gap_tol", "refine_change_tol", "refine_stall_iters", "refine_stall_tol"):
         if getattr(args_cli, _key) is not None:
             args["Benders_args"][_key] = getattr(args_cli, _key)
             print(f"[override] {_key} = {getattr(args_cli, _key)}")
@@ -2159,6 +2201,7 @@ if __name__ == "__main__":
         print(f"[override] lp_phase_tol = {args_cli.lp_phase_tol}")
     #! On by default; a config can switch it off with "lp_phase_tol": null.
     args["Benders_args"].setdefault("lp_phase_tol", LP_PHASE_TOL)
+    args["Benders_args"].setdefault("refine_gap_tol", REFINE_GAP_TOL)
     if args_cli.lp_phase_max_iters is not None:
         args["Benders_args"]["lp_phase_max_iters"] = args_cli.lp_phase_max_iters
         print(f"[override] lp_phase_max_iters = {args_cli.lp_phase_max_iters}")
@@ -2458,6 +2501,7 @@ if __name__ == "__main__":
                     refine_change_tol=args["Benders_args"].get("refine_change_tol"),
                     refine_stall_iters=args["Benders_args"].get("refine_stall_iters"),
                     refine_stall_tol=args["Benders_args"].get("refine_stall_tol", 1e-4),
+                    refine_gap_tol=args["Benders_args"].get("refine_gap_tol"),
                 )
                 #! The tolerance profile goes into every result row, so a table can say what it compares.
                 tol_profile = {
@@ -2465,6 +2509,7 @@ if __name__ == "__main__":
                     "benders_rel_tol": BENDERS_REL_TOL,
                     "master_mip_gap": solver_kwargs["master_mip_gap"],
                     "lp_phase_tol": solver_kwargs["lp_phase_tol"],
+                    "refine_gap_tol": solver_kwargs["refine_gap_tol"] or None,
                     "refine_change_tol": solver_kwargs["refine_change_tol"],
                     "refine_stall_iters": solver_kwargs["refine_stall_iters"],
                     "numeric_tol": NUMERIC_TOL,

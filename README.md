@@ -184,7 +184,7 @@ If `primal_net_directory` points at a flow-first run (one with `model.pt`), `gep
 ### LP phase (on by default)
 For the first iterations the master's investments are **continuous**, so each master is a cheap LP. When the relaxed problem's gap drops below **1e-3**, the investments become integer and **all cuts are kept**.
 - This is safe: every cut is valid for any u, and the LP master's bound is a valid lower bound.
-- During the LP phase, the stopping tests and the switch to exact refinement wait for the integer phase, because an upper bound at a fractional u is not a buildable investment.
+- During the LP phase, the stopping tests wait for the integer phase, because an upper bound at a fractional u is not a buildable investment. The gap switch to exact refinement does not wait (see below).
 - The phase also ends when the LP master repeats an investment, or after `--lp-phase-max-iters` (default 50) LP iterations.
 - On 3 nodes it cut master solver time roughly in half for `full` cuts and by about 70 % for `kmeans` cuts. `single` cuts converge slowly even as an LP and often reach the 50-iteration cap.
 
@@ -197,14 +197,21 @@ For the first iterations the master's investments are **continuous**, so each ma
 The iteration log marks LP-phase iterations in the `lp_phase` column. `gen_GEP/solve_for_train.py` does not use the LP phase, so harvested trajectories stay integer.
 
 ### When the inexact phase ends
-By default, exact refinement starts when the master proposes **exactly** the same investment twice. With surrogate cuts the master often keeps moving a few units back and forth instead, so that can take very long, or never happen. Two optional triggers end the phase earlier. Both are off by default and inactive during the LP phase.
+**Default: on a gap tolerance.** Exact refinement starts as soon as the inexact UB−LB gap is below **1e-2** (`--refine-gap-tol`, key `refine_gap_tol`; `0` turns it off).
+- **Why:** surrogate cuts cannot close the gap below the surrogate's own error. On 12 nodes that error is 0.4–0.8 %, above the LP-phase tolerance, so the inexact gap stalls there. Waiting for a repeated investment instead spent integer masters of 50–110 s each that raised the lower bound by only 0.002 %, plus one more master just to detect the repeat.
+- **The check also runs during the LP phase.** After the switch the LP phase continues on exact cuts and ends as usual.
+- **Fallback:** if the LP phase would end while still inexact (a repeated investment or the iteration cap), the run switches to exact first. So the integer master never runs on surrogate cuts.
+- **Without the tolerance**, exact refinement starts only when the master proposes **exactly** the same investment twice. With surrogate cuts the master often keeps moving a few units back and forth, so that can take very long.
+
+Two more optional triggers are off by default and inactive during the LP phase:
 
 | Flag | Ends the inexact phase when |
 |---|---|
+| `--refine-gap-tol 1e-2` (default) | the inexact UB−LB gap is below 1 % (also in the LP phase) |
 | `--refine-change-tol 0.01` | the investment moved by less than 1 % of built capacity (MW, summed over generators) since the last iteration |
 | `--refine-stall-iters 5` (`--refine-stall-tol 1e-4`) | the lower bound rose by less than 1e-4 over the last 5 iterations, counted only once the inexact UB−LB gap is below 1 % |
 
-Either trigger acts like a repeated investment: switch to exact refinement, or stop in pure `Inexact` mode. The result rows record what ended the phase in `refine_reason`.
+Every trigger switches to exact refinement. The change and stall triggers stop the run instead in pure `Inexact` mode; the gap tolerance does nothing there. The result rows record what ended the phase in `refine_reason`, and the tolerance in `refine_gap_tol`.
 
 ### One solver profile for every model
 Every model in a run uses the same solver and the same parameters, so the direct solve and Benders compare like for like:
