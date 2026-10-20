@@ -166,7 +166,7 @@ If `primal_net_directory` points at a flow-first run (one with `model.pt`), `gep
 | Mode | How to select | What solves the subproblems |
 |---|---|---|
 | Exact Benders | `--benders-setup Exact` | the LP solver, every iteration |
-| Inexact Benders with refinement | `--benders-setup Inexact_Refine` | the surrogate until the master repeats an investment, then the LP solver |
+| Inexact Benders with refinement | `--benders-setup Inexact_Refine` | the surrogate until the gap switch (see below), then the LP solver |
 | Inexact Benders | `--benders-setup Inexact` | the surrogate only |
 | All three | `--benders-setup All` | runs Exact, Inexact and Inexact_Refine one after another |
 | Direct solve | `-s` / `--solve-direct` | the full GEP as one MIP, no decomposition |
@@ -178,20 +178,23 @@ If `primal_net_directory` points at a flow-first run (one with `model.pt`), `gep
   - Without ramping: one dispatch LP per hour.
   - With ramping: one LP per block of B hours.
   - One persistent model is re-solved with new right-hand sides.
-- **Stopping rule:** the run stops when `(UB − LB) / max(1, |UB|) ≤ 1e-4`. The lower bound is the master's bound; the upper bound is investment cost plus the subproblem costs.
+- **Stopping rule:** the run stops when `(UB* − LB) / max(1, |UB*|) ≤ 1e-4`, the same criterion as the direct solve's MIP gap.
+  - LB is the master's bound.
+  - UB* is the best integer, exactly evaluated plan so far (investment cost plus subproblem costs).
+  - Results report UB* and its investment.
+- **Thesis algorithm:** the code follows "Inexact Benders with exact refinement, LP warm start and gap switch" in the thesis. Master gap ε_M ≤ ε; no LP-iteration cap.
 - **Limits:** one hour of wall-clock time per sample. The master's own time limit is the time remaining.
 
 ### LP phase (on by default)
 For the first iterations the master's investments are **continuous**, so each master is a cheap LP. When the relaxed problem's gap drops below **1e-3**, the investments become integer and **all cuts are kept**.
 - This is safe: every cut is valid for any u, and the LP master's bound is a valid lower bound.
 - During the LP phase, the stopping tests wait for the integer phase, because an upper bound at a fractional u is not a buildable investment. The gap switch to exact refinement does not wait (see below).
-- The phase also ends when the LP master repeats an investment, or after `--lp-phase-max-iters` (default 50) LP iterations.
-- On 3 nodes it cut master solver time roughly in half for `full` cuts and by about 70 % for `kmeans` cuts. `single` cuts converge slowly even as an LP and often reach the 50-iteration cap.
+- The phase also ends when the LP master repeats an investment. There is no iteration cap.
+- On 3 nodes it cut master solver time roughly in half for `full` cuts and by about 70 % for `kmeans` cuts. `single` cuts converge slowly even as an LP.
 
 | Flag / key | Effect |
 |---|---|
 | `--lp-phase-tol 1e-3` / `lp_phase_tol` | gap of the relaxed problem at which the master turns integer (default 1e-3) |
-| `--lp-phase-max-iters 50` / `lp_phase_max_iters` | safety cap on LP iterations |
 | `--no-lp-phase` / `"lp_phase_tol": null` | integer master from the first iteration |
 
 The iteration log marks LP-phase iterations in the `lp_phase` column. `gen_GEP/solve_for_train.py` does not use the LP phase, so harvested trajectories stay integer.
@@ -200,7 +203,7 @@ The iteration log marks LP-phase iterations in the `lp_phase` column. `gen_GEP/s
 **Default: on a gap tolerance.** Exact refinement starts as soon as the inexact UB−LB gap is below **1e-2** (`--refine-gap-tol`, key `refine_gap_tol`; `0` turns it off).
 - **Why:** surrogate cuts cannot close the gap below the surrogate's own error. On 12 nodes that error is 0.4–0.8 %, above the LP-phase tolerance, so the inexact gap stalls there. Waiting for a repeated investment instead spent integer masters of 50–110 s each that raised the lower bound by only 0.002 %, plus one more master just to detect the repeat.
 - **The check also runs during the LP phase.** After the switch the LP phase continues on exact cuts and ends as usual.
-- **Fallback:** if the LP phase would end while still inexact (a repeated investment or the iteration cap), the run switches to exact first. So the integer master never runs on surrogate cuts.
+- **Fallback:** if the LP phase would end while still inexact (its gap below 1e-3 or a repeated investment), the run switches to exact first. So the integer master never runs on surrogate cuts.
 - **Without the tolerance**, exact refinement starts only when the master proposes **exactly** the same investment twice. With surrogate cuts the master often keeps moving a few units back and forth, so that can take very long.
 
 Two more optional triggers are off by default and inactive during the LP phase:
@@ -220,7 +223,9 @@ Every model in a run uses the same solver and the same parameters, so the direct
 - **Parameters:** 1 thread, seed 0, primal and dual feasibility tolerances 1e-9.
 - **Gaps:**
   - Direct solve: MIP gap **1e-4**, the same tolerance Benders certifies.
-  - Benders master: MIP gap **1e-5** (`--master-mip-gap`; must stay below 1e-4).
+  - Benders master: MIP gap **1e-5** (`--master-mip-gap`; at most 1e-4).
+  - Why up to 1e-4 is enough: the master only has to be ε-optimal (Geoffrion & Graves 1974), and LB is its bound, valid at any gap. At the master's plan x, UB − LB = cut error at x + master gap.
+  - The default (1e-4 vs 5e-5) is to be set from the 12-node test.
 - **Precision:** all matrices are built in float64.
 
 ### Timing

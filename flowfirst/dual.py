@@ -506,12 +506,28 @@ class FlowFirstPrimal:
         self.net, self.data, self.sweeps = net, data, polish_sweeps
         self.fill = MeritOrderFill(data)
         self.polish = Polish(data) if polish_sweeps else None
+        self._cache = None   # (X, key, f, f's version) of the last flows() call
+
+    def _cache_key(self, X):
+        """What the flows of X depend on besides its values: X and the weights unchanged in place
+        (torch bumps a tensor's _version on every in-place write), and the sweep count."""
+        return (X._version, self.sweeps, tuple(p._version for p in self.net.parameters()))
 
     def flows(self, X):
+        """Polished flows of X. Benders calls primal_net(X) and then dual_net(X) on the same X,
+        and both need these flows: the second call reuses them instead of running the network
+        and the polish again. A hit needs the very same tensor object, unchanged in place, so a
+        new X is always recomputed; flows modified in place by a caller are detected and
+        recomputed too. Inference-mode tensors carry no version counter and are never cached."""
+        if self._cache is not None and not X.is_inference():
+            X0, key0, f0, f0_version = self._cache
+            if X is X0 and self._cache_key(X) == key0 and f0._version == f0_version:
+                return f0
         with torch.no_grad():
             f = self.net(X)[2]
             if self.polish is not None:
                 f, _ = self.polish(X, f, self.sweeps)
+        self._cache = None if (X.is_inference() or f.is_inference()) else (X, self._cache_key(X), f, f._version)
         return f
 
     def __call__(self, X, total_demands=None):
@@ -538,6 +554,7 @@ class FlowFirstDual:
 
     def __call__(self, X):
         with torch.no_grad():
+            # the primal's flows of this X: computed once per Benders iteration (see FlowFirstPrimal.flows)
             lam = self.recovery.prices(X, self.primal.flows(X), self.sweeps)
         return self.recovery.completion(lam), -lam
 

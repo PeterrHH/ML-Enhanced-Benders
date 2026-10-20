@@ -289,10 +289,11 @@ NUMERIC_TOL = 1e-9
 #! so both certify the same optimality.
 BENDERS_REL_TOL = 1e-4
 
-#! Master MIP gap, the same in the inexact and exact phases. The lower bound is the
-#! master's bound, so it is valid at any gap; the gap only has to sit below the
-#! Benders certificate for the incumbent to let UB-LB close. A tighter gap only makes
-#! every master slower.
+#! Master MIP gap, the same in the inexact and exact phases (an epsilon-optimal master,
+#! Geoffrion & Graves 1974). The lower bound is the master's bound, so it is valid at any
+#! gap. At the master's plan x, UB - LB = (cut error at x) + (master gap), so any gap up to
+#! BENDERS_REL_TOL gives the direct solve's certificate; at equality a new plan with cut
+#! error can cost an extra iteration. A tighter gap only makes every master slower.
 MASTER_MIP_GAP = BENDERS_REL_TOL / 10
 
 #! Default LP phase of a gep_benders.py run: the master's u stays continuous until the relaxed
@@ -439,7 +440,7 @@ class BendersSolver():
                  dynamic_cluster_features="price", env=None,
                  gap_gate_threshold=None, gap_gate_action="resolve",
                  solver="gurobi", solver_log_dir=None, solver_tee=False, dump_master=False,
-                 master_mip_gap=MASTER_MIP_GAP, lp_phase_tol=None, lp_phase_max_iters=50,
+                 master_mip_gap=MASTER_MIP_GAP, lp_phase_tol=None,
                  refine_change_tol=None, refine_stall_iters=None, refine_stall_tol=1e-4,
                  refine_gap_tol=None):
 
@@ -456,6 +457,7 @@ class BendersSolver():
         self.pWeight = self.gep_data.pWeight 
         self.max_investment = max_investment
         self.best_upper_bound = np.inf
+        self.best_investment = None   # investment of best_upper_bound
         self.best_lower_bound = -np.inf
 
         self.cut_selection = cut_selection
@@ -526,8 +528,8 @@ class BendersSolver():
         self._master_opt = None
         self._master_time_limit = 3600.0  # safety net; solve_with_benders tightens it to the remaining wall-clock
         self._master_mip_gap = float(master_mip_gap)
-        if not 0.0 <= self._master_mip_gap < BENDERS_REL_TOL:
-            raise ValueError(f"master_mip_gap={master_mip_gap} must be below the Benders stopping "
+        if not 0.0 <= self._master_mip_gap <= BENDERS_REL_TOL:
+            raise ValueError(f"master_mip_gap={master_mip_gap} must be at most the Benders stopping "
                              f"tolerance {BENDERS_REL_TOL:g}, or UB-LB cannot close.")
         #! LP phase (two-phase Benders): the master's u is continuous until the relaxed problem
         #! is solved to lp_phase_tol, so the first cuts come from cheap LP masters; then u turns
@@ -535,7 +537,6 @@ class BendersSolver():
         #! valid lower bound, so only the stopping tests (and the incumbent upper bound, whose u
         #! is fractional) wait for the integer phase. None: integer from the start, as before.
         self.lp_phase_tol = None if lp_phase_tol is None else float(lp_phase_tol)
-        self.lp_phase_max_iters = int(lp_phase_max_iters)
         self._lp_phase = self.lp_phase_tol is not None
         self._lp_iters = 0
         self.lp_phase_hist = []
@@ -1770,6 +1771,7 @@ class BendersSolver():
                 # print("Found upper bound:",upper_bound)
                 if upper_bound < self.best_upper_bound:
                     self.best_upper_bound = upper_bound
+                    self.best_investment = investments_iter_k.clone()
 
                 same_investment = (
                     len(investments_all) >= 2
@@ -1781,11 +1783,14 @@ class BendersSolver():
                 )
 
 
-                if (upper_bound - lower_bound) / max(1.0, abs(upper_bound)) < rel_tol:
+                #! Stop on the best integer plan so far (the Benders upper bound), with <=: the
+                #! same criterion as the direct solve's MIP gap.
+                best_ub = self.best_upper_bound
+                if (best_ub - lower_bound) / max(1.0, abs(best_ub)) <= rel_tol:
                     optimal = True
                     print('Done! Optimal solution found')
                     print('Total number of iterations needed:', i)
-                    print('Optimal objective value:', upper_bound)
+                    print('Optimal objective value:', best_ub)
                 elif same_investment:
                     optimal = True
                     print('Done! Investment repeated in exact mode.')
@@ -1812,8 +1817,7 @@ class BendersSolver():
                 self._switch_to_exact(f"gap {gap_now:.1e} < {self.refine_gap_tol:g}")
             if in_lp and i > 0:
                 lp_gap = gap_now
-                lp_done = (lp_gap < self.lp_phase_tol or lp_repeated
-                           or self._lp_iters >= self.lp_phase_max_iters)
+                lp_done = lp_gap < self.lp_phase_tol or lp_repeated
                 if gap_switch and not sub_exact and lp_done:
                     #! Never go integer on surrogate cuts: stay in the LP phase on exact cuts.
                     if not self.exact:
@@ -1822,8 +1826,6 @@ class BendersSolver():
                     self._end_lp_phase(f"relaxation gap {lp_gap:.1e} < {self.lp_phase_tol:g}")
                 elif lp_repeated:
                     self._end_lp_phase("investment repeated")
-                elif self._lp_iters >= self.lp_phase_max_iters:
-                    self._end_lp_phase(f"cap of {self.lp_phase_max_iters} reached, relaxation gap still {lp_gap:.1e}")
             self.wall_master_hist.append(
                             float(inference_time_master) if i > 0 else 0.0
                         )
@@ -1834,6 +1836,9 @@ class BendersSolver():
         #! Everything solve_with_benders spent, Pyomo bookkeeping, clustering and cut
         #! building included -- next to total_time, which only sums solver calls.
         self.wall_time = time.time() - t_start
+        #! Report the best integer plan found, not merely the last one evaluated.
+        if np.isfinite(self.best_upper_bound):
+            upper_bound = self.best_upper_bound
         return upper_bound, lower_bound, benders_cut_all, investments_all, obj_val_subproblems_all, i
     
 
@@ -2032,7 +2037,7 @@ if __name__ == "__main__":
         type=float,
         default=None,
         help=f"Override Benders_args.master_mip_gap: the master's relative MIP gap in both "
-             f"phases. Must be below the Benders stopping tolerance {BENDERS_REL_TOL:g}. "
+             f"phases. At most the Benders stopping tolerance {BENDERS_REL_TOL:g}. "
              f"Default {MASTER_MIP_GAP:g}.",
     )
     parser.add_argument(
@@ -2049,14 +2054,6 @@ if __name__ == "__main__":
         dest="no_lp_phase",
         action="store_true",
         help="Integer master from the first iteration (no LP phase).",
-    )
-    parser.add_argument(
-        "--lp-phase-max-iters", "--lp_phase_max_iters",
-        dest="lp_phase_max_iters",
-        type=int,
-        default=None,
-        help="Safety cap on LP-phase iterations (default 50); the phase also ends when the LP "
-             "master repeats an investment.",
     )
     parser.add_argument(
         "--refine-gap-tol", "--refine_gap_tol",
@@ -2202,9 +2199,6 @@ if __name__ == "__main__":
     #! On by default; a config can switch it off with "lp_phase_tol": null.
     args["Benders_args"].setdefault("lp_phase_tol", LP_PHASE_TOL)
     args["Benders_args"].setdefault("refine_gap_tol", REFINE_GAP_TOL)
-    if args_cli.lp_phase_max_iters is not None:
-        args["Benders_args"]["lp_phase_max_iters"] = args_cli.lp_phase_max_iters
-        print(f"[override] lp_phase_max_iters = {args_cli.lp_phase_max_iters}")
     if args_cli.master_mip_gap is not None:
         args["Benders_args"]["master_mip_gap"] = args_cli.master_mip_gap
         print(f"[override] master_mip_gap = {args_cli.master_mip_gap}")
@@ -2497,7 +2491,6 @@ if __name__ == "__main__":
                     dump_master=args_cli.dump_master,
                     master_mip_gap=args["Benders_args"].get("master_mip_gap", MASTER_MIP_GAP),
                     lp_phase_tol=args["Benders_args"].get("lp_phase_tol"),
-                    lp_phase_max_iters=args["Benders_args"].get("lp_phase_max_iters", 50),
                     refine_change_tol=args["Benders_args"].get("refine_change_tol"),
                     refine_stall_iters=args["Benders_args"].get("refine_stall_iters"),
                     refine_stall_tol=args["Benders_args"].get("refine_stall_tol", 1e-4),
@@ -2669,7 +2662,8 @@ if __name__ == "__main__":
                                 "total_time_subproblem_exact": solver.total_time_subproblem_exact,
                                 "total_time_subproblem_pdl": solver.total_time_subproblem_pdl,
                                 "hit_time_limit": solver.hit_time_limit,
-                                "investments": investments_all[-1].tolist() if len(investments_all) > 0 else None,
+                                "investments": (solver.best_investment.tolist() if solver.best_investment is not None
+                                                else investments_all[-1].tolist() if len(investments_all) > 0 else None),
                                 "has_crossover": crossover_metrics["has_crossover"],
                                 "lb_cross": crossover_metrics["lb_cross"],
                                 "gap_cross_pct": crossover_metrics["gap_cross_pct"],

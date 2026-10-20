@@ -9,7 +9,8 @@ import pytest
 import torch
 
 from flowfirst.dataset import CONFIG_DIR, dataset_path, load_or_create
-from flowfirst.dual import DualRecovery, GraphedPrimalDual, PathPolish, Polish, PrimalDual, cast_net
+from flowfirst.dual import (DualRecovery, FlowFirstDual, FlowFirstPrimal, GraphedPrimalDual, PathPolish, Polish,
+                            PrimalDual, cast_net)
 from flowfirst.train import build_net, line_bounds
 
 torch.set_default_dtype(torch.float64)
@@ -243,3 +244,72 @@ def test_reduced_precision_network_keeps_float64_bounds(problem, labels, dtype):
     assert torch.allclose(out.primal, data.obj_fn(X, out.y))
     assert (out.dual <= obj * (1 + 1e-9)).all()
     assert (out.certificate >= (out.primal - obj) / obj - 1e-9).all()
+
+
+def count_calls(net):
+    """A function returning how often `net` has run its forward pass since this call."""
+    n = [0]
+    net.register_forward_hook(lambda *_: n.__setitem__(0, n[0] + 1))
+    return lambda: n[0]
+
+
+def benders_pair(problem, X, sweeps=1):
+    """The (primal_net, dual_net) adapters as load_flowfirst_pair builds them: the dual shares the primal."""
+    data, _ = problem
+    net = small_net(problem, X)
+    primal = FlowFirstPrimal(net, data, sweeps)
+    return net, primal, FlowFirstDual(primal, data)
+
+
+def test_benders_adapters_run_the_network_once_per_iteration(problem, labels):
+    """gep_benders calls primal_net(X) and then dual_net(X) on the same X; the dual reuses the primal's flows, so
+    the network and the polish run once, and every output is bit-identical to running each adapter on its own."""
+    data, _ = problem
+    X = labels[0]
+    net, primal, dual = benders_pair(problem, X)
+    calls = count_calls(net)
+    y = primal(X)
+    mu, lam = dual(X)
+    assert calls() == 1
+    # reference: adapters with nothing to share, on a separate copy of X
+    y_ref = FlowFirstPrimal(net, data, 1)(X.clone())
+    mu_ref, lam_ref = FlowFirstDual(FlowFirstPrimal(net, data, 1), data)(X.clone())
+    assert calls() == 3
+    assert torch.equal(y, y_ref) and torch.equal(mu, mu_ref) and torch.equal(lam, lam_ref)
+
+
+def test_flow_reuse_recomputes_whenever_the_flows_could_differ(problem, labels):
+    """Only the very same, unmodified X with unmodified weights and sweep count is served from the last call."""
+    X = labels[0].clone()
+    net, primal, _ = benders_pair(problem, X)
+    calls = count_calls(net)
+
+    f = primal.flows(X)
+    assert primal.flows(X) is f and calls() == 1            # same tensor: reused
+    primal.flows(X.clone())
+    assert calls() == 2                                     # equal values in a new tensor: recomputed
+
+    f = primal.flows(X)
+    assert calls() == 3
+    X[:, 0] *= 1.1                                          # X changed in place
+    f2 = primal.flows(X)
+    assert calls() == 4 and not torch.equal(f, f2)
+
+    f2_values = f2.clone()
+    f2[:, 0] = 0.0                                          # a caller wrote into the returned flows
+    f3 = primal.flows(X)
+    assert calls() == 5 and torch.equal(f3, f2_values)
+
+    primal.sweeps = 2                                       # different polish
+    primal.flows(X)
+    assert calls() == 6
+    with torch.no_grad():
+        next(net.parameters()).mul_(1.0)                    # weights written in place
+    primal.flows(X)
+    assert calls() == 7
+
+    with torch.inference_mode():                            # no version counter: never reused, never an error
+        Xi = X.clone()
+        primal.flows(Xi)
+        primal.flows(Xi)
+    assert calls() == 9
