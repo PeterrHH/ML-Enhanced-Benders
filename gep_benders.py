@@ -2418,6 +2418,10 @@ if __name__ == "__main__":
                         weights=flowfirst_weights, polish_sweeps=polish_sweeps,
                         device=BENDERS_DEVICE,
                     )
+                    print(f"[flowfirst] surrogate runs on {BENDERS_DEVICE}"
+                          + ("" if BENDERS_DEVICE == "cpu" else
+                             ": one float64 pass per iteration, replayed as a CUDA graph"
+                             if BENDERS_DEVICE == "cuda" else ""), flush=True)
                 else:
                     primal_model_args = json.load(open(os.path.join(primal_net_directory, "args.json")))
                     dual_model_args = json.load(open(os.path.join(dual_net_directory, "args.json")))

@@ -98,12 +98,18 @@ class DualRecovery:
         gen_region = torch.einsum("bnr,ng->bgr", onehot, self.M)
         cap_below = torch.einsum("kg,bg,bgr->bkr", self.below, cap, gen_region)
         cap_upto = torch.einsum("kg,bg,bgr->bkr", self.upto, cap, gen_region)
-        Rk, al = R[:, None, :], self.alphabet[None, :, None].expand_as(cap_below)
+        # A residual exactly on a merit-order step is a tie, decided by the comparisons below. The
+        # sums are only exact up to rounding, and a device that adds them in another order (CUDA,
+        # MPS) would land one ulp to either side and pick the neighbouring price: a valid but
+        # looser bound once node_ascent starts from it. So compare up to the sums' rounding scale;
+        # values that are exactly equal give the same result as before.
+        tol = 64 * torch.finfo(R.dtype).eps * (cap_upto.amax(dim=1) + R.abs())    # [B, regions]
+        Rk, tk, al = R[:, None, :], tol[:, None, :], self.alphabet[None, :, None].expand_as(cap_below)
         big = torch.full_like(cap_below, self.voll)
-        lo = torch.where((cap_below < Rk) & (Rk <= cap_upto), al, big).min(dim=1).values
-        hi = torch.where((cap_below <= Rk) & (Rk < cap_upto), al, big).min(dim=1).values
-        lo = torch.where(R <= 0, torch.zeros_like(lo), lo)
-        hi = torch.where(R < 0, torch.zeros_like(hi), hi)
+        lo = torch.where((cap_below < Rk - tk) & (Rk <= cap_upto + tk), al, big).min(dim=1).values
+        hi = torch.where((cap_below <= Rk + tk) & (Rk < cap_upto - tk), al, big).min(dim=1).values
+        lo = torch.where(R <= tol, torch.zeros_like(lo), lo)
+        hi = torch.where(R < -tol, torch.zeros_like(hi), hi)
         return torch.gather(0.5 * (lo + hi), 1, lab)
 
     def node_ascent(self, X, lam, sweeps=3):
@@ -403,7 +409,8 @@ def cast_data(data, dtype, device=None):
     def move(t):
         return t.to(device, dtype) if t.is_floating_point() else t.to(device)
     out.X = move(data.X)
-    out.opt_targets = {k: move(v) for k, v in data.opt_targets.items()}
+    if getattr(data, "opt_targets", None) is not None:   # absent on some problem sets gep_benders builds
+        out.opt_targets = {k: move(v) for k, v in data.opt_targets.items()}
     for name in DATA_TENSORS:
         setattr(out, name, move(getattr(data, name)))
     return out
@@ -490,7 +497,9 @@ def build_net_for_data(a, data, run_dir, weights="model.pt", device="cpu"):
               layernorm=a.get("gnn_layernorm", False), antisym=a.get("gnn_antisym", False))
     scaler = None if a["variant"] == "flowfirst-gnn" else make_scaler(a.get("input_scale", "layernorm"), X_train)
     net = build_net(a["variant"], args, data, scaler, X_train=X_train, gnn_kwargs=kw).to(device)
-    net.load_state_dict(torch.load(Path(run_dir) / weights, map_location=device, weights_only=True))
+    # read on the CPU and let load_state_dict copy into the net's device and dtype: a float64
+    # checkpoint cannot even be read onto a device without float64 (MPS)
+    net.load_state_dict(torch.load(Path(run_dir) / weights, map_location="cpu", weights_only=True))
     return net.eval()
 
 
@@ -562,16 +571,101 @@ class FlowFirstDual:
         return self
 
 
-def load_flowfirst_pair(run_dir, data, weights="model.pt", polish_sweeps=1, device="cpu"):
+class DevicePrimalDual:
+    """One flow-first pass per X on an accelerator, for the Benders adapters below.
+
+    The whole pipeline (network, polish, fill, prices, completion) runs on the device as
+    one `PrimalDual` pass, replayed as a CUDA graph (`GraphedPrimalDual`, F30): a pass is
+    tens of thousands of small kernels, so launching them one by one would cost more than
+    the arithmetic. X arrives on the CPU and the solution goes back to the CPU in X's
+    dtype; that copy waits for the device, so a timer around the call measures the whole
+    pass. The graph is captured for the first X's number of rows and recaptured if it changes.
+
+    primal_net(X) and dual_net(X) are called on the same X each Benders iteration: the
+    second call is served from the first (same reuse rule as FlowFirstPrimal.flows).
+    """
+
+    def __init__(self, pipeline, device):
+        self.pipeline, self.device = pipeline, torch.device(device)
+        self.dtype = pipeline.dual.c.dtype
+        self._graphed, self._cache = None, None
+
+    def __call__(self, X):
+        if self._cache is not None and self._cache[0] is X and self._cache[1] == X._version:
+            return self._cache[2]
+        if self._graphed is None or self._graphed.batch != X.shape[0]:
+            self._graphed = GraphedPrimalDual(self.pipeline, batch=X.shape[0])
+        out = self._graphed(X.to(self.device, self.dtype))
+        # to the CPU first, then to X's dtype: casting on the device would need that dtype there
+        sol = PrimalDualSolution(**{k: v.to("cpu").to(X.dtype) for k, v in vars(out).items()})
+        self._cache = (X, X._version, sol)
+        return sol
+
+
+class DevicePrimal:
+    """`primal_net(X) -> y` on a `DevicePrimalDual`; returns a fresh CPU tensor."""
+
+    def __init__(self, runner):
+        self.runner = runner
+
+    def __call__(self, X, total_demands=None):
+        return self.runner(X).y.clone()
+
+    def eval(self):
+        return self
+
+
+class DeviceDual:
+    """`dual_net(X) -> (mu, lamb)` on a `DevicePrimalDual`, in FlowFirstDual's convention (price
+    negated). Fresh CPU tensors: gep_benders scales them in place."""
+
+    def __init__(self, runner):
+        self.runner = runner
+
+    def __call__(self, X):
+        sol = self.runner(X)
+        return sol.mu.clone(), -sol.lam
+
+    def eval(self):
+        return self
+
+
+def load_flowfirst_pair(run_dir, data, weights="model.pt", polish_sweeps=1, device="cpu", dtype=None):
     """(primal, dual) adapters for the flow-first run in `run_dir`, on `data`.
 
     Drop-in for the `(primal_net, dual_net)` pair `gep_benders.py` loads from two PDL
     checkpoint directories; here one directory holds the only network there is.
+
+    On the CPU these are FlowFirstPrimal / FlowFirstDual. On another device the problem
+    data and the network are moved there and both adapters share one `DevicePrimalDual`
+    pass per X. The device computes in `dtype`, by default the data's own (float64): the
+    cuts stay valid for any prices, but the completion that makes them dual feasible is
+    only exact to the precision it runs in, so float64 keeps the device's cuts as tight as
+    the CPU's. MPS has no float64 and needs an explicit `dtype=torch.float32`.
     """
     a = json.load(open(Path(run_dir) / "args.json"))
-    net = build_net_for_data(a, data, run_dir, weights=weights, device=device)
-    primal = FlowFirstPrimal(net, data, polish_sweeps)
-    return primal, FlowFirstDual(primal, data)
+    name = torch.device(device).type            # the networks take a plain device name ("cuda")
+    if name == "cpu":
+        net = build_net_for_data(a, data, run_dir, weights=weights, device=device)
+        primal = FlowFirstPrimal(net, data, polish_sweeps)
+        return primal, FlowFirstDual(primal, data)
+    dtype = dtype or data.cost_vec.dtype
+    if name == "mps" and dtype == torch.float64:
+        raise ValueError("MPS has no float64; run the Benders surrogate on cpu or cuda "
+                         "(or pass dtype=torch.float32 for a test run)")
+    if dtype != torch.get_default_dtype():
+        # the network's buffers and the pipeline's constants are created in torch's default dtype
+        raise ValueError(f"set torch's default dtype to {dtype} before loading the surrogate in it "
+                         f"(it is {torch.get_default_dtype()})")
+    data_dev = cast_data(data, dtype, name)     # before the network: its fill keeps plain-tensor constants
+    # the MLP variant's FeedForwardNet sets torch's global default device to its own; left on the
+    # GPU, every tensor gep_benders creates afterwards would land there, so put it back
+    prev = torch.get_default_device()
+    net = build_net_for_data(a, data_dev, run_dir, weights=weights, device=name)
+    if torch.get_default_device() != prev:
+        torch.set_default_device(prev)
+    runner = DevicePrimalDual(PrimalDual(data_dev, net, polish_sweeps), name)
+    return DevicePrimal(runner), DeviceDual(runner)
 
 
 def is_flowfirst_run(run_dir, weights="model.pt"):

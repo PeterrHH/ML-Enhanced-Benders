@@ -9,8 +9,8 @@ import pytest
 import torch
 
 from flowfirst.dataset import CONFIG_DIR, dataset_path, load_or_create
-from flowfirst.dual import (DualRecovery, FlowFirstDual, FlowFirstPrimal, GraphedPrimalDual, PathPolish, Polish,
-                            PrimalDual, cast_net)
+from flowfirst.dual import (DevicePrimal, DevicePrimalDual, DeviceDual, DualRecovery, FlowFirstDual, FlowFirstPrimal,
+                            GraphedPrimalDual, PathPolish, Polish, PrimalDual, cast_data, cast_net)
 from flowfirst.train import build_net, line_bounds
 
 torch.set_default_dtype(torch.float64)
@@ -313,3 +313,61 @@ def test_flow_reuse_recomputes_whenever_the_flows_could_differ(problem, labels):
         primal.flows(Xi)
         primal.flows(Xi)
     assert calls() == 9
+
+
+def test_quotient_prices_ignore_rounding_in_the_capacity_sums(problem, labels):
+    """The polish leaves residuals exactly on merit-order steps, where the quotient price is a tie. A device that sums
+    the capacities in another order is off by a few ulps; the prices must not depend on that (they would flip to
+    the neighbouring price, and node ascent then ends at a looser bound)."""
+    data, _ = problem
+    X = labels[0]
+    f, _ = Polish(data)(X, small_net(problem, X)(X)[2].detach(), 1)
+    nudged = X.clone()
+    nudged[:, data.num_n:] *= 1 + 8 * torch.finfo(X.dtype).eps          # capacity columns, a few ulps up
+    R = DualRecovery(data)
+    assert torch.equal(R.quotient_prices(X, f), R.quotient_prices(nudged, f))
+
+
+def test_device_runner_on_the_cpu_matches_the_cpu_adapters(problem, labels):
+    """The accelerator path of load_flowfirst_pair (one PrimalDual pass per X, shared by both adapters) gives the CPU
+    adapters' outputs bit for bit when run on the CPU, runs the network once per X, and hands out fresh tensors
+    (gep_benders scales the multipliers in place)."""
+    data, _ = problem
+    X = labels[0]
+    net = small_net(problem, X)
+    primal = FlowFirstPrimal(net, data, 1)
+    y_ref = primal(X)
+    mu_ref, lam_ref = FlowFirstDual(primal, data)(X)
+    runner = DevicePrimalDual(PrimalDual(data, net, 1), "cpu")
+    P, D = DevicePrimal(runner), DeviceDual(runner)
+    calls = count_calls(net)
+    y, (mu, lam) = P(X), D(X)
+    assert calls() == 1
+    assert torch.equal(y, y_ref) and torch.equal(mu, mu_ref) and torch.equal(lam, lam_ref)
+    mu *= 2.0
+    assert torch.equal(D(X)[0], mu_ref) and calls() == 1
+    P(X.clone())
+    assert calls() == 2                                                  # a new X is a new pass
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device (run on a GPU node)")
+def test_cuda_runner_matches_the_cpu_pass(problem, labels):
+    """On CUDA the pass is replayed as a CUDA graph in float64 and returns CPU tensors; dispatch, prices and the
+    certified dual bound agree with the CPU pass to float64 rounding."""
+    data, args = problem
+    X = labels[0]
+    net = small_net(problem, X)
+    ref = PrimalDual(data, net, 1)(X)
+    data_c = cast_data(data, torch.float64, "cuda")
+    net_c = build_net("flowfirst-gnn", {**args, "device": "cuda"}, data_c, None, X_train=X.to("cuda"),
+                      gnn_kwargs=dict(hidden=16, rounds=2, id_embed=8, layernorm=False, antisym=False)).eval()
+    net_c.load_state_dict(net.state_dict())
+    runner = DevicePrimalDual(PrimalDual(data_c, net_c, 1), "cuda")
+    P, D = DevicePrimal(runner), DeviceDual(runner)
+    y, (mu, lam) = P(X), D(X)
+    assert runner._graphed.graph is not None                             # replayed, not eager
+    assert y.device.type == mu.device.type == lam.device.type == "cpu" and y.dtype == torch.float64
+    assert torch.allclose(y, ref.y, rtol=1e-9, atol=1e-6)
+    assert torch.allclose(-lam, ref.lam, rtol=1e-9, atol=1e-9)
+    R = DualRecovery(data)
+    assert torch.allclose(R.dual_objective(X, -lam), ref.dual, rtol=1e-9, atol=1e-6)

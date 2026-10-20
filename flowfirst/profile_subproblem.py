@@ -23,7 +23,8 @@ sys.path.insert(0, os.getcwd())
 torch.set_default_dtype(torch.float64)
 
 import json                                                            # noqa: E402
-from flowfirst.dual import FlowFirstDual, FlowFirstPrimal, build_net_for_data   # noqa: E402
+from flowfirst.dual import (DualRecovery, FlowFirstDual, FlowFirstPrimal, build_net_for_data,  # noqa: E402
+                            load_flowfirst_pair)
 from flowfirst.dataset import load_or_create                           # noqa: E402
 from flowfirst.train import build_net, make_scaler                     # noqa: E402
 from flowfirst.train import split_inputs                               # noqa: E402
@@ -41,6 +42,9 @@ p.add_argument("--solver", default="gurobi")
 p.add_argument("--data-root", default=None)
 p.add_argument("--no-exact", action="store_true")
 p.add_argument("--torch-profile", action="store_true", help="also print the top torch ops")
+p.add_argument("--device", default=None,
+               help="also run the Benders surrogate pass on this device (e.g. cuda) through load_flowfirst_pair, "
+                    "time it, and check it against the CPU pass; needs --run-dir")
 a = p.parse_args()
 
 if a.threads:
@@ -138,6 +142,31 @@ if a.torch_profile:
     n_calls = sum(e.count for e in ev)
     print(f"\ntorch ops launched by one primal+dual pass: {n_calls}")
     print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=15))
+
+# ---- the same pass on an accelerator, as gep_benders --device runs it ----------
+if a.device and a.device != "cpu":
+    assert a.run_dir, "--device needs --run-dir"
+    P, Dd = load_flowfirst_pair(a.run_dir, data, weights=a.weights, device=a.device)
+    def device_iteration():
+        Xi = X.clone()                                      # a new X each Benders iteration
+        t0 = time.perf_counter()
+        y_d = P(Xi)
+        mu_d, nl_d = Dd(Xi)                                 # served from the same pass
+        return time.perf_counter() - t0, (y_d, mu_d, nl_d)
+    t_first, _ = device_iteration()                         # includes the CUDA-graph capture
+    runs = [device_iteration() for _ in range(a.repeats)]
+    t_dev = float(np.median([r[0] for r in runs]))
+    y_d, mu_d, nl_d = runs[-1][1]
+    Xc = X.clone(); y_c = primal(Xc); mu_c, nl_c = dual(Xc)
+    R = DualRecovery(data)
+    b_c, b_d = R.dual_objective(X, -nl_c).sum().item(), R.dual_objective(X, -nl_d).sum().item()
+    rel = lambda u, v: ((u - v).abs().max() / v.abs().max().clamp(min=1)).item()
+    print(f"\nSurrogate pass on {a.device} (primal_net + dual_net, one graph replay, copy back included):")
+    print(f"  first call (graph capture)   {t_first * 1e3:9.1f} ms")
+    print(f"  per iteration, median        {t_dev * 1e3:9.1f} ms   vs {(t_primal_call + t_dual_call) * 1e3:.1f} ms on the CPU")
+    print(f"  check against the CPU pass: y rel {rel(y_d, y_c):.1e}, prices rel {rel(nl_d, nl_c):.1e}, "
+          f"multipliers rel {rel(mu_d, mu_c):.1e}, dual bound total rel {(b_d - b_c) / abs(b_c):+.1e}")
+    print("  (expect all near 1e-12 or below in float64; a larger gap means the device pass differs)")
 
 # ---- exact: persistent LP re-solved hour by hour -----------------------------
 if not a.no_exact:
