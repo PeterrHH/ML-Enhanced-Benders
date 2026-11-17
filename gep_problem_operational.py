@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from data_wrangling import dataframe_to_dict
 from devices import move_attrs, resolve_device
 from gep_config_parser import parse_config
-from gep_problem import GEPProblemSet
+from gep_problem import GEPProblemSet, ramp_block_rows
 from scipy.stats import qmc
 
 class GEPOperationalProblemSet():
@@ -31,6 +31,9 @@ class GEPOperationalProblemSet():
         self.ED_args = args["ED_args"]
         # Operation sample is always of length 1 for benders!
         self.sample_duration = 1
+        #! Ramping off until set_ramping() is called, as in GEPProblemSet. Pickles from
+        #! before ramping existed have no attribute and read as off through ramp_block_hours_.
+        self.ramp_block_hours = 1
 
         # Number of samples to generate (through randomly chosen investment variables)
         self.n_samples = 2 ** self.ED_args["2n_synthetic_samples"]
@@ -254,6 +257,67 @@ class GEPOperationalProblemSet():
         with open(save_path, 'wb') as file:
             pickle.dump(self, file)
 
+    # ------------------------------------------------------------------ ramping
+    #! Shared with GEPProblemSet, so both classes read the same B and the same R_g.
+    ramp_block_hours_ = GEPProblemSet.ramp_block_hours_
+    ramp_limits = GEPProblemSet.ramp_limits
+
+    def set_ramping(self, block_hours):
+        """Make one sample a block of `block_hours` consecutive hours with ramp rows (>1),
+        or one hour without (1/None/0, the default).
+
+        Mirrors GEPProblemSet.set_ramping: the hourly rows of every hour of the block come
+        first, then the ramp rows of the block in ramp_block_rows order, so with B = 1 every
+        matrix is exactly the hourly one. Variables are [p, f, md] per hour, hour after hour.
+
+        One difference: the investment is fixed here, so the ramp term R_g u_g leaves the
+        matrix (where GEPProblemSet keeps it, u being a variable there) for the right-hand
+        side, and X carries it -- capacity alone does not give u back when availability is 0:
+            X = [D_1 .. D_B (B*N), cap_1 .. cap_B (B*G), R_g u_g (G, only when B > 1)]
+
+        Rebuilds the matrices; X and the labels belong to the caller, who must build them
+        in this layout (e.g. gen_GEP/solve_for_train.py --ramp-block-hours B).
+        """
+        B = int(block_hours) if block_hours else 1
+        if B < 1:
+            raise ValueError(f"ramp_block_hours must be >= 1, got {block_hours}.")
+        G, L, N = self.num_g, self.num_l, self.num_n
+        self.ramp_block_hours = B
+        self.sample_duration = B
+        self.n_ramp = 2 * G * (B - 1)
+        self.neq = B * N
+        self.nineq = B * 2 * (G + L + N) + self.n_ramp
+        self.n_prod_vars, self.n_line_vars, self.n_md_vars = G * B, L * B, N * B
+        self.ydim = self.n_prod_vars + self.n_line_vars + self.n_md_vars
+        self.md_indices = self.get_md_nt_indices()
+        self.f_lt_indices = self.get_f_lt_indices()
+        self.capacity_ub_indices = self.get_capacity_ub_indices()
+        self.missed_demand_ub_indices = self.get_missed_demand_ub_indices()
+        self.ineq_cm, self.ineq_rhs = self.build_ineq_cm_rhs()
+        self.eq_cm = self.build_eq_cm()
+        self.obj_coeff, self.cost_vec = self.build_obj_coeff()
+        return self
+
+    def ramp_room(self, investments):
+        """R_g u_g, the X entries of a block sample, for investments [K, G]."""
+        R_g = torch.as_tensor(self.ramp_limits(), dtype=self.DTYPE)
+        return torch.as_tensor(investments, dtype=self.DTYPE) * R_g
+
+    def hourly_X(self, X):
+        """The hours of block samples as hourly samples: [K, xdim] -> [K*B, N+G], block after block."""
+        B, N, G = self.ramp_block_hours_, self.num_n, self.num_g
+        D = X[:, :B * N].reshape(-1, B, N)
+        cap = X[:, B * N:B * (N + G)].reshape(-1, B, G)
+        return torch.cat([D, cap], dim=2).reshape(-1, N + G)
+
+    def split_ramp_constraints(self, ineq):
+        """The ramp rows of a block's inequality [residuals, rhs or multipliers]: up rows then
+        down rows, each [batch, (B-1)*G] ordered (hour, generator). Empty when ramping is off."""
+        B = self.ramp_block_hours_
+        tail = ineq[:, B * 2 * (self.num_g + self.num_l + self.num_n):]
+        half = self.num_g * (B - 1)
+        return tail[:, :half], tail[:, half:]
+
     def build_X_capacity_sobol(self):
         """
         Build X using:
@@ -319,14 +383,17 @@ class GEPOperationalProblemSet():
         """
         if X is None:
             X = self.X
-    
+        if X.shape[1] != self.num_n + self.num_g:
+            raise NotImplementedError("Heuristic lambda labels are hourly; for ramping blocks "
+                                      "pass self.hourly_X(X) and read them per hour.")
+
         device = X.device
         dtype  = X.dtype
-    
+
         B = X.shape[0]
         N = self.num_n
         G = self.num_g
-    
+
         D   = X[:, :N]       # [B, N]  — nodal demand
         cap = X[:, N:N + G]  # [B, G]  — availability-adjusted generation capacity
     
@@ -1035,14 +1102,26 @@ class GEPOperationalProblemSet():
         return indices
     
     def get_capacity_ub_indices(self):
-        #! Second |G| constraints are capacity upper bounds.
-        indices = list(range(self.num_g, 2*self.num_g))
+        #! Second |G| constraints of every hour are capacity upper bounds.
+        R = 2 * (self.num_g + self.num_l + self.num_n)
+        indices = [j * R + i for j in range(self.ramp_block_hours_) for i in range(self.num_g, 2*self.num_g)]
         return indices
     
     def get_missed_demand_ub_indices(self):
-        #! Last |N| constraints are demand upper bounds.
-        indices = list(range(2*self.num_g + 2*self.num_l + self.num_n, 2*self.num_g + 2*self.num_l + 2*self.num_n))
+        #! Last |N| constraints of every hour are demand upper bounds.
+        R = 2 * (self.num_g + self.num_l + self.num_n)
+        indices = [j * R + i for j in range(self.ramp_block_hours_)
+                   for i in range(2*self.num_g + 2*self.num_l + self.num_n, 2*self.num_g + 2*self.num_l + 2*self.num_n)]
         return indices
+
+    def get_ramp_indices(self):
+        """Rows of the ramp constraints and the generator each one bounds; empty when ramping is off."""
+        B = self.ramp_block_hours_
+        if B <= 1:
+            return [], np.empty(0, dtype=int)
+        R = 2 * (self.num_g + self.num_l + self.num_n)
+        _, _, _, gen = ramp_block_rows(B, self.num_g, self.n_vars)
+        return list(range(B * R, B * R + len(gen))), gen
     
     # TODO: Change for compact form!
     def split_ineq_constraints(self, ineq):
@@ -1060,6 +1139,13 @@ class GEPOperationalProblemSet():
 
         # Define segment sizes based on multiple constraints per type
         sizes = [self.num_g, self.num_g, self.num_l, self.num_l, self.num_n, self.num_n]  # Num constraints per type
+
+        B = self.ramp_block_hours_
+        if B > 1:
+            #! A block: each type over the block's hours, [batch, B*count] ordered (hour, item).
+            #! The ramp rows after the hourly ones are split_ramp_constraints'.
+            hours = ineq[:, :B * sum(sizes)].reshape(batch_size, B, sum(sizes))
+            return tuple(part.reshape(batch_size, -1) for part in torch.split(hours, sizes, dim=2))
 
         # Extract constraint tensors along the first dimension (constraint type)
         h, b, d, e, i, j = torch.split(ineq, sizes, dim=1)
@@ -1099,11 +1185,17 @@ class GEPOperationalProblemSet():
         # else:
         ui_g = None
 
-        # Reshape Y for efficient slicing
-        Y = Y.view(batch_size, self.n_vars - self.num_n)
-
         # Define segment sizes
         sizes = [self.num_g, self.num_l]
+
+        B = self.ramp_block_hours_
+        if B > 1:
+            Y = Y.reshape(batch_size, B, sum(sizes))
+            p_gt, f_lt = (part.reshape(batch_size, -1) for part in torch.split(Y, sizes, dim=2))
+            return ui_g, p_gt, f_lt
+
+        # Reshape Y for efficient slicing
+        Y = Y.view(batch_size, self.n_vars - self.num_n)
 
         # Extract constraint tensors
         p_gt, f_lt = torch.split(Y, sizes, dim=1)
@@ -1125,6 +1217,13 @@ class GEPOperationalProblemSet():
         # Define segment sizes
         sizes = [self.num_g, self.num_l, self.num_n]
         # print(Y.shape)
+
+        B = self.ramp_block_hours_
+        if B > 1:
+            #! A block: [batch, B*G | B*L | B*N], ordered (hour, item).
+            Y = Y.reshape(batch_size, B, sum(sizes))
+            p_gt, f_lt, md_nt = (part.reshape(batch_size, -1) for part in torch.split(Y, sizes, dim=2))
+            return p_gt, f_lt, md_nt
 
         # Extract constraint tensors
         p_gt, f_lt, md_nt = torch.split(Y, sizes, dim=1)
@@ -1164,7 +1263,8 @@ class GEPOperationalProblemSet():
 
         p_gt = torch.abs(p_gt)
         
-        cost = self.cost_vec @ p_gt.T
+        #! cost_vec is per generator; a block sample has B hours of them.
+        cost = self.cost_vec.repeat(self.ramp_block_hours_) @ p_gt.T
 
         load_shedding = self.pVOLL * torch.norm(md_nt, p=1, dim=1)
 
@@ -1204,7 +1304,13 @@ class GEPOperationalProblemSet():
         md_nt_lb_resid = md_nt_lb_resid / md_nt
         md_nt_ub_resid = md_nt_ub_resid / md_nt
 
-        return torch.concat([p_gt_lb_resid, p_gt_ub_resid, f_lt_lb_resid, f_lt_ub_resid, md_nt_lb_resid, md_nt_ub_resid], dim=1)
+        parts = [p_gt_lb_resid, p_gt_ub_resid, f_lt_lb_resid, f_lt_ub_resid, md_nt_lb_resid, md_nt_ub_resid]
+        if self.ramp_block_hours_ > 1:
+            #! Ramp rows relative to the ramp room R_g u_g (1 where nothing is built, as for p above).
+            room = torch.cat(self.split_ramp_constraints(ineq_rhs), dim=1)
+            room = torch.where(room == 0, torch.ones_like(room), room)
+            parts.append(torch.cat(self.split_ramp_constraints(ineq_resid), dim=1) / room)
+        return torch.concat(parts, dim=1)
     
     def relative_ineq_dist(self, X, Y):
         ineq_resid = self.relative_ineq_resid(X, Y)
@@ -1229,7 +1335,8 @@ class GEPOperationalProblemSet():
                          p_{g,tn}, f_{l,tn}, md_{n,tn}] """
         # coeff vector of zero's to be filled
         obj_coeff = torch.zeros(self.n_vars * self.sample_duration, dtype=self.DTYPE)
-        cost_vec = torch.zeros(self.num_g * self.sample_duration, dtype=self.DTYPE)
+        #! cost_vec is per generator, whatever the sample length (obj_fn repeats it per hour).
+        cost_vec = torch.zeros(self.num_g, dtype=self.DTYPE)
 
         for t in range(self.sample_duration):
             # Sum over G,T (PC_g * p_{g,t}) --> Generation costs
@@ -1237,7 +1344,7 @@ class GEPOperationalProblemSet():
                 # Generator variables are always at first |G| indices per timestep
                 coeff_idx = t * self.n_vars + idx_g
                 obj_coeff[coeff_idx] = self.pVarCost[g]
-                cost_vec[coeff_idx] = self.pVarCost[g]
+                cost_vec[idx_g] = self.pVarCost[g]
 
             # Sum over N,T (MDC * md_{n,t}) --> Cost missed demand
             for idx_n in range(self.num_n):
@@ -1256,14 +1363,20 @@ class GEPOperationalProblemSet():
         '''
         # eq_rhs = X[:, :self.neq]
         # capacity_ub = X[:, self.neq:]
-        eq_rhs = X[:,:len(self.N)]
-        capacity_ub = X[:, len(self.N):len(self.N)+len(self.G)]
+        #! B = 1: X = [D, cap]. A ramping block (set_ramping): X = [D_1..D_B, cap_1..cap_B, R_g u_g].
+        B, N, G = self.ramp_block_hours_, len(self.N), len(self.G)
+        eq_rhs = X[:, :B * N]
+        capacity_ub = X[:, B * N:B * (N + G)]
         ineq_rhs = self.ineq_rhs.clone().repeat(X.size(0), 1)
         #print(f"Capacity UB Index: {self.capacity_ub_indices}, Missed Demand UB Index: {self.missed_demand_ub_indices}")
         #! Second |G| constraints are capacity upper bounds.
         ineq_rhs[:, self.capacity_ub_indices] = capacity_ub
         #! Last |N| constraints are demand upper bounds.
         ineq_rhs[:, self.missed_demand_ub_indices] = eq_rhs
+        if B > 1:
+            #! Ramp rows: |p_t - p_{t-1}| <= R_g u_g, the rhs read from X.
+            rows, gen = self.get_ramp_indices()
+            ineq_rhs[:, rows] = X[:, B * (N + G):B * (N + G) + G][:, torch.as_tensor(gen)]
 
         return eq_rhs, ineq_rhs
 
@@ -1356,7 +1469,7 @@ class GEPOperationalProblemSet():
         self.assign_identity_or_scalar(block_matrix, 2*self.num_g + 2*self.num_l + self.num_n, self.num_g + self.num_l, self.num_n, 1)  # 3.1j: Missed demand upper bound
 
         # Use Kronecker product to copy the block matrix diagonally for all timesteps
-        #! Sample duration is always 1
+        #! Sample duration is 1 unless ramping blocks are on (set_ramping); see the end.
         # ineq_cm = torch.kron(torch.eye(self.sample_duration), block_matrix)
         ineq_cm = block_matrix
 
@@ -1381,6 +1494,17 @@ class GEPOperationalProblemSet():
         # ineq_rhs += [self.pDemand[(n, t)] for n in self.N]
         #! This is a placeholder, where we will substitute the missed demand upper bound (Demand) taken from X.
         ineq_rhs += [0.0 for _ in range(self.num_n)] # Upper bound is Demand.
+
+        B = self.ramp_block_hours_
+        if B > 1:
+            #! A block of B hours: the hourly rows of every hour, then the ramp rows,
+            #! laid out as in GEPProblemSet (ramp_block_rows). Their rhs R_g u_g comes from X.
+            r, c, v, gen = ramp_block_rows(B, self.num_g, num_columns_per_t)
+            #! Two triplets per ramp row (p_t and p_{t-1}); one row per entry of gen.
+            ramp = torch.zeros((len(gen), B * num_columns_per_t), dtype=ineq_cm.dtype)
+            ramp[torch.as_tensor(r), torch.as_tensor(c)] = torch.as_tensor(v, dtype=ineq_cm.dtype)
+            ineq_cm = torch.cat([torch.kron(torch.eye(B, dtype=ineq_cm.dtype), ineq_cm), ramp], dim=0)
+            ineq_rhs = ineq_rhs * B + [0.0] * len(gen)
         
         return ineq_cm, torch.tensor(ineq_rhs)
 
@@ -1392,8 +1516,10 @@ class GEPOperationalProblemSet():
         eq_cm = torch.concat([self.node_to_gen_mask, self.lineflow_mask, torch.eye(self.num_n)], dim=1)
 
         # Use Kronecker product to copy the block matrix diagonally for all timesteps
-        #! Not necessary, sample duration is always 1.
-        # eq_cm = torch.kron(torch.eye(self.sample_duration), block_matrix)
+        #! Only for ramping blocks (set_ramping); otherwise the sample is one hour.
+        B = self.ramp_block_hours_
+        if B > 1:
+            eq_cm = torch.kron(torch.eye(B, dtype=eq_cm.dtype), eq_cm)
                 
         return eq_cm
 

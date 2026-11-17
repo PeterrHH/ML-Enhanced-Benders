@@ -1458,6 +1458,120 @@ class FlowFirstGNN(nn.Module):
         return torch.cat([p, f, unmet], dim=1), f_raw, f
 
 
+class FlowFirstSpaceTime(nn.Module):
+    """Ways 2-i and 2-ii of docs/ramping-surrogate-design.tex: one ramping block of B hours as a space-time graph.
+
+    Vertices: a node vertex (n, t) per node and hour, and a technology vertex (s, t) per ramp-limited
+    technology (ramp limit below its unit size) and hour, attached to its node in that hour. Edges: line
+    edges inside each hour, and ramp edges (s, t-1) -> (s, t). The per-hour part is a FlowFirstGNN
+    (`self.hourly`, so an hourly checkpoint loads into it unchanged) run on the K*B hours as one batch;
+    each round adds, in this order: line edges, ramp edges from their two technology-hours, technology
+    vertices from their node and both ramp edges, node vertices from the hourly update plus the sum of
+    their technologies. The readout is the hourly one: line flows only, sigmoid-repaired into the
+    limits, then the hourly merit-order fill; the ramp ladder repairs the rest.
+
+    The two paths into the hourly stream, the technology-to-node update and the hour embedding, start
+    at zero, so before training the network returns exactly the hourly GNN's flows.
+
+    With paths=True (Way 2-ii) each technology-hour also reads out a correction in MW to that
+    technology's output (`path_head`, last layer zero, scaled by the technology's capacity spread);
+    flowfirst/spacetime.py adds it to the merit-order output and clips the sum into the ramp limits.
+
+    Input X [K, B*N + B*G + G]: demand per hour, available capacity A*UnitCap*u per hour, and the
+    ramp room rho = R*u per technology (the block set's layout). Technology and ramp features (capacity
+    and ramp room) are z-scored per technology with training-set statistics.
+    """
+
+    def __init__(self, data, ramp_frac, B, X_train, hidden=128, rounds=3, id_embed=8, layernorm=False, antisym=False,
+                 paths=False):
+        super().__init__()
+        self.data, self.B, self.rounds, self.paths = data, B, rounds, paths
+        N, G = data.num_n, data.num_g
+        dev = data.node_to_gen_mask.device
+        slow = torch.nonzero(torch.as_tensor(ramp_frac, device=dev) < 1.0).flatten()
+        S = len(slow)
+        self.register_buffer("slow", slow)                                   # generator index of each technology
+        self.register_buffer("slow_node", data.node_to_gen_mask[:, slow].T.argmax(dim=1))
+        self.register_buffer("tech_to_node_mask", data.node_to_gen_mask[:, slow].to(torch.get_default_dtype()))
+        D, cap, rho = self.split(X_train)
+        self.hourly = FlowFirstGNN(None, data, self.hours(D, cap), hidden, rounds, id_embed, layernorm, antisym)
+        self.register_buffer("cap_mean", cap[:, :, slow].reshape(-1, S).mean(dim=0))
+        self.register_buffer("cap_std", cap[:, :, slow].reshape(-1, S).std(dim=0).clamp_min(1e-8))
+        self.register_buffer("rho_mean", rho[:, slow].mean(dim=0))
+        self.register_buffer("rho_std", rho[:, slow].std(dim=0).clamp_min(1e-8))
+        self.tech_id = nn.Parameter(0.1 * torch.randn(S, id_embed, device=dev))
+        self.tech_hour = nn.Parameter(0.1 * torch.randn(B, hidden, device=dev))
+        self.hour_emb = nn.Parameter(torch.zeros(B, hidden, device=dev))      # node and line states; 0: hourly at init
+
+        def mlp(i, o, norm=False):
+            layers = [nn.LayerNorm(i, device=dev)] if norm else []
+            return nn.Sequential(*layers, nn.Linear(i, hidden, device=dev), nn.ReLU(), nn.Linear(hidden, o, device=dev))
+        self.tech_enc = mlp(2 + id_embed, hidden)
+        self.ramp_enc = mlp(1 + id_embed, hidden)
+        self.ramp_upd = nn.ModuleList([mlp(3 * hidden, hidden, layernorm) for _ in range(rounds)])
+        self.tech_upd = nn.ModuleList([mlp(4 * hidden, hidden, layernorm) for _ in range(rounds)])
+        self.tech_to_node = nn.ModuleList([mlp(hidden, hidden, layernorm) for _ in range(rounds)])
+        for m in self.tech_to_node:
+            nn.init.zeros_(m[-1].weight)
+            nn.init.zeros_(m[-1].bias)
+        if paths:
+            self.path_head = mlp(hidden, 1)
+            nn.init.zeros_(self.path_head[-1].weight)
+            nn.init.zeros_(self.path_head[-1].bias)
+
+    def split(self, X):
+        """D [K, B, N], cap [K, B, G], rho [K, G] from block rows."""
+        B, N, G = self.B, self.data.num_n, self.data.num_g
+        return X[:, :B * N].reshape(-1, B, N), X[:, B * N:B * (N + G)].reshape(-1, B, G), X[:, B * (N + G):]
+
+    @staticmethod
+    def hours(D, cap):
+        """The block's hours as hourly network rows [K*B, N+G]."""
+        return torch.cat([D, cap], dim=2).reshape(-1, D.shape[2] + cap.shape[2])
+
+    def forward(self, X):
+        """Returns f [K, B, L] (repaired line flows), f_raw [K, B, L], and with paths the output
+        correction [K, B, S] in MW of each ramp-limited technology (None without)."""
+        hn, B = self.hourly, self.B
+        D, cap, rho = self.split(X)
+        K, S = D.shape[0], len(self.slow)
+        Xh = self.hours(D, cap)
+        dt = hn.readout[-1].weight.dtype
+        nf = (hn.node_features(Xh) - hn.nf_mean) / hn.nf_std
+        ef = hn.edge_feat.expand(Xh.shape[0], -1, -1)
+        if hn.id_dim > 0:
+            nf = torch.cat([nf, hn.node_id.expand(Xh.shape[0], -1, -1)], dim=-1)
+            ef = torch.cat([ef, hn.edge_id.expand(Xh.shape[0], -1, -1)], dim=-1)
+        hour = self.hour_emb.repeat(K, 1)[:, None, :]                              # [K*B, 1, H]
+        h, e = hn.node_enc(nf.to(dt)) + hour, hn.edge_enc(ef.to(dt)) + hour        # [K*B, N, H], [K*B, L, H]
+
+        cap_z = ((cap[:, :, self.slow] - self.cap_mean) / self.cap_std).to(dt)       # [K, B, S]
+        rho_z = ((rho[:, self.slow] - self.rho_mean) / self.rho_std).to(dt)         # [K, S]
+        tid = self.tech_id.to(dt)
+        g = self.tech_enc(torch.cat([cap_z[..., None], rho_z[:, None, :, None].expand(K, B, S, 1),
+                                     tid.expand(K, B, S, -1)], dim=-1)) + self.tech_hour[None, :, None, :]
+        r = self.ramp_enc(torch.cat([rho_z[:, None, :, None].expand(K, B - 1, S, 1),
+                                     tid.expand(K, B - 1, S, -1)], dim=-1))         # [K, B-1, S, H], edge t-1 -> t
+        zero = torch.zeros_like(r[:, :1])
+        for i, (edge_upd, node_upd) in enumerate(zip(hn.edge_upd, hn.node_upd, strict=True)):
+            e = e + edge_upd(torch.cat([e, h[:, hn.from_idx], h[:, hn.to_idx]], dim=-1))
+            r = r + self.ramp_upd[i](torch.cat([r, g[:, :-1], g[:, 1:]], dim=-1))
+            h_at = h.reshape(K, B, -1, h.shape[-1])[:, :, self.slow_node]             # [K, B, S, H]
+            r_in, r_out = torch.cat([zero, r], dim=1), torch.cat([r, zero], dim=1)
+            g = g + self.tech_upd[i](torch.cat([g, h_at, r_in, r_out], dim=-1))
+            g_node = torch.einsum("ns,kbsh->kbnh", self.tech_to_node_mask.to(dt), g).reshape(K * B, -1, g.shape[-1])
+            agg_in = torch.einsum("nl,blh->bnh", hn.A_in, e)
+            agg_out = torch.einsum("nl,blh->bnh", hn.A_out, e)
+            h = h + node_upd(torch.cat([h, agg_in, agg_out], dim=-1)) + self.tech_to_node[i](g_node)
+        hf, ht = h[:, hn.from_idx], h[:, hn.to_idx]
+        f_raw = hn.readout(torch.cat([e, hf, ht], dim=-1)).squeeze(-1)
+        if hn.antisym:
+            f_raw = f_raw - hn.readout(torch.cat([e, ht, hf], dim=-1)).squeeze(-1)
+        f = hn.f_lb + (hn.f_ub - hn.f_lb) * torch.sigmoid(f_raw.to(X.dtype))
+        corr = self.path_head(g).squeeze(-1).to(X.dtype) * self.cap_std if self.paths else None
+        return f.reshape(K, B, -1), f_raw.reshape(K, B, -1), corr
+
+
 def load(args, data, save_dir):
     primal_net = PrimalNetEndToEnd(args, data=data)
     primal_net.load_state_dict(torch.load(save_dir + '/primal_weights.pth', weights_only=True))

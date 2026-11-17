@@ -97,7 +97,14 @@ def parse_cli():
         action="store_true",
         help="Solve every instance with exact Benders and save the trajectories (every "
              "investment visited, the optimum, the bounds per iteration), without harvesting "
-             "or labelling. Required for ramping instances until the block harvest exists.",
+             "or labelling. With --ramp-block-hours B > 1 and without this flag, the block "
+             "harvest follows the solves.",
+    )
+    parser.add_argument(
+        "--resolve",
+        action="store_true",
+        help="Block harvest only: solve the instances again even when this run's trajectories "
+             "file already exists (by default it is reused).",
     )
     parser.add_argument(
         "--cut-selection", "--cut_selection",
@@ -376,6 +383,160 @@ def compute_opt_targets_parallel(base, pool, n_workers):
     }
 
 
+# ================= BLOCK HARVEST (ramping, B > 1) =================
+#! The hourly harvest cannot serve ramping: its states are single hours, and ramp rows
+#! couple consecutive hours. The block harvest keeps the same recipe -- representative
+#! units x clustered trajectory investments, labelled exactly -- with the unit a block of
+#! B consecutive hours: a GEPOperationalProblemSet after set_ramping(B).
+
+def select_representative_blocks(D, apmax, n_clusters, seed=0):
+    """One block per KMeans cluster of standardized [demand, A*UnitCap] over the block's hours,
+    as select_representative_hours keeps one hour per cluster. D [K, B, N], apmax [K, B, G]."""
+    H = np.concatenate([D.reshape(D.shape[0], -1), apmax.reshape(apmax.shape[0], -1)], axis=1)
+    H = (H - H.mean(0)) / (H.std(0) + 1e-9)
+    labels = KMeans(min(n_clusters, len(H)), random_state=seed, n_init=10).fit_predict(H)
+    rng = np.random.default_rng(seed)
+    return np.sort([rng.choice(np.flatnonzero(labels == c)) for c in np.unique(labels)])
+
+
+def harvest_blocks(trajs, paths, manifest, args, B, n_block_clusters, n_inv_clusters, out_path, pool, n_workers):
+    """The ramping training set: a GEPOperationalProblemSet whose samples are blocks of B hours.
+
+    Per instance, n_block_clusters representative blocks x n_inv_clusters clustered trajectory
+    investments. The set is the first instance's operational companion switched to blocks with
+    set_ramping(B), so its matrices are the block LP Benders solves (SampleStructure), and
+        X = [D_1..D_B (B*N), cap_1..cap_B (B*G), R_g u_g (G)].
+    Labels come from the same LP path as the hourly harvest (compute_opt_targets_parallel):
+    y, mu (ramp multipliers last), lamb, obj. Samples are stored train, valid, test (a random split
+    over blocks, SPLIT_SEED, 80/10/10), so _split_X_in_sets(0.8, 0.1, 0.1) gives that split.
+    block_info holds what X does not: instance, block, investment, start hour, availability,
+    Q_free (ramp rows relaxed), binding = obj > Q_free, ramp impact, exact cut slope, class, split.
+    """
+    from flowfirst.block import BlockSystem, sample_blocks
+    from gep_benders import SampleStructure
+
+    by_name = {os.path.basename(p): p for p in paths}     # trajectories may carry another machine's paths
+    base, system, first_gep = None, None, None
+    cols = {k: [] for k in ("inst", "block", "inv", "start_hour", "u", "D", "apmax", "Q", "Q_free", "slope")}
+    classes, inst_paths, t0 = [], [], time.time()
+    for i, tr in enumerate(trajs):
+        path = by_name[os.path.basename(tr["instance_path"])]
+        with open(path, "rb") as f:
+            gep = pickle.load(f)
+        gep.set_ramping(B)
+        if base is None:
+            base = build_operational_companion(gep, args).set_ramping(B)
+            system = BlockSystem.from_gep(gep, B)
+            first_gep = gep
+        elif not (np.allclose(system.V, [float(gep.pVarCost[g]) for g in gep.G])
+                  and np.allclose(system.R_g, gep.ramp_limits())):
+            raise SystemExit(f"{path}: costs or ramp limits differ from the first instance; "
+                             "one problem set holds one system.")
+        m = manifest.get(os.path.basename(path), {})
+        struct = SampleStructure(gep, 0)
+        D_all, ap_all, _ = sample_blocks(struct, np.zeros(struct.G))
+        blocks = select_representative_blocks(D_all, ap_all, n_block_clusters)
+        invs = cluster_investments(np.asarray(tr["trajectory"]), n_inv_clusters)
+        nb, ni = len(blocks), len(invs)
+        D = np.repeat(D_all[blocks][None], ni, axis=0).reshape(nb * ni, B, -1)
+        apmax = np.repeat(ap_all[blocks][None], ni, axis=0).reshape(nb * ni, B, -1)
+        u = np.repeat(invs[:, None, :], nb, axis=1).reshape(nb * ni, -1)
+        #! The block LP once more through BlockSystem: Q_free and the cut slope, and a check
+        #! on the labels below (two codes, one LP).
+        ex = system.exact(D, apmax, u)
+        free = system.exact(D, apmax, u, relax_ramps=True)
+        _, slope = system.dual_bound(ex["lam"], ex["nu_up"], ex["nu_dn"], D, apmax, u)
+        starts = np.asarray(m.get("window_starts", np.arange(struct.K) * B))
+        for k, v in (("inst", np.full(nb * ni, i)), ("block", np.tile(blocks, ni)),
+                     ("inv", np.repeat(np.arange(ni), nb)), ("start_hour", np.tile(starts[blocks], ni)),
+                     ("u", u), ("D", D), ("apmax", apmax), ("Q", ex["Q"]), ("Q_free", free["Q"]), ("slope", slope)):
+            cols[k].append(v)
+        classes.append(m.get("class", "unknown"))
+        inst_paths.append(path)
+        bind = ex["Q"] > free["Q"] + 1e-9 * np.maximum(1.0, np.abs(ex["Q"]))
+        print(f"[{i + 1}/{len(trajs)}] {os.path.basename(path)} ({classes[-1]}): {nb} blocks x {ni} investments, "
+              f"{100 * bind.mean():.1f}% binding, {time.time() - t0:.0f}s", flush=True)
+
+    info = {k: np.concatenate(v) for k, v in cols.items()}
+    n = len(info["Q"])
+    #! Random split over blocks, stored train | valid | test so the class's contiguous split is this one.
+    perm = np.random.default_rng(SPLIT_SEED).permutation(n)
+    n_tr, n_va = int(0.8 * n), int(0.1 * n)
+    split = np.empty(n, dtype="<U5")
+    split[:n_tr], split[n_tr:n_tr + n_va], split[n_tr + n_va:] = "train", "valid", "test"
+    info = {k: v[perm] for k, v in info.items()}
+    info["split"] = split
+    info["binding"] = info["Q"] > info["Q_free"] + 1e-9 * np.maximum(1.0, np.abs(info["Q"]))
+    info["ramp_impact"] = (info["Q"] - info["Q_free"]) / np.maximum(np.abs(info["Q"]), 1e-9)
+    info["class"] = np.asarray(classes)[info["inst"]]
+    info["instance_path"] = np.asarray(inst_paths)
+    info["n_block_clusters"], info["n_inv_clusters"], info["split_seed"] = n_block_clusters, n_inv_clusters, SPLIT_SEED
+
+    dt = base.DTYPE
+    cap = info["apmax"] * info["u"][:, None, :]
+    X = torch.cat([torch.tensor(info["D"].reshape(n, -1), dtype=dt), torch.tensor(cap.reshape(n, -1), dtype=dt),
+                   base.ramp_room(info["u"])], dim=1)
+    base.X, base.xdim, base.n_samples = X, X.shape[1], n
+    t1 = time.time()
+    base.opt_targets = compute_opt_targets_parallel(base, pool, n_workers)
+    print(f"Labels: {time.time() - t1:.1f}s")
+    obj = base.opt_targets["obj"].numpy()
+    worst = float(np.max(np.abs(obj - info["Q"]) / np.maximum(1.0, np.abs(info["Q"]))))
+    if worst > 1e-6:
+        raise SystemExit(f"Labels disagree with the block LP of BlockSystem (max rel. diff {worst:.2e}).")
+    del info["Q"]                                    # it is opt_targets["obj"]
+
+    base.block_info = info
+    base.pUnitInvestment = torch.tensor(info["u"], dtype=dt)
+    base.total_demands = torch.ones((n, 1))
+    #! The heuristic lambda labels are hourly; the companion's are for its one dummy sample.
+    for k in ("heuristic_lambda_soft_labels", "heuristic_lambda_confidence",
+              "heuristic_lambda_tier", "heuristic_lambda_classes"):
+        setattr(base, k, None)
+    base._split_X_in_sets(0.8, 0.1, 0.1)
+    ensure_dir(os.path.dirname(out_path))
+    with open(out_path, "wb") as f:
+        pickle.dump(base, f)
+    b = info["binding"]
+    print(f"\n{n:,} blocks, {100 * b.mean():.2f}% binding  |  "
+          + ", ".join(f"{s} {int((split == s).sum()):,} ({100 * b[split == s].mean():.2f}% binding)"
+                      for s in ("train", "valid", "test"))
+          + f"  |  labels match BlockSystem to {worst:.1e}  |  {time.time() - t0:.0f}s"
+          + f"\nSaved -> {out_path}  |  GEPOperationalProblemSet, B={B}, X dim {base.xdim}, y dim {base.ydim}, "
+          + f"{base.nineq} ineq rows ({base.n_ramp} ramp)")
+    harvest_block_hours(base, first_gep, args, out_path.replace(".pkl", "_hourly.pkl"), pool, n_workers)
+
+
+def harvest_block_hours(block_set, gep, args, out_path, pool, n_workers):
+    """The hours of the block set as an hourly GEPOperationalProblemSet, for hourly networks.
+
+    Every block becomes B rows [D_t, cap_t] (block_set.hourly_X), in block order, so the stored
+    train | valid | test order carries over and a contiguous 80/10/10 split keeps every hour in its
+    block's split. Labels are the hourly LP (no ramp rows): what an hourly network can know.
+    hour_info maps each row back to its block (row of the block set) and its hour in the block.
+    """
+    B = block_set.ramp_block_hours_
+    hourly = build_operational_companion(gep, args)
+    X = block_set.hourly_X(block_set.X)
+    n = X.shape[0]
+    hourly.X, hourly.xdim, hourly.n_samples = X, X.shape[1], n
+    t0 = time.time()
+    hourly.opt_targets = compute_opt_targets_parallel(hourly, pool, n_workers)
+    hourly.total_demands = torch.ones((n, 1))
+    hourly.pUnitInvestment = torch.repeat_interleave(block_set.pUnitInvestment, B, dim=0)
+    if hourly.ED_args.get("precompute_heuristic_lambda_labels", False):
+        (hourly.heuristic_lambda_soft_labels, hourly.heuristic_lambda_confidence,
+         hourly.heuristic_lambda_tier, hourly.heuristic_lambda_classes) = \
+            hourly.compute_heuristic_lambda_soft_labels_vectorized(X=hourly.X)
+    hourly.hour_info = {"block": np.repeat(np.arange(block_set.n_samples), B), "hour": np.tile(np.arange(B), block_set.n_samples),
+                        "split": np.repeat(block_set.block_info["split"], B), "block_data": os.path.basename(out_path)}
+    hourly._split_X_in_sets(0.8, 0.1, 0.1)
+    with open(out_path, "wb") as f:
+        pickle.dump(hourly, f)
+    print(f"Saved -> {out_path}  |  hourly GEPOperationalProblemSet, {n:,} hours of {block_set.n_samples:,} blocks, "
+          f"X dim {hourly.xdim}, labels {time.time() - t0:.0f}s")
+
+
 # ================= RUN =================
 def main():
     cli_args = parse_cli()
@@ -385,9 +546,8 @@ def main():
     data_root = roots["data_root"]
 
     RAMP_B = cli_args.ramp_block_hours
-    if RAMP_B > 1 and not cli_args.solve_only:
-        raise SystemExit("Ramping instances can only be solved with --solve-only for now: the "
-                         "harvest below builds hourly states, and the block harvest does not exist yet.")
+    #! Ramping: --solve-only stops after the trajectories; without it the block harvest follows.
+    BLOCKS = RAMP_B > 1 and not cli_args.solve_only
     DIR = resolve_instance_dir(args, data_root, cli_args.horizon, RAMP_B)
 
     #! The horizon we are actually reading, taken from the directory name rather
@@ -402,19 +562,27 @@ def main():
 
     #! Solve-only output: the trajectories, named like the instance folder plus the cut mode,
     #! so runs with different block lengths or cut modes never overwrite one another.
+    _tag = os.path.basename(DIR)[len(IN_PREFIX.split('/')[-1]) + 1:]
     TRAJ_OUT = under_root(os.path.join(os.path.dirname(RELATIVE_OUT),
-                                       f"GEP_trajectories_{os.path.basename(DIR)[len(IN_PREFIX.split('/')[-1]) + 1:]}"
-                                       f"_{cli_args.cut_selection}.pkl"), data_root)
+                                       f"GEP_trajectories_{_tag}_{cli_args.cut_selection}.pkl"), data_root)
+    #! Block harvest output, named like the trajectories it is built from.
+    BLOCK_OUT = under_root(os.path.join(os.path.dirname(RELATIVE_OUT),
+                                        f"GEP_block_data_{_tag}_{cli_args.cut_selection}.pkl"), data_root)
 
     print(f"Run config: {under_repo(cli_args.config)}")
     print(f"Instances:  {DIR}")
-    print(f"Trajectories to: {TRAJ_OUT}" if cli_args.solve_only else f"Harvest to: {ED_OUT}")
+    if cli_args.solve_only:
+        print(f"Trajectories to: {TRAJ_OUT}")
+    elif BLOCKS:
+        print(f"Trajectories:    {TRAJ_OUT}\nBlock harvest to: {BLOCK_OUT}")
+    else:
+        print(f"Harvest to: {ED_OUT}")
 
     #! main.py reads ED_args.direct_data_path. If it does not name the file we are
     #! about to write, training would load something else entirely -- say so now
     #! rather than let it be discovered three stages later.
     _configured = args["ED_args"].get("direct_data_path")
-    if not cli_args.solve_only and _configured and os.path.normpath(_configured) != os.path.normpath(RELATIVE_OUT):
+    if not (cli_args.solve_only or BLOCKS) and _configured and os.path.normpath(_configured) != os.path.normpath(RELATIVE_OUT):
         print(
             f"[warn] this config's ED_args.direct_data_path is\n"
             f"           {_configured}\n"
@@ -432,8 +600,8 @@ def main():
     n_hour_clusters = N_HOUR_CLUSTERS                     
     n_inv_clusters  = max(1, round(per_instance / n_hour_clusters))
     if not cli_args.solve_only:
-        print(f"Targeting {TARGET_STATES:,} states: {len(paths)} instances "
-              f"× {n_inv_clusters} inv × {n_hour_clusters} hours "
+        print(f"Targeting {TARGET_STATES:,} {'blocks' if BLOCKS else 'states'}: {len(paths)} instances "
+              f"× {n_inv_clusters} inv × {n_hour_clusters} {f'{RAMP_B}-hour blocks' if BLOCKS else 'hours'} "
               f"= {len(paths) * n_inv_clusters * n_hour_clusters:,}")
 
     #! Say so here rather than crashing further down on an empty harvest list.
@@ -469,7 +637,10 @@ def main():
         )
 
     try:
-        if cli_args.solve_only:
+        #! Ramping block harvest reuses this run's trajectories when they exist (the Benders
+        #! solves are the expensive part); --resolve, or no file yet, solves them first.
+        reuse = BLOCKS and not cli_args.resolve and os.path.exists(TRAJ_OUT)
+        if cli_args.solve_only or (BLOCKS and not reuse):
             jobs = [(i, p, args, cli_args.check_direct, cli_args.cut_selection,
                      cli_args.cut_selection_k, RAMP_B) for i, p in enumerate(paths)]
             results, t0 = [None] * len(paths), time.time()
@@ -485,6 +656,21 @@ def main():
                 pickle.dump(results, f)
             print(f"Solved {len(paths)} instances in {time.time() - t0:.1f}s  |  "
                   f"{sum(len(h['trajectory']) for h in results):,} investments visited  |  saved -> {TRAJ_OUT}")
+            if cli_args.solve_only:
+                return
+
+        if BLOCKS:
+            with open(TRAJ_OUT, "rb") as f:
+                trajs = pickle.load(f)
+            print(f"{'Reusing' if reuse else 'Using'} trajectories {TRAJ_OUT} ({len(trajs)} instances)"
+                  + ("; pass --resolve to solve again" if reuse else ""))
+            manifest_path = os.path.join(DIR, "manifest.pkl")
+            manifest = {}
+            if os.path.exists(manifest_path):
+                with open(manifest_path, "rb") as f:
+                    manifest = {os.path.basename(m["save_path"]): m for m in pickle.load(f)}
+            harvest_blocks(trajs, paths, manifest, args, RAMP_B, n_hour_clusters, n_inv_clusters, BLOCK_OUT,
+                           pool, n_workers)
             return
 
         harvest, Xs, base_bytes = [None] * len(paths), [None] * len(paths), None

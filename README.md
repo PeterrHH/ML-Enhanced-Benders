@@ -315,7 +315,7 @@ Instead of sampling investments from a fixed range, this pipeline harvests the i
 
 ```
 gen_GEP/create_GEP_for_training.py  →  data/GEP_perturb_mix_<topology>_H<h>[_B<B>]/  perturbed GEP instances
-gen_GEP/solve_for_train.py          →  data/ED_data_gen/                             trajectories, or an hourly ED dataset
+gen_GEP/solve_for_train.py          →  data/ED_data_gen/                             trajectories, an hourly ED dataset, or a ramp-block dataset
 ```
 
 1. **`create_GEP_for_training.py`** builds perturbed GEP instances from real demand and availability, perturbing demand level, investment costs and (lightly) availability. A class mixture covers renewable-heavy, high-demand and middle optima (`USE_CLASS_MIXTURE`, `RENEWABLE_FRAC`).
@@ -328,7 +328,9 @@ gen_GEP/solve_for_train.py          →  data/ED_data_gen/                      
 | `solve_for_train.py` | `-j/--workers`, `--threads` | worker processes (default: the job's CPUs) and threads per worker |
 | | `--check-direct` | also solve each instance as one MIP and print both objectives |
 | | `--cut-selection`, `--cut-selection-k` | cut mode of the harvesting solves (default `single`: slow convergence, widely spread trajectories) |
-| | `--ramp-block-hours B --solve-only` | solve ramping instances and save their trajectories to `data/ED_data_gen/GEP_trajectories_<topology>_H<h>_B<B>_<cut>.pkl`; the block harvest is not built yet |
+| | `--ramp-block-hours B --solve-only` | solve ramping instances and save their trajectories to `data/ED_data_gen/GEP_trajectories_<topology>_H<h>_B<B>_<cut>.pkl` |
+| | `--ramp-block-hours B` | block harvest: reuse those trajectories (solve first if the file is missing), then label 20 representative B-hour blocks × 30 clustered investments per instance with the exact block LP. Saves a `GEPOperationalProblemSet` after `set_ramping(B)` (one sample = one block, `X = [D per hour, capacity per hour, R_g·u_g]`, ramp multipliers at the end of `mu`, extras in `block_info`) to `data/ED_data_gen/GEP_block_data_<topology>_H<h>_B<B>_<cut>.pkl`, stored train/valid/test (random 80/10/10, seed 42) |
+| | `--resolve` | block harvest: solve the instances again even if the trajectories file exists |
 
 ```bash
 # hourly (as before)
@@ -338,6 +340,8 @@ python gen_GEP/solve_for_train.py
 # ramping: instances in 4-hour windows, then exact Benders with ramping
 python gen_GEP/create_GEP_for_training.py --horizon 876 --ramp-block-hours 4 -n 80
 python gen_GEP/solve_for_train.py --ramp-block-hours 4 --solve-only --check-direct
+python gen_GEP/solve_for_train.py --ramp-block-hours 4        # block dataset from those trajectories
+python flowfirst/eval_block_ladder.py                          # plan A (hourly net + ramp ladder) on its test split
 ```
 
 To train on a harvested hourly dataset, point `main.py` at it:
